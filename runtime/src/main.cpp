@@ -54,6 +54,7 @@
 #include <ucontext.h>
 #endif
 #endif
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -1585,6 +1586,18 @@ int RuntimeMain(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+#if defined(__linux__) && !defined(__GLIBC__)
+    // musl gives new threads a 128 KiB stack where glibc gives 8 MiB, and Dawn's shader compiler
+    // (Tint) recurses deeply on aurora's pipeline workers, overflowing it. Match glibc before any
+    // thread starts. A linker -z stack-size would not reach every loader (HBLauncher builds its
+    // own program headers), so set the default here.
+    pthread_attr_t threadDefaults;
+    if (pthread_attr_init(&threadDefaults) == 0) {
+        pthread_attr_setstacksize(&threadDefaults, 8u << 20);
+        pthread_setattr_default_np(&threadDefaults);
+        pthread_attr_destroy(&threadDefaults);
+    }
+#endif
     return RuntimeMain(argc, argv);
 }
 extern "C" bool g_dynamicAspectRatioEnabled = false;
