@@ -9,7 +9,16 @@ get_filename_component(MKW_HOST_RUNTIME_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOL
 # separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers;
 # Apple Silicon uses the project's x18-safe AArch64 assembly backend, while Intel macOS uses
 # libco's existing System V AMD64 backend.
-if(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
+if(MKW_PLATFORM_LINUX AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    # AArch64 Linux uses the ELF build of the Apple Silicon assembly backend instead of libco's
+    # AArch64 code array, which needs mprotect to become executable and carries no BTI landing
+    # pad (see src/platform/aarch64/co_switch_elf.S). It keeps the mkw::libco name so every
+    # link site stays the same.
+    enable_language(ASM)
+    add_library(mkw_libco STATIC "${MKW_HOST_RUNTIME_DIR}/src/platform/aarch64/co_switch_elf.S")
+    add_library(mkw::libco ALIAS mkw_libco)
+    target_include_directories(mkw_libco PUBLIC "${MKW_HOST_RUNTIME_DIR}/third_party/libco")
+elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
     add_library(mkw_libco STATIC "${MKW_HOST_RUNTIME_DIR}/third_party/libco/libco.c")
     add_library(mkw::libco ALIAS mkw_libco)
     target_include_directories(mkw_libco PUBLIC "${MKW_HOST_RUNTIME_DIR}/third_party/libco")

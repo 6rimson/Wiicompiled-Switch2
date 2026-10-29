@@ -8,7 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif defined(__APPLE__) && defined(__aarch64__)
+#elif defined(__aarch64__) && (defined(__APPLE__) || defined(__linux__))
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -72,7 +72,7 @@ void Switch(Handle target)
     SwitchToFiber(target);
 }
 
-#elif defined(__APPLE__) && defined(__aarch64__)
+#elif defined(__aarch64__) && (defined(__APPLE__) || defined(__linux__))
 
 namespace {
 struct Context {
@@ -110,7 +110,7 @@ Handle Create(std::size_t stackSize, Entry entry, void* argument)
     const std::size_t guardSize = static_cast<std::size_t>(getpagesize());
     const std::size_t totalSize = stackSize + guardSize;
     context->stack = mmap(nullptr, totalSize, PROT_READ | PROT_WRITE,
-                          MAP_ANON | MAP_PRIVATE, -1, 0);
+                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (context->stack == MAP_FAILED) {
         delete context;
         return nullptr;
