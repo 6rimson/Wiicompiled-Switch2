@@ -1,0 +1,456 @@
+--- a/engine/switch2/ro/payload/main.c
++++ b/engine/switch2/ro/payload/main.c
+@@ -16,7 +16,8 @@
+ extern Reply thread_id(u32 handle);
+ extern u64 system_tick(void);
+ extern u32 process_request(u32 command, const u64 *input, u32 bytes,
+-    u32 handle, u64 *output, u32 *output_bytes, void *receive, u64 receive_size);
++    u32 handle, u64 *output, u32 *output_bytes, void *receive, u64 receive_size,
++    u64 caller_pid);
+ 
+ static u32 *message(void) {
+     u32 *p;
+@@ -49,12 +50,15 @@
+ static Reply respond(u32 session, u64 registration_result) {
+     u32 *p = message();
+     u32 at = 2, handle = 0, valid = p[0] == 4 || p[0] == 0x01000004;
+-    u64 receive_address = 0, receive_size = 0;
++    u64 receive_address = 0, receive_size = 0, caller_pid = 0;
+     if (valid && p[1] >> 31) {
+         u32 special = p[at++];
+         // Process probes accept one copied handle and an optional kernel PID.
+         valid = (special & ~1u) == 2;
+-        if (special & 1) at += 2;
++        if (special & 1) {
++            caller_pid = (u64)p[at] | ((u64)p[at + 1] << 32);
++            at += 2;
++        }
+         if (valid) handle = p[at++];
+     }
+     if (valid && p[0] == 0x01000004) {
+@@ -83,7 +87,7 @@
+     } else if (valid && handle) {
+         result = process_request(command, (u64 *)(p + at + 4),
+             (end - at - 4) * 4, handle, output, &output_bytes,
+-            (void *)receive_address, receive_size);
++            (void *)receive_address, receive_size, caller_pid);
+     }
+     if (handle) close_handle(handle);
+     clear(p);
+--- a/engine/switch2/ro/payload/process.c
++++ b/engine/switch2/ro/payload/process.c
+@@ -19,6 +19,8 @@
+ 
+ #define SELF 0xffff8001u
+ #define BAD_INPUT 0xd401u
++
++#include "hbl-range.h"
+ 
+ static void publish_code(u64 address, u64 size) {
+     // Cover every possible cache line without assuming a particular line size.
+@@ -64,7 +66,8 @@
+ }
+ 
+ u32 process_request(u32 command, const u64 *input, u32 bytes,
+-    u32 handle, u64 *out, u32 *output_bytes, void *receive, u64 receive_size) {
++    u32 handle, u64 *out, u32 *output_bytes, void *receive, u64 receive_size,
++    u64 caller_pid) {
+     *output_bytes = 64;
+     if (bytes < 32) return BAD_INPUT;
+     if (receive_size && command != 0x524f0016) return BAD_INPUT;
+@@ -86,6 +89,9 @@
+         return queried.result;
+     }
+     if (!input[0] || queried.result) return queried.result ? queried.result : BAD_INPUT;
++    if (command == HBL_MAP_RX || command == HBL_MAP_RW || command == HBL_UNMAP)
++        return hbl_range(command, input, bytes, handle, caller_pid, &pid,
++            &info, out, output_bytes);
+     if (command == 0x524f0015) {
+         // Toggle only the read bit of native FS executable pages.
+         u64 address = input[1], size = input[2], permission = input[3];
+--- /dev/null
++++ b/engine/switch2/ro/payload/hbl-range.h
+@@ -0,0 +1,98 @@
++/* HBLauncher range protocol v1. Included after the upstream SVC declarations.
++ * No new SVCs, process launches, filesystem writes, or persistent state.
++ * One kernel mapping per request; no speculative page-by-page fallback.
++ */
++#define HBL_MAP_RX 0x524f001au
++#define HBL_MAP_RW 0x524f001bu
++#define HBL_UNMAP  0x524f001cu
++#define HBL_PAGE 0x1000ULL
++#define HBL_MAX_PAGES 16384ULL
++
++static int hbl_contains(const MemoryInfo *info, u64 address, u64 size) {
++    /* Subtraction avoids overflow and permits an exact end-of-region match. */
++    return info->size && address >= info->address &&
++        address - info->address < info->size &&
++        size <= info->size - (address - info->address);
++}
++
++static u32 hbl_range(u32 command, const u64 *input, u32 bytes, u32 handle,
++    u64 caller_pid, const Reply *pid, const MemoryInfo *source_info,
++    u64 *out, u32 *output_bytes) {
++    /* out[0..2] are the upstream identity fields. out[3] is completed pages;
++     * [4] failure page (0: whole-range operation), [5] primary failure,
++     * [6] failure count, [7] rollback result, [8] mode (1: contiguous SVC).
++     * A nonzero result always means stop; out[3] can describe retained pages.
++     */
++    *output_bytes = 72;
++    for (u32 i = 3; i < 9; i++) out[i] = 0;
++    out[8] = 1;
++    u64 source = input[1], destination = input[2], pages = input[3];
++    /* The kernel-inserted IPC PID must match the copied target process handle.
++     * New operations can only modify the requesting application, never FS/RO.
++     * Keep every legacy command's contract unchanged.
++     */
++    /* CMIF raw-data length includes up to 16 bytes of alignment padding. */
++    if (bytes < 32 || bytes > 48 || !caller_pid || caller_pid != pid->value ||
++        input[0] != caller_pid || !source || !destination ||
++        (source | destination) & (HBL_PAGE - 1) ||
++        !pages || pages > HBL_MAX_PAGES) goto invalid;
++    for (u32 i = 32; i < bytes; i++)
++        if (((const unsigned char *)input)[i]) goto invalid;
++    u64 size = pages * HBL_PAGE;
++    if (source > ~0ULL - size || destination > ~0ULL - size ||
++        (source < destination + size && destination < source + size) ||
++        !hbl_contains(source_info, source, size) || source_info->type != 5 ||
++        source_info->ipc_refs || source_info->device_refs) goto invalid;
++
++    MemoryInfo target = {0};
++    Reply q = query_process(&target, handle, destination);
++    u32 result = (u32)q.result;
++    if (result) goto failed;
++    if (!hbl_contains(&target, destination, size) || target.ipc_refs ||
++        target.device_refs || target.attributes) goto invalid;
++
++    if (command == HBL_UNMAP) {
++        if (source_info->permission != 0 || source_info->attributes != 1 ||
++            (target.type != 8 && target.type != 9) ||
++            (target.permission != 0 && target.permission != 3 && target.permission != 5))
++            goto invalid;
++        /* The kernel checks that source/destination describe the same pages. */
++        result = unmap_code(handle, destination, source, size);
++        if (result) goto failed;
++        out[3] = pages;
++        return 0;
++    }
++
++    if (source_info->permission != 3 || source_info->attributes ||
++        target.type != 0 || target.permission) goto invalid;
++    result = map_code(handle, destination, source, size);
++    if (result) goto failed;
++    out[3] = pages;
++    u32 permission = command == HBL_MAP_RX ? 5 : 3;
++    result = process_permission(handle, destination, size, permission);
++    if (!result) {
++        MemoryInfo after = {0};
++        q = query_process(&after, handle, destination);
++        result = (u32)q.result;
++        if (!result && (!hbl_contains(&after, destination, size) ||
++            after.type != (permission == 5 ? 8u : 9u) ||
++            after.permission != permission || after.attributes ||
++            after.ipc_refs || after.device_refs)) result = BAD_INPUT;
++    }
++    if (!result) return 0;
++    /* Roll back only a mapping this request successfully created. Do not
++     * retry a failed rollback; report the retained pages to the host.
++     */
++    out[7] = unmap_code(handle, destination, source, size);
++    if (!out[7]) out[3] = 0;
++    else out[6] = 1;
++    out[5] = result;
++    return result;
++
++invalid:
++    result = BAD_INPUT;
++failed:
++    out[5] = result;
++    out[6] = 1;
++    return result;
++}
+--- a/engine/switch2/ro/worker-control.cjs
++++ b/engine/switch2/ro/worker-control.cjs
+@@ -83,7 +83,9 @@
+         check(state.services.some(x => x.name === 'ro:dmnt' && x.handle === handle), 'Process probe requires the owned RO service');
+         check(s.handles.has(target) || target === 0xffff8001, 'Target process handle is not owned');
+         check([0x524f0010, 0x524f0011, 0x524f0012, 0x524f0013, 0x524f0014,
+-          0x524f0015, 0x524f0016].includes(id), 'Unknown process probe');
++          0x524f0015, 0x524f0016, 0x524f001a, 0x524f001b, 0x524f001c].includes(id), 'Unknown process probe');
++        if (id >= 0x524f001a && id <= 0x524f001c)
++          check(target === 0xffff8001, 'HBLauncher ranges require the current application process');
+         const size = id === 0x524f0014 ? 128 : 64;
+         check(typeof request.hex === 'string' && request.hex.length === size && /^[0-9a-fA-F]+$/.test(request.hex),
+           'Process probe input length differs');
+--- /dev/null
++++ b/tests/hbl-range-native.c
+@@ -0,0 +1,212 @@
++/* Execute the actual production process_request with simulated kernel SVCs.
++ * This checks our validation, wire results and rollback decisions, not the
++ * retail kernel's implementation. No console connection or privileged calls.
++ */
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "../engine/switch2/ro/payload/process.c"
++
++#define SOURCE 0x100000000ULL
++#define DEST 0x40000000ULL
++#define EXTENT 0x8001000ULL
++#define PID 123ULL
++#define FAULT 0x123401u
++typedef struct { u64 source, destination, size; u32 permission; } Mapping;
++static Mapping mappings[8];
++static u32 map_calls, unmap_calls, permission_calls, query_calls;
++static u32 map_fault, unmap_fault, permission_fault, query_fault_at;
++static u32 pid_fault, program_fault, wrong_readback;
++static MemoryInfo source_override, target_override;
++static int override_source, override_target;
++static u64 process_pid, process_program;
++static unsigned cases;
++
++static void reset(void) {
++    memset(mappings, 0, sizeof(mappings));
++    map_calls = unmap_calls = permission_calls = query_calls = 0;
++    map_fault = unmap_fault = permission_fault = query_fault_at = 0;
++    pid_fault = program_fault = wrong_readback = 0;
++    override_source = override_target = 0;
++    process_pid = PID; process_program = 0x0100000000001000ULL;
++    cases++;
++}
++Reply process_id(u32 handle) { assert(handle == 42); return (Reply){pid_fault, process_pid}; }
++Reply get_info(u32 type, u32 handle, u64 subtype) {
++    (void)handle; (void)subtype;
++    return (Reply){program_fault, type == 18 ? process_program : 0};
++}
++Reply query_memory(MemoryInfo *info, u64 address) { (void)info; (void)address; return (Reply){FAULT, 0}; }
++u32 map_process(u64 d, u32 h, u64 s, u64 n) { (void)d;(void)h;(void)s;(void)n; assert(0); return FAULT; }
++u32 unmap_process(u64 d, u32 h, u64 s, u64 n) { (void)d;(void)h;(void)s;(void)n; assert(0); return FAULT; }
++
++Reply query_process(MemoryInfo *info, u32 handle, u64 address) {
++    assert(handle == 42);
++    query_calls++;
++    if (query_fault_at == query_calls) return (Reply){FAULT,0};
++    memset(info, 0, sizeof(*info));
++    if (address >= SOURCE && address < SOURCE + EXTENT) {
++        if (override_source) { *info = source_override; return (Reply){0,0}; }
++        info->address = SOURCE; info->size = EXTENT; info->type = 5; info->permission = 3;
++        for (u32 i = 0; i < 8; i++) if (mappings[i].size) {
++            Mapping m = mappings[i];
++            if (address >= m.source && address < m.source + m.size) {
++                info->address = m.source; info->size = m.size;
++                info->permission = 0; info->attributes = 1; return (Reply){0,0};
++            }
++            if (m.source > address && m.source < info->address + info->size)
++                info->size = m.source - info->address;
++            if (m.source + m.size <= address && m.source + m.size > info->address) {
++                u64 end = info->address + info->size;
++                info->address = m.source + m.size; info->size = end - info->address;
++            }
++        }
++        return (Reply){0,0};
++    }
++    if (override_target) { *info = target_override; return (Reply){0,0}; }
++    info->address = 0x1000; info->size = SOURCE - 0x1000;
++    for (u32 i = 0; i < 8; i++) if (mappings[i].size) {
++        Mapping m = mappings[i];
++        if (address >= m.destination && address < m.destination + m.size) {
++            info->address = m.destination; info->size = m.size;
++            info->type = m.permission == 3 ? 9 : 8;
++            info->permission = wrong_readback ? 7 : m.permission;
++            return (Reply){0,0};
++        }
++        if (m.destination > address && m.destination < info->address + info->size)
++            info->size = m.destination - info->address;
++        if (m.destination + m.size <= address && m.destination + m.size > info->address) {
++            u64 end = info->address + info->size;
++            info->address = m.destination + m.size; info->size = end - info->address;
++        }
++    }
++    return (Reply){0,0};
++}
++u32 map_code(u32 handle, u64 destination, u64 source, u64 size) {
++    assert(handle == 42); map_calls++;
++    if (map_fault) return map_fault;
++    for (u32 i=0; i<8; i++) if (!mappings[i].size) {
++        mappings[i] = (Mapping){source,destination,size,0}; return 0;
++    }
++    assert(0); return FAULT;
++}
++u32 process_permission(u32 handle, u64 address, u64 size, u32 permission) {
++    assert(handle == 42); permission_calls++;
++    if (permission_fault) return permission_fault;
++    for (u32 i=0; i<8; i++) if (mappings[i].size == size && mappings[i].destination == address) {
++        mappings[i].permission = permission; return 0;
++    }
++    assert(0); return FAULT;
++}
++u32 unmap_code(u32 handle, u64 destination, u64 source, u64 size) {
++    assert(handle == 42); unmap_calls++;
++    if (unmap_fault) return unmap_fault;
++    for (u32 i=0; i<8; i++) if (mappings[i].size == size && mappings[i].source == source && mappings[i].destination == destination) {
++        mappings[i].size = 0; return 0;
++    }
++    return FAULT;
++}
++static u64 out[24];
++static u32 output_bytes;
++static u32 request(u32 command, u64 source, u64 destination, u64 pages, u64 sender, u32 bytes) {
++    u64 input[8] = {PID, source, destination, pages};
++    for (u32 i=0; i<24; i++) out[i]=0;
++    out[23] = 0xabcdef;
++    u32 result = process_request(command,input,bytes,42,out,&output_bytes,0,0,sender);
++    assert(out[23] == 0xabcdef);
++    return result;
++}
++static void rejected(u64 source, u64 destination, u64 pages, u64 sender, u32 bytes) {
++    assert(request(HBL_MAP_RX,source,destination,pages,sender,bytes) != 0);
++    assert(!map_calls && !permission_calls && !unmap_calls);
++}
++int main(void) {
++    for (u32 perm=3; perm<=5; perm+=2) for (u64 pages=1; pages<=16384; pages*=128) {
++        reset();
++        assert(!request(perm==5?HBL_MAP_RX:HBL_MAP_RW,SOURCE,DEST,pages,PID,40));
++        assert(output_bytes==72 && out[0]==PID && out[3]==pages && !out[6] && out[8]==1);
++        assert(map_calls==1 && permission_calls==1 && !unmap_calls);
++        assert(mappings[0].size==pages*4096 && mappings[0].permission==perm);
++        assert(!request(HBL_UNMAP,SOURCE,DEST,pages,PID,40));
++        assert(out[3]==pages && !out[6] && unmap_calls==1 && !mappings[0].size);
++    }
++    reset(); override_source=1; source_override=(MemoryInfo){.address=SOURCE,.size=4096,.type=5,.permission=3};
++    assert(!request(HBL_MAP_RX,SOURCE,DEST,1,PID,32)); /* exact end, no slack */
++    reset(); override_source=1; source_override=(MemoryInfo){.address=SOURCE,.size=8192,.type=5,.permission=3};
++    assert(!request(HBL_MAP_RX,SOURCE+4096,DEST,1,PID,40)); /* interior exact end */
++    reset(); rejected(SOURCE+1,DEST,1,PID,40);
++    reset(); rejected(SOURCE,DEST+1,1,PID,40);
++    reset(); rejected(SOURCE,DEST,0,PID,40);
++    reset(); rejected(SOURCE,DEST,16385,PID,40);
++    reset(); rejected(SOURCE,DEST,~0ULL,PID,40);
++    reset(); rejected(SOURCE,DEST,1,0,40);
++    reset(); rejected(SOURCE,DEST,1,PID+1,40);
++    reset(); process_pid=PID+1; rejected(SOURCE,DEST,1,PID,40);
++    reset(); rejected(SOURCE,DEST,1,PID,24);
++    reset(); rejected(SOURCE,DEST,1,PID,64);
++    reset(); rejected(SOURCE,0,1,PID,40);
++    reset(); rejected(0,DEST,1,PID,40);
++    reset(); rejected(SOURCE,SOURCE+4096,2,PID,40);
++    reset(); rejected(SOURCE,0xfffffffffffff000ULL,2,PID,40);
++    reset(); rejected(SOURCE+EXTENT-4096,DEST,2,PID,40);
++    for (u32 bad=0;bad<7;bad++) {
++        reset();override_source=1;
++        source_override=(MemoryInfo){.address=SOURCE,.size=8192,.type=5,.permission=3};
++        if (bad==0) source_override.type=3;
++        if (bad==1) source_override.permission=5;
++        if (bad==2) source_override.attributes=1;
++        if (bad==3) source_override.ipc_refs=1;
++        if (bad==4) source_override.device_refs=1;
++        if (bad==5) source_override.size=4095;
++        if (bad==6) source_override.address=SOURCE+4096;
++        rejected(SOURCE,DEST,1,PID,40);
++    }
++    for (u32 bad=0;bad<6;bad++) {
++        reset();override_target=1;target_override=(MemoryInfo){.address=DEST,.size=8192};
++        if (bad==0) target_override.type=5;
++        if (bad==1) target_override.permission=3;
++        if (bad==2) target_override.attributes=1;
++        if (bad==3) target_override.ipc_refs=1;
++        if (bad==4) target_override.device_refs=1;
++        if (bad==5) target_override.size=4095;
++        rejected(SOURCE,DEST,1,PID,40);
++    }
++    reset(); pid_fault=FAULT;rejected(SOURCE,DEST,1,PID,40);
++    reset(); program_fault=FAULT;rejected(SOURCE,DEST,1,PID,40);
++    reset(); query_fault_at=1;rejected(SOURCE,DEST,1,PID,40);
++    reset(); query_fault_at=2;rejected(SOURCE,DEST,1,PID,40);
++    reset(); map_fault=FAULT;
++    assert(request(HBL_MAP_RX,SOURCE,DEST,2,PID,40)==FAULT && !out[3]);
++    assert(map_calls==1 && !permission_calls && !unmap_calls);
++    reset();permission_fault=FAULT;
++    assert(request(HBL_MAP_RX,SOURCE,DEST,2,PID,40)==FAULT);
++    assert(!out[3] && out[5]==FAULT && !out[7] && unmap_calls==1 && !mappings[0].size);
++    reset();permission_fault=FAULT;unmap_fault=FAULT+1;
++    assert(request(HBL_MAP_RX,SOURCE,DEST,2,PID,40)==FAULT);
++    assert(out[3]==2 && out[6]==1 && out[7]==FAULT+1 && unmap_calls==1 && mappings[0].size);
++    reset();wrong_readback=1;
++    assert(request(HBL_MAP_RX,SOURCE,DEST,2,PID,40)==BAD_INPUT && !out[3] && unmap_calls==1);
++    reset();query_fault_at=3;
++    assert(request(HBL_MAP_RX,SOURCE,DEST,2,PID,40)==FAULT && !out[3] && unmap_calls==1);
++    reset();assert(!request(HBL_MAP_RW,SOURCE,DEST,2,PID,40));unmap_fault=FAULT;
++    assert(request(HBL_UNMAP,SOURCE,DEST,2,PID,40)==FAULT && !out[3] && out[6]==1);
++    assert(unmap_calls==1 && mappings[0].size==8192);
++    reset();assert(request(HBL_UNMAP,SOURCE,DEST,1,PID,40)==BAD_INPUT && !unmap_calls);
++    reset(); /* HBLauncher large-image chunk boundary and separate cleanup. */
++    assert(!request(HBL_MAP_RX,SOURCE,DEST,16384,PID,40));
++    assert(!request(HBL_MAP_RX,SOURCE+0x4000000,DEST+0x4000000,14699,PID,40));
++    assert(map_calls==2);
++    assert(!request(HBL_UNMAP,SOURCE,DEST,16384,PID,40));
++    assert(!request(HBL_UNMAP,SOURCE+0x4000000,DEST+0x4000000,14699,PID,40));
++    assert(unmap_calls==2);
++    reset(); /* Existing single-page ABI remains available to the 4/4 flow. */
++    assert(!request(0x524f0012,SOURCE,DEST,4096,0,40));
++    assert(!request(0x524f0013,SOURCE,DEST,4096,0,40));
++    reset(); /* Trailing non-padding data and receive buffers are rejected. */
++    u64 input[8]={PID,SOURCE,DEST,1,1};
++    assert(process_request(HBL_MAP_RX,input,40,42,out,&output_bytes,0,0,PID)==BAD_INPUT);
++    assert(process_request(HBL_MAP_RX,input,32,42,out,&output_bytes,input,8,PID)==BAD_INPUT);
++    assert(!map_calls);
++    printf("native range tests: %u scenarios passed\n",cases);
++    return 0;
++}
+--- /dev/null
++++ b/tests/hbl-wire.test.cjs
+@@ -0,0 +1,54 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const vm = require('node:vm');
++const {createRequire} = require('node:module');
++const {packet, response} = require('../engine/shared/ipc.cjs');
++test('actual CMIF packet contains 32 argument bytes and 8 padding bytes',()=>{
++  const input=Buffer.alloc(32);[123,0x100000000,0x40000000,2].forEach((v,i)=>input.writeBigUInt64LE(BigInt(v),i*8));
++  const bytes=packet(0x524f001a,input,{pid:true,copies:[0xffff8001]});
++  assert.equal(bytes.readUInt32LE(8),3);
++  bytes.writeBigUInt64LE(123n,12); // What the kernel writes into the PID descriptor.
++  const beforeAlignment=6, at=8, end=beforeAlignment+(bytes.readUInt32LE(4)&0x3ff);
++  assert.equal((end-at-4)*4,40);
++  assert.equal(bytes.readBigUInt64LE(12),123n);
++  assert(bytes.subarray((at+4)*4,(at+4)*4+32).equals(input));
++  assert(bytes.subarray((at+4)*4+32,end*4).equals(Buffer.alloc(8)));
++});
++test('72-byte range reply survives the upstream reply decoder',()=>{
++  const bytes=Buffer.alloc(256);bytes.writeUInt32LE((0x80000000|26)>>>0,4);bytes.writeUInt32LE(1,8);
++  bytes.writeBigUInt64LE(209n,12);bytes.write('SFCO',32);bytes.writeUInt32LE(0,40);
++  [123n,1n,0n,16384n,0n,0n,0n,0n,1n].forEach((v,i)=>bytes.writeBigUInt64LE(v,48+i*8));
++  const reply=response(bytes);assert.equal(reply.result,0);assert.equal(reply.data.readBigUInt64LE(24),16384n);
++  assert.equal(reply.data.readBigUInt64LE(64),1n);
++});
++function harness(){
++  const file=path.resolve(__dirname,'../engine/switch2/ro/worker-control.cjs');
++  const realRequire=createRequire(file), writes=[], started=[];
++  const fakeRequire=name=>{
++    if(name.endsWith('/native-worker.cjs'))return {start:async(...args)=>{started.push(args);return {thread:1};}};
++    if(name.endsWith('/events.cjs'))return {verify:async()=>{},initialize:async()=>{},code:{wait:{offset:0x100}}};
++    if(name.endsWith('/worker.cjs'))return {verifyWorkerCode:async()=>{}};
++    return realRequire(name);
++  };
++  const module={exports:{}};
++  vm.runInNewContext(fs.readFileSync(file,'utf8'),{require:fakeRequire,module,exports:module.exports,__dirname:path.dirname(file),Buffer,Date});
++  const s={base:0x100000000,bytes:0x3000000,threads:new Set(),handles:new Set([7,8]),write:async(address,bytes)=>writes.push({address,bytes})};
++  const state={services:[{name:'ro:dmnt',handle:7}]};
++  return {dispatch:module.exports.dispatch,context:{s,live:{sdk:0x200000000},save:async()=>{}},state,writes,started};
++}
++for(const id of [0x524f001a,0x524f001b,0x524f001c])test(`host accepts range command ${id.toString(16)} with PID descriptor`,async()=>{
++  const h=harness();await h.dispatch(h.context,{command:'root-native-worker-prepare',kind:'ro-process',handle:7,processHandle:0xffff8001,id,hex:Buffer.alloc(32).toString('hex')},h.state,{});
++  assert.equal(h.started.length,1);assert.equal(h.writes[0].bytes.readUInt32LE(8),3);
++  assert.equal(h.writes[0].bytes.readUInt32LE(40),id);
++});
++test('new host commands reject a different owned process handle',async()=>{
++  const h=harness();await assert.rejects(h.dispatch(h.context,{command:'root-native-worker-prepare',kind:'ro-process',handle:7,processHandle:8,id:0x524f001a,hex:Buffer.alloc(32).toString('hex')},h.state,{}),/current application/);
++  assert.equal(h.started.length,0);assert.equal(h.writes.length,0);
++});
++test('unknown commands remain rejected',async()=>{
++  const h=harness();await assert.rejects(h.dispatch(h.context,{command:'root-native-worker-prepare',kind:'ro-process',handle:7,processHandle:0xffff8001,id:0x524f001d,hex:Buffer.alloc(32).toString('hex')},h.state,{}),/Unknown process probe/);
++  assert.equal(h.started.length,0);
++});

@@ -1,0 +1,430 @@
+--- a/host/lib/target.cjs
++++ b/host/lib/target.cjs
+@@ -14,6 +14,7 @@
+  * by tests/host/lifecycle.test.cjs without a console.
+  */
+ const path = require('node:path');
++const fs = require('node:fs');
+ const {HostError, check, hex} = require('./common.cjs');
+ 
+ const PAGE = 0x1000;
+@@ -21,8 +22,6 @@
+ const CMD_MAP_RX_RANGE = 0x524f001a;
+ const CMD_MAP_RW_RANGE = 0x524f001b;
+ const CMD_UNMAP_RANGE = 0x524f001c;
+-const CMD_UNMAP_PAGE = 0x524f0013;
+-const CMD_PATCH = 0x524f0014;
+ const SDK_ALLOCATE = 5732112;
+ /* operator delete(void*) -> free().  5797280 (used before) is memset, which
+    made every release a silent no-op and leaked each launch's blocks. */
+@@ -36,18 +35,23 @@
+     this.pid = 0;
+     this.prepared = null;
+     this.mapped = [];
++    this.retainedSources = new Set();
++    this.mappingFailure = null;
+   }
+ 
+   static async open(options) {
+     const target = new LiveTarget(options);
+     const runDir = target.runDir;
++    check(!fs.existsSync(path.join(runDir, 'hbl-mapping-uncertain.json')),
++      'This run has an unresolved mapping failure; restart SmileBASIC and the runner.',
++      'session-uncertain');
+     target.rpc = require(path.join(runDir, 'shared/rpc.cjs'));
+     const {connect} = require(path.join(runDir, 'switch2/tools/fs-memory.cjs'));
+     const {Client} = require(path.join(runDir, 'switch2/process/client.cjs'));
+     target.memory = await connect();
+     target.client = await new Client().open();
+-    /* Bulk mapping makes thousands of calls; keep the audit journal in memory. */
+-    target.client.save = async () => {};
++    /* Keep the native request journal: the range extension uses only a few
++     * IPCs per image, and the replies are useful hardware-test evidence. */
+     const app = await target.client.info(HANDLE);
+     check(!Number(app.result) && Number(app.pid) > 0, 'cannot identify the application process');
+     target.pid = Number(app.pid);
+@@ -59,6 +63,24 @@
+   get kind() { return 'live'; }
+   get scratchOutput() { return this.rpc.output; }
+ 
++  requireHealthy() {
++    check(!this.mappingFailure && !this.client?.pending,
++      'Session has an unresolved native operation; restart SmileBASIC and the runner. ' +
++      (this.mappingFailure || ''), 'session-uncertain');
++  }
++
++  markMappingFailure(error) {
++    this.mappingFailure = error.message;
++    if (this.runDir) {
++      try {
++        fs.writeFileSync(path.join(this.runDir, 'hbl-mapping-uncertain.json'),
++          JSON.stringify({session: this.session, error: error.message,
++            mapped: this.mapped, at: new Date().toISOString()}, null, 2) + '\n',
++          {mode: 0o600});
++      } catch (saveError) { this.log?.warn('cannot save failure marker: ' + saveError.message); }
++    }
++  }
++
+   async prepare() {
+     this.prepared = await this.memory.request({command: 'root-native-process-test-prepare'});
+     check(Number(this.prepared.output) > 0, 'prepared context page is invalid');
+@@ -66,6 +88,7 @@
+   }
+ 
+   async allocate(size, align = PAGE) {
++    this.requireHealthy();
+     check(Number.isInteger(size) && size > 0, 'allocation size');
+     const reply = await this.rpc.call(SDK_ALLOCATE, [this.rpc.output, align, size]);
+     check(reply.result === 0n, 'SDK allocate failed: ' + reply.result);
+@@ -75,45 +98,60 @@
+   }
+ 
+   async free(address) {
++    this.requireHealthy();
++    check(!this.retainedSources.has(address),
++      'Refusing to free a source block that may still be mapped: ' + hex(address));
+     /* free() returns void: x0 is whatever the callee left there. */
+     await this.rpc.call(SDK_FREE, [address, 0, 0]);
+     return true;
+   }
+ 
+-  async write(address, buffer) { await this.rpc.write(address, buffer); }
+-  async read(address, length) { return this.rpc.read(address, length); }
+-  async query(address) { return this.rpc.query(address); }
++  /* rpc.write refuses more than 64 MiB per call; a large app image (a
++     statically recompiled game's code is over 100 MiB) goes in pieces. */
++  async write(address, buffer) {
++    this.requireHealthy();
++    const piece = 0x2000000;
++    for (let offset = 0; offset < buffer.length; offset += piece)
++      await this.rpc.write(address + offset, buffer.subarray(offset, offset + piece));
++  }
++  async read(address, length) { this.requireHealthy(); return this.rpc.read(address, length); }
++  async query(address) { this.requireHealthy(); return this.rpc.query(address); }
+ 
+   /* The bridge refuses call-address until the entry has been verified against
+      the bytes at the destination. */
+   async verify(address, bytes) {
++    this.requireHealthy();
+     const reply = await this.rpc.request({command: 'verify-function', address,
+       hex: bytes.subarray(0, 32).toString('hex')});
+     check(reply.verified, 'entry verification failed at ' + hex(address));
+   }
+ 
+   async call(address, args) {
++    this.requireHealthy();
+     const reply = await this.rpc.callAddress(address, args);
+     return {result: Number(BigInt.asIntN(32, reply.result)), raw: reply.result};
+   }
+ 
+   async mapRange({source, destination, pages, permission}) {
+-    check(pages > 0 && pages <= MAX_RANGE_PAGES, 'range page count ' + pages);
++    this.requireHealthy();
++    check(Number.isInteger(pages) && pages > 0 && pages <= MAX_RANGE_PAGES, 'range page count ' + pages);
++    check(permission === 5 || permission === 3, 'mapping permission must be RX or RW');
+     const id = permission === 5 ? CMD_MAP_RX_RANGE : CMD_MAP_RW_RANGE;
+     const reply = await this.client.request(id, HANDLE, [this.pid, source, destination, pages]);
+     const v = reply.values.map(Number);
+     const mapped = v[3] || 0;
+-    check(!Number(reply.result) && mapped === pages,
++    check(v.length >= 9 && v[8] === 1 && !Number(reply.result) && mapped === pages && !v[6] && !v[7],
+       `map ${permission === 5 ? 'RX' : 'RW'} ${hex(destination)} failed ` +
+       `(${mapped}/${pages} pages, result ${Number(reply.result)})`);
+     return {mapped, mode: v[8] || 0};
+   }
+ 
+   async unmapRange({source, destination, pages}) {
++    this.requireHealthy();
+     const reply = await this.client.request(CMD_UNMAP_RANGE, HANDLE,
+       [this.pid, source, destination, pages]);
+     const v = reply.values.map(Number);
+-    check(!Number(reply.result) && !v[6],
++    check(v.length >= 9 && v[8] === 1 && !Number(reply.result) && v[3] === pages && !v[6],
+       `unmap ${hex(destination)} failed (result ${Number(reply.result)}, ` +
+       `unmapped ${v[3]}/${pages}, failPage ${v[4]}, failResult ${v[5]}, ` +
+       `failures ${v[6]}, source ${hex(source)})`);
+@@ -122,7 +160,15 @@
+ 
+   /* Map one contiguous image into one contiguous free destination. */
+   async mapImage({source, destination, bytes, permission}) {
++    this.requireHealthy();
++    check(Number.isSafeInteger(bytes) && bytes > 0 &&
++      Number.isSafeInteger(source) && source > 0 && source % PAGE === 0 &&
++      Number.isSafeInteger(destination) && destination > 0 && destination % PAGE === 0 &&
++      (permission === 3 || permission === 5), 'invalid mapping request');
+     const pages = Math.ceil(bytes / PAGE);
++    check(Number.isSafeInteger(source + pages * PAGE) &&
++      Number.isSafeInteger(destination + pages * PAGE), 'mapping range overflow');
++    check(!this.retainedSources.has(source), 'source block is already retained');
+     const region = await this.query(destination);
+     /* region.size counts from region.address, not from the destination. */
+     const room = Number(region.address) + Number(region.size) - destination;
+@@ -132,13 +178,24 @@
+       'helper) already owns this base; rebuild the app at a different ' +
+       '--code-base, or restart SmileBASIC if a previous launch leaked it.');
+     /* The range command maps at most MAX_RANGE_PAGES per call. */
+-    for (let done = 0; done < pages; done += MAX_RANGE_PAGES) {
+-      const n = Math.min(MAX_RANGE_PAGES, pages - done);
+-      await this.mapRange({source: source + done * PAGE, destination: destination + done * PAGE,
+-        pages: n, permission});
+-    }
+-    const record = {source, destination, pages, permission, bytes};
++    const record = {source, destination, pages, permission, bytes, confirmedPages: 0};
++    /* Retain BEFORE issuing a mutating request: a lost reply is not proof that
++     * nothing happened. Runtime.release must never free a partially mapped
++     * source, including when mapImage throws before it registers the image.
++     */
++    this.retainedSources.add(source);
+     this.mapped.push(record);
++    try {
++      for (let done = 0; done < pages; done += MAX_RANGE_PAGES) {
++        const n = Math.min(MAX_RANGE_PAGES, pages - done);
++        await this.mapRange({source: source + done * PAGE, destination: destination + done * PAGE,
++          pages: n, permission});
++        record.confirmedPages += n;
++      }
++    } catch (error) {
++      this.markMappingFailure(error);
++      throw error;
++    }
+     return record;
+   }
+ 
+@@ -190,60 +247,28 @@
+   }
+ 
+   async unmapImage(entry) {
++    this.requireHealthy();
+     const pages = entry.pages || Math.ceil((entry.bytes || 0) / PAGE);
+-    check(pages > 0, 'unmap needs a page count for ' + hex(entry.destination));
+-    /* The bulk unmap command validates the source range against the source
+-     * block's reported size and returned 0xD401 for an app image whose source
+-     * was exactly page-rounded.  The single-page command has no such check, so
+-     * unmap page by page (cheap: a handful of pages, one round trip each) and
+-     * fall back to the bulk command if the per-page form is rejected. */
+-    /* Large images: one bulk command (sources carry a slack page, which the
+-     * bulk command needs), per-page as the fallback. */
+-    if (pages > 64) {
+-      try {
+-        for (let done = 0; done < pages; done += MAX_RANGE_PAGES) {
+-          const n = Math.min(MAX_RANGE_PAGES, pages - done);
+-          await this.unmapRange({source: entry.source + done * PAGE,
+-            destination: entry.destination + done * PAGE, pages: n});
+-        }
+-        this.mapped = this.mapped.filter(item =>
+-          !(item.destination === entry.destination && item.source === entry.source));
+-        return;
+-      } catch (error) {
+-        this.log?.warn('bulk unmap failed, unmapping page by page: ' + error.message);
++    const record = this.mapped.find(item => item.source === entry.source &&
++      item.destination === entry.destination && item.pages === pages);
++    check(record && record.confirmedPages === pages, "unmap requires this target's complete mapping");
++    try {
++      for (let done = 0; done < pages; done += MAX_RANGE_PAGES) {
++        const n = Math.min(MAX_RANGE_PAGES, pages - done);
++        await this.unmapRange({source: entry.source + done * PAGE,
++          destination: entry.destination + done * PAGE, pages: n});
+       }
+-    }
+-    /* Page-by-page takes ~30 ms a page: for big images that is minutes of
+-     * blocked host.  Leave them mapped (the caller then keeps the source)
+-     * and report it; relink at another base or restart SmileBASIC. */
+-    if (pages > 2048) {
+-      throw new Error(`bulk unmap failed; leaving ${pages} pages at ${hex(entry.destination)} mapped`);
+-    }
+-    let lastError = 0;
+-    for (let i = 0; i < pages; i++) {
+-      const reply = await this.client.request(CMD_UNMAP_PAGE, HANDLE,
+-        [this.pid, entry.source + i * PAGE, entry.destination + i * PAGE, PAGE]);
+-      if (Number(reply.result)) { lastError = Number(reply.result); break; }
+-    }
+-    if (lastError) {
+-      try {
+-        for (let done = 0; done < pages; done += MAX_RANGE_PAGES) {
+-          const n = Math.min(MAX_RANGE_PAGES, pages - done);
+-          await this.unmapRange({source: entry.source + done * PAGE,
+-            destination: entry.destination + done * PAGE, pages: n});
+-        }
+-        lastError = 0;
+-      } catch (error) {
+-        throw new Error(`unmap ${hex(entry.destination)} failed ` +
+-          `(per-page result ${hex(lastError)}): ${error.message}`);
+-      }
+-    }
+-    /* Drop the same object that mapImage stored. */
+-    this.mapped = this.mapped.filter(item =>
+-      !(item.destination === entry.destination && item.source === entry.source));
++    } catch (error) {
++      /* Never fall back to a second mutation after an uncertain first one. */
++      this.markMappingFailure(error);
++      throw error;
++    }
++    this.mapped = this.mapped.filter(item => item !== record);
++    this.retainedSources.delete(entry.source);
+   }
+ 
+   async close() {
++    if (this.mappingFailure || this.client?.pending) return;
+     try { await this.client.close(); } catch (error) { this.log?.warn('client close: ' + error.message); }
+   }
+ }
+--- a/host/lib/preflight.cjs
++++ b/host/lib/preflight.cjs
+@@ -40,7 +40,8 @@
+     let ok = true;
+     try { execFileSync('sh', ['-c', `command -v ${tool}`], {stdio: 'ignore'}); }
+     catch { ok = false; }
+-    add(tool, ok, true, ok ? 'found' : 'missing', 'apt install gcc-aarch64-linux-gnu');
++    add(tool, ok, !!options.build, ok ? 'found' : 'missing (needed only to rebuild)',
++      'Install a real cross toolchain before using --build');
+   }
+ 
+   /* Built artifacts */
+--- a/host/start.cjs
++++ b/host/start.cjs
+@@ -76,7 +76,7 @@
+   const log = new Log({file: logFile, quiet: false});
+   log.info('hbl-start', {version: '1.0.0', mock: options.mock});
+ 
+-  const checks = await preflight.run({ns2jbDir: options.ns2jbDir, mock: options.mock});
++  const checks = await preflight.run({ns2jbDir: options.ns2jbDir, mock: options.mock, build: options.build});
+   const summary = preflight.summarise(checks, log);
+   if (options.preflight) {
+     console.log(JSON.stringify({ok: summary.ok, checks}, null, 2));
+@@ -169,7 +169,7 @@
+       : await runtime.run({maxEntries: options.maxEntries,
+           maxFrames: options.maxFrames, deadline, stage: options.stage || 0});
+     log.stage('session summary', result);
+-    return 0;
++    return options.appId && result.status !== 0 ? 3 : 0;
+   } catch (error) {
+     log.error(error.message, {stack: error.stack});
+     return 3;
+--- /dev/null
++++ b/tests/host/range-safety.test.cjs
+@@ -0,0 +1,125 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const {LiveTarget} = require('../../host/lib/target.cjs');
++const PAGE = 4096, SOURCE = 0x100000000, DEST = 0x40000000;
++function fixture(replyFn) {
++  const target = new LiveTarget({});
++  const requests = [], frees = [];
++  target.pid = 123;
++  target.rpc = {
++    query: async () => ({address: 0x1000, size: 0x7ffff000, type: 0}),
++    call: async (fn, args) => { frees.push(args[0]); return {result: 0n}; },
++    read: async () => Buffer.alloc(0),
++  };
++  target.client = {pending: false, request: async (id, handle, values) => {
++    requests.push({id,handle,values});
++    if (replyFn) return replyFn(requests.length, id, values, target);
++    return {result: 0, values: [123n,1n,0n,BigInt(values[3]),0n,0n,0n,0n,1n]};
++  }};
++  return {target,requests,frees};
++}
++const entry = (pages=2, permission=5) => ({source:SOURCE,destination:DEST,bytes:pages*PAGE,permission});
++test('RX and RW wire contracts and full cleanup', async () => {
++  for (const permission of [3,5]) {
++    const {target,requests,frees} = fixture(); const e=entry(2,permission);
++    await target.mapImage(e);
++    assert.deepEqual(requests[0],{id:permission===5?0x524f001a:0x524f001b,handle:0xffff8001,values:[123,SOURCE,DEST,2]});
++    await assert.rejects(target.free(SOURCE),/still be mapped/);
++    assert.equal(frees.length,0);
++    await target.unmapImage(e);
++    assert.equal(requests[1].id,0x524f001c);
++    await target.free(SOURCE); assert.deepEqual(frees,[SOURCE]);
++  }
++});
++test('game-sized image maps and unmaps in two bounded requests',async()=>{
++  const {target,requests}=fixture();const e=entry(31083);
++  await target.mapImage(e);
++  assert.deepEqual(requests.map(r=>r.values.slice(1)),[[SOURCE,DEST,16384],[SOURCE+0x4000000,DEST+0x4000000,14699]]);
++  await target.unmapImage(e);
++  assert.equal(requests.length,4);assert.equal(target.retainedSources.size,0);
++});
++test('partial final page rounds up and region offset is respected',async()=>{
++  const {target,requests}=fixture();
++  target.rpc.query=async()=>({address:DEST-PAGE,size:PAGE*3,type:0});
++  await target.mapImage({...entry(),bytes:PAGE+1});assert.equal(requests[0].values[3],2);
++});
++test('source is retained before the first request can lose its reply',async()=>{
++  const {target,requests,frees}=fixture(async(n,id,v,t)=>{
++    assert(t.retainedSources.has(SOURCE));t.client.pending=true;throw Error('lost reply');
++  });
++  await assert.rejects(target.mapImage(entry()),/lost reply/);
++  await assert.rejects(target.free(SOURCE),/unresolved/);
++  await assert.rejects(target.mapImage(entry()),/unresolved/);
++  await assert.rejects(target.unmapImage(entry()),/unresolved/);
++  assert.equal(requests.length,1);assert.equal(frees.length,0);
++});
++test('second-chunk failure cannot free the first chunk or replay mutations',async()=>{
++  const {target,requests,frees}=fixture(async(n,id,v)=>{
++    if(n===2) throw Error('second chunk failed');
++    return {result:0,values:[123n,1n,0n,BigInt(v[3]),0n,0n,0n,0n,1n]};
++  });
++  await assert.rejects(target.mapImage(entry(31083)),/second chunk/);
++  assert.equal(target.mapped[0].confirmedPages,16384);
++  await assert.rejects(target.free(SOURCE),/unresolved/);
++  await assert.rejects(target.call(DEST,[0]),/unresolved/);
++  assert.equal(requests.length,2);assert.equal(frees.length,0);
++});
++test('native permission/rollback failure fails closed',async()=>{
++  const {target,frees}=fixture(async()=>({result:0xd401,values:[123n,1n,0n,2n,0n,0xd401n,1n,0xd401n,1n]}));
++  await assert.rejects(target.mapImage(entry()),/map RX/);
++  await assert.rejects(target.free(SOURCE),/unresolved/);assert.equal(frees.length,0);
++});
++test('short response and incorrect count are not success',async()=>{
++  for(const values of [[123n,1n,0n,2n],[123n,1n,0n,1n,0n,0n,0n,0n,1n]]){
++    const {target}=fixture(async()=>({result:0,values}));
++    await assert.rejects(target.mapImage(entry()),/map RX/);
++    assert(target.retainedSources.has(SOURCE));
++  }
++});
++test('unmap failure performs no fallback and keeps the allocation',async()=>{
++  const {target,requests,frees}=fixture(async(n,id,v)=>({result:n>1?0xd401:0,values:[123n,1n,0n,n>1?0n:BigInt(v[3]),0n,0n,n>1?1n:0n,0n,1n]}));
++  await target.mapImage(entry());
++  await assert.rejects(target.unmapImage(entry()),/unmap/);
++  await assert.rejects(target.free(SOURCE),/unresolved/);
++  assert.equal(requests.length,2);assert.equal(frees.length,0);
++});
++test('partial successful unmap across chunks still retains source on next failure',async()=>{
++  const {target,requests}=fixture(async(n,id,v)=>{
++    if(n===4)throw Error('unmap response lost');
++    return {result:0,values:[123n,1n,0n,BigInt(v[3]),0n,0n,0n,0n,1n]};
++  });
++  const e=entry(31083);await target.mapImage(e);
++  await assert.rejects(target.unmapImage(e),/lost/);
++  await assert.rejects(target.free(SOURCE),/unresolved/);assert.equal(requests.length,4);
++});
++test('successful status with a short unmap count is rejected',async()=>{
++  const {target}=fixture(async(n,id,v)=>({result:0,values:[123n,1n,0n,n>1?1n:BigInt(v[3]),0n,0n,0n,0n,1n]}));
++  await target.mapImage(entry());await assert.rejects(target.unmapImage(entry()),/unmap/);
++});
++test('occupied or undersized destination causes no mutation',async()=>{
++  for(const region of [{address:DEST,size:PAGE,type:0},{address:DEST,size:PAGE*2,type:5}]){
++    const {target,requests}=fixture();target.rpc.query=async()=>region;
++    await assert.rejects(target.mapImage(entry()),/not free/);
++    assert.equal(requests.length,0);assert.equal(target.retainedSources.size,0);
++  }
++});
++test('malformed requests are rejected before contacting the process client',async()=>{
++  for(const change of [{source:SOURCE+1},{destination:DEST+1},{bytes:0},{bytes:-1},{bytes:NaN},{permission:7},{bytes:Number.MAX_SAFE_INTEGER}]){
++    const {target,requests}=fixture();await assert.rejects(target.mapImage({...entry(),...change}));
++    assert.equal(requests.length,0);
++  }
++});
++test('unknown mappings cannot be unmapped',async()=>{
++  const {target,requests}=fixture();await assert.rejects(target.unmapImage(entry()),/complete mapping/);
++  assert.equal(requests.length,0);
++});
++test('failure marker blocks reopening the same run before any connection',async(t)=>{
++  const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
++  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'hbl-range-test-'));
++  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
++  const {target}=fixture(async()=>{throw Error('uncertain mapping');});target.runDir=dir;
++  await assert.rejects(target.mapImage(entry()),/uncertain mapping/);
++  assert(fs.existsSync(path.join(dir,'hbl-mapping-uncertain.json')));
++  await assert.rejects(LiveTarget.open({runDir:dir}),/unresolved mapping failure/);
++});

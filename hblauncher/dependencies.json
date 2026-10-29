@@ -1,9 +1,36 @@
 {
   "hblauncher": {
     "repository": "https://github.com/ravensclawx/HBLauncher",
-    "commit": "18b4748",
+    "commit": "18b4748ba98eeac7df17beb5d3418985eb74897c",
     "abi": 3,
-    "patches": ["hblauncher-runtime-file-locks.diff", "hblauncher-host-large-writes.diff"]
+    "patches": [
+      "hblauncher-runtime-file-locks.diff"
+    ],
+    "host_patch": "hblauncher-host-range-mapping.diff",
+    "reference": {
+      "commit": "9d00834f3636639d9d9df54cb3e1fb10456b2467",
+      "directory": "reference/hblauncher-cpu-sdk",
+      "files": {
+        "homebrew-launcher/display-imports.json": "66d4b3f55b8d2fc178e4d32d2db2ea8fbeac5a466180a91c257283a2a980dceb",
+        "homebrew-launcher/inspect-compatibility.cjs": "19b7366a4afbe48aa3ef66cfdce419a02ab26333d46a04fb6ef61f2c53b1d594",
+        "homebrew-launcher/inspect-display.cjs": "3d425a43b250411c59faefc6c896090ada6301711c721e2ed3789517691a8792",
+        "homebrew-launcher/inspect.cjs": "5341d000b9761c9bc1a4f80c7738e26e9942e0fc55c5a3c0c794e8ddc26ee4ce",
+        "sdk/native/hid-functions.json": "f23cd395c7a993274e6d64afc458121b272747fe571b8af98c925c988d81f89d",
+        "smilebasic/reference/sdk-checks.cjs": "41cef64ebc4b0d4cf064a7ef5555753aa8621fb876a8fa63c9a58ed2ba599287",
+        "smilebasic/reference/sdk-checks.json": "e9cc4c17cb36ba5a2fecfdad346006f795ec99d9cf1ac31dc94c0d254732cabb"
+      }
+    }
+  },
+  "ns2jb": {
+    "repository": "https://gitlab.com/kurumuz/ns2jb",
+    "commit": "81d5bb114c856109dadaf1077d927a9f297fe58d",
+    "patch": "ns2jb-range-mapping.diff",
+    "zig": "0.15.2",
+    "payload": {
+      "path": "engine/switch2/ro/payload/main",
+      "bytes": 5801,
+      "sha256": "8a2c670b2ea4dbb32df281d42567946951ab9f69318775fd0a75c5fe2c1d1421"
+    }
   },
   "dawn": {
     "repository": "https://github.com/encounter/dawn",
