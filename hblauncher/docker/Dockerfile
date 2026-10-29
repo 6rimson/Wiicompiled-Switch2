@@ -3,6 +3,9 @@
 # assembly, so Linux builds translate on Linux), plus what musl-cross-make and Dawn need.
 # libvulkan-dev: HBLauncher's hbxl-build.py takes the (architecture-neutral) Vulkan headers
 # from /usr/include.
+# HBLauncher's own build (run.sh launcher -> tools/build-all.sh): Pillow and DejaVu for the font
+# atlas, glslang and SPIR-V Tools for the UI shaders, Node.js for its host tests. Its AArch64
+# compiler and binutils are the native ones on arm64 (aarch64-linux-gnu-gcc).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential bison flex texinfo gawk file wget curl ca-certificates gnupg \
         git python3 cmake ninja-build pkg-config xz-utils bzip2 rsync patch unzip \
         libicu74 libvulkan-dev \
+        python3-pil fonts-dejavu-core glslang-tools spirv-tools nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Clang 22 from LLVM's apt repository.
