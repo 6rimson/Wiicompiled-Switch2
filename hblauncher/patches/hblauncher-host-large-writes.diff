@@ -1,0 +1,19 @@
+diff --git a/host/lib/target.cjs b/host/lib/target.cjs
+index 3233582..814351f 100644
+--- a/host/lib/target.cjs
++++ b/host/lib/target.cjs
+@@ -80,7 +80,13 @@ class LiveTarget {
+     return true;
+   }
+ 
+-  async write(address, buffer) { await this.rpc.write(address, buffer); }
++  /* rpc.write refuses more than 64 MiB per call; a large app image (a
++     statically recompiled game's code is over 100 MiB) goes in pieces. */
++  async write(address, buffer) {
++    const piece = 0x2000000;
++    for (let offset = 0; offset < buffer.length; offset += piece)
++      await this.rpc.write(address + offset, buffer.subarray(offset, offset + piece));
++  }
+   async read(address, length) { return this.rpc.read(address, length); }
+   async query(address) { return this.rpc.query(address); }
+ 

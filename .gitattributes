@@ -3,6 +3,7 @@
 
 # Patch files must stay LF: git apply matches context bytes against LF upstream sources
 *.patch -text
+hblauncher/patches/*.diff -text
 translator/tests/Translator.Tests/TestAssets/**/*.bin binary
 
 # Region tables

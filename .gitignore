@@ -76,3 +76,10 @@ output.txt
 
 # Operating System
 .DS_Store
+
+# HBLauncher (Switch 2) package build: dependencies, outputs, private file-server roots
+/hblauncher/deps/
+/hblauncher/build/
+/hblauncher/dist/
+/hblauncher/fsroot/
+/hblauncher/app/build/

@@ -1,0 +1,19 @@
+diff --git a/sdk/linux/vfs.c b/sdk/linux/vfs.c
+index d0cfd28..b21d07b 100644
+--- a/sdk/linux/vfs.c
++++ b/sdk/linux/vfs.c
+@@ -674,6 +674,14 @@ long hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, long f, in
+             unlock();
+             return fd;
+         }
++        /* POSIX record locks: one process owns every file, so a lock is never
++         * contended.  SQLite (shader/pipeline caches) cannot open a database
++         * whose locks fail, so grant them: F_GETLK reports F_UNLCK. */
++        if (b == 5 || b == 36) {                        /* F_GETLK / F_OFD_GETLK */
++            if (c) *(volatile short *)c = 2;            /* l_type = F_UNLCK */
++            return 0;
++        }
++        if (b == 6 || b == 7 || b == 37 || b == 38) return 0;  /* F_(OFD_)SETLK(W) */
+         return -HBXL_EINVAL;
+     case 23: case 24:                                   /* dup / dup3 */
+         if (a < 3) return n == 23 ? a : b;

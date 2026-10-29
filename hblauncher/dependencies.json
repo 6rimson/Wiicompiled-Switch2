@@ -1,0 +1,28 @@
+{
+  "hblauncher": {
+    "repository": "https://github.com/ravensclawx/HBLauncher",
+    "commit": "18b4748",
+    "abi": 3,
+    "patches": ["hblauncher-runtime-file-locks.diff", "hblauncher-host-large-writes.diff"]
+  },
+  "dawn": {
+    "repository": "https://github.com/encounter/dawn",
+    "commit": "1155e0ed531126f33a1279afa029349651ca1c93",
+    "patch": "dawn-hbx-switch2.diff"
+  },
+  "sdl3": {
+    "repository": "https://github.com/libsdl-org/SDL",
+    "commit": "8e37db5e797b6167f3a00d697d816a684bd259c7",
+    "version": "3.4.10",
+    "patch": "sdl3-hbx-switch2.diff"
+  },
+  "aurora": {
+    "patch": "aurora-hbx-switch2.diff"
+  },
+  "musl-cross-make": {
+    "repository": "https://github.com/richfelker/musl-cross-make",
+    "commit": "5e8042e63de29f8473fc3b0b831a587ba284e1a8",
+    "toolchain": "GCC 15.1.0, musl 1.2.6, binutils 2.44; HBLauncher syscall hooks; BTI target libraries"
+  },
+  "clang": "22"
+}

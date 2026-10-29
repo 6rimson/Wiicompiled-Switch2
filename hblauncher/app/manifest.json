@@ -1,0 +1,20 @@
+{
+  "id": "wiicompiled-rr",
+  "name": "Retro Rewind",
+  "description": "WiiCompiled + Retro Rewind - your own RMCP01 disc and RetroRewind6 folder, served from the PC",
+  "version": "0.1.0",
+  "abi": 3,
+  "kind": "native",
+  "display": "exclusive",
+  "sources": [],
+  "linux": {
+    "code_base": "0x40000000",
+    "data_base": "0x50000000",
+    "fs_port": 39503
+  },
+  "limits": {
+    "heap_bytes": 65536,
+    "stack_bytes": 1048576,
+    "frames": 0
+  }
+}
