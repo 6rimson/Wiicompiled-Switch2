@@ -45,11 +45,17 @@ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0010'0000'0000ull;
 // fold this to a compile-time false: it appears in every flat access and must
 // not become a hot-path load. Only AArch64, where the page size is a kernel
 // configuration (4/16/64 KiB), has to probe it at runtime.
+// MKW_GUEST_FLAT_CHECKED_ONLY builds (hosts that can neither place memory at a fixed address nor
+// alias it, such as HBLauncher on Switch 2) fold this to a compile-time true instead: every access
+// takes the checked page-table path, which handles the cached/uncached/physical mirrors itself,
+// and the fixed base is never reserved or touched (see guest_flat_memory_heap.cpp).
 #if defined(_WIN32) || defined(__x86_64__)
 #define MKW_GUEST_FLAT_FIXED_PAGE_SIZE 1
 #endif
 
-#if defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+inline constexpr bool RequiresCheckedAccess() noexcept { return true; }
+#elif defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
 inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
 #else
 extern bool g_requiresCheckedAccess;

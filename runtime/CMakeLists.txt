@@ -344,6 +344,18 @@ endif()
 # a registration file is silently never compiled and never errors. The stale-glob
 # failure mode is worth far more than the milliseconds.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
+# Checked-only guest memory: no fixed 4 GiB reservation and no aliased views, for hosts that
+# cannot provide them (HBLauncher on Switch 2). The define must reach the translated shards
+# too, since every guest access is inlined from guest_abi/memory_access.h.
+option(MKW_GUEST_FLAT_CHECKED_ONLY "Route every guest access through the checked page table (no flat reservation)" OFF)
+if(MKW_GUEST_FLAT_CHECKED_ONLY)
+    add_compile_definitions(MKW_GUEST_FLAT_CHECKED_ONLY=1)
+    list(REMOVE_ITEM SOURCES
+        "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+else()
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_heap.cpp")
+endif()
 if(MKW_PLATFORM_MACOS)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
     if(MKW_PLATFORM_MACOS_ARM64)

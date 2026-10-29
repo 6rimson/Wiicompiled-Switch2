@@ -535,7 +535,8 @@ MKW_MEMORY_FORCE_INLINE void WriteResolvedFloat64(uint8_t* r, uint32_t o, uint32
 // FlatWrite* helpers then use the checked page-table path, which materializes
 // deferred reads and applies executable-write/MMIO policy before touching RAM.
 // FlatWriteRam* remains direct because the translator emits it only for
-// addresses it has proven are ordinary RAM.
+// addresses it has proven are ordinary RAM - except in MKW_GUEST_FLAT_CHECKED_ONLY
+// builds, which have no flat view to store into.
 
 template <typename T>
 MKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {
@@ -618,26 +619,46 @@ MKW_MEMORY_FORCE_INLINE void FlatWriteFloat64(uint32_t address, double value) {
 // instead of dispatched inline. Never use these for an address the translator hasn't proven.
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRam8(uint32_t address, uint8_t value) {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    Memory::Write8(address, value);
+#else
     FlatStore<uint8_t>(address, value);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRam16(uint32_t address, uint16_t value) {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    Memory::Write16(address, value);
+#else
     FlatStore<uint16_t>(address, value);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRam32(uint32_t address, uint32_t value) {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    Memory::Write32(address, value);
+#else
     FlatStore<uint32_t>(address, value);
+#endif
 }
 
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRamFloat32(uint32_t address, double value) {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    Memory::WriteFloat32(address, value);
+#else
     FlatStore<uint32_t>(address, ConvertPpcDoubleToSingleBits(value));
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRamFloat64(uint32_t address, double value) {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    Memory::WriteFloat64(address, value);
+#else
     uint64_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     FlatStore<uint64_t>(address, bits);
+#endif
 }
 
 } // namespace MemoryInline
