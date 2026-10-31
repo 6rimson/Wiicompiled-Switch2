@@ -14,6 +14,7 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "runtime_product.h"
+#include "runtime_stall.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -917,6 +918,7 @@ extern "C" int32_t DVDReadPrio_8015E834(uint32_t fileInfoPtr, uint32_t bufferPtr
                             "DVD read destination is outside guest memory");
     }
 
+    RuntimeStall::Timer dvdReadTimer("dvd read", HostPathText(entry.hostPath), RuntimeStall::Io::Dvd, uLength);
     std::vector<uint8_t> tempBuf;
     DvdReadContract::HostReadFailure failure;
     if (!DvdReadContract::ReadExact(entry.hostPath, uOffset, uLength, tempBuf, failure)) {
@@ -984,6 +986,8 @@ extern "C" int32_t DVD__ReadAbsAsyncPrio_HLE_801628cc(uint32_t cmdBlockPtr,
                                      readInfo.fileOffset, requestedLength,
                                      "DVD read destination is outside guest memory");
         } else {
+            RuntimeStall::Timer dvdReadTimer("dvd read", HostPathText(readInfo.entry->hostPath),
+                                             RuntimeStall::Io::Dvd, readInfo.readLength);
             std::vector<uint8_t> tempBuf;
             DvdReadContract::HostReadFailure failure;
             if (!DvdReadContract::ReadExact(readInfo.entry->hostPath,
@@ -1115,6 +1119,8 @@ extern "C" int32_t DVDLowRead_80166330(uint32_t buffer, uint32_t length, uint32_
         return finish(false);
     }
 
+    RuntimeStall::Timer dvdReadTimer("dvd read", HostPathText(readInfo.entry->hostPath),
+                                     RuntimeStall::Io::Dvd, readInfo.readLength);
     std::vector<uint8_t> tempBuf;
     DvdReadContract::HostReadFailure failure;
     if (!DvdReadContract::ReadExact(readInfo.entry->hostPath,

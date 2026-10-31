@@ -1,5 +1,7 @@
 // OSReport formatting/logging.
 
+#include "runtime_stall.h"
+
 #include <cstdint>
 #include <iostream>
 #include <set>
@@ -119,13 +121,13 @@ static void HLE_LogOSReport(CpuContext* cpu, const char* fmt)
         return;
     } else {
         if (repeated != 0) {
-            std::cout << "[OSReport] previous message repeated " << repeated << " time(s)" << std::endl;
+            std::cout << "[OSReport] t=" << RuntimeStall::NowMs() << " previous message repeated " << repeated << " time(s)" << std::endl;
             repeated = 0;
         }
         lastBuffer = buffer;
     }
 
-    std::cout << "[OSReport] " << buffer;
+    std::cout << "[OSReport] t=" << RuntimeStall::NowMs() << " " << buffer;
 
     // OSReport strings don't always end in \n, so flush explicitly
     if (buffer.empty() || buffer.back() != '\n') {

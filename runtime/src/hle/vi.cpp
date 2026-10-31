@@ -3,6 +3,7 @@
 #include "abi_bridge.h"
 #include "guest_interrupt_context.h"
 #include "ppc_runtime.h"
+#include "runtime_stall.h"
 #include "aurora_events.h"
 #include "settings_overlay.h"
 #include "fiber_manager.h"
@@ -524,6 +525,30 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     struct SequenceGuard {
         ~SequenceGuard() { s_presentSequenceActive.store(false, std::memory_order_release); }
     } sequenceGuard;
+    {
+        // Screen-change freezes (restart, next race, change course...) are many small reads and
+        // saves rather than one slow call, so report each long frame with the file I/O done in it.
+        // Whatever is left over is guest code, shader waits ([stall] lines) and rendering.
+        static long long s_lastPresentUs = 0;
+        const long long nowUs = RuntimeStall::NowUs();
+        RuntimeStall::IoTotals& io = RuntimeStall::FrameIo();
+        constexpr int kDvd = static_cast<int>(RuntimeStall::Io::Dvd);
+        constexpr int kNand = static_cast<int>(RuntimeStall::Io::Nand);
+        const long long dvdUs = io.us[kDvd].exchange(0, std::memory_order_relaxed);
+        const long long dvdOps = io.ops[kDvd].exchange(0, std::memory_order_relaxed);
+        const long long dvdBytes = io.bytes[kDvd].exchange(0, std::memory_order_relaxed);
+        const long long nandUs = io.us[kNand].exchange(0, std::memory_order_relaxed);
+        const long long nandOps = io.ops[kNand].exchange(0, std::memory_order_relaxed);
+        const long long nandBytes = io.bytes[kNand].exchange(0, std::memory_order_relaxed);
+        if (s_lastPresentUs != 0 && nowUs - s_lastPresentUs >= 250'000) {
+            std::fprintf(stderr,
+                         "[frame] t=%lld took %lld ms: disc reads %lld (%lld KiB) %lld ms, "
+                         "saves/NAND %lld ops (%lld KiB written) %lld ms\n",
+                         s_lastPresentUs / 1000, (nowUs - s_lastPresentUs) / 1000, dvdOps, dvdBytes / 1024,
+                         dvdUs / 1000, nandOps, nandBytes / 1024, nandUs / 1000);
+        }
+        s_lastPresentUs = nowUs;
+    }
     Clock::time_point paceDeadline{};
     bool paceThisFrame = false;
     if (paceToRetrace) {

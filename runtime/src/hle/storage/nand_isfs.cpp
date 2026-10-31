@@ -3,6 +3,7 @@
 // Shared state and helpers live in nand_internal.h.
 
 #include "nand_internal.h"
+#include "runtime_stall.h"
 
 #include "discord_presence.h"
 #include "runtime_log.h"
@@ -359,6 +360,7 @@ static int32_t HandleShaIoctlv(int32_t fd, uint32_t cmd, uint32_t numIn, uint32_
 }
 
 extern "C" int32_t NAND_IOS_Open_HLE(uint32_t pathPtr, uint32_t mode) {
+    RuntimeStall::Timer nandTimer("nand open", {}, RuntimeStall::Io::Nand, 0);
     const std::string pathStorage = ReadGuestCString(pathPtr);
     const char* path = pathPtr == 0 ? nullptr : pathStorage.c_str();
     
@@ -439,6 +441,7 @@ extern "C" void NAND_IOS_OpenBody_HLE_801938FC(CpuContext* ctx) {
 REGISTER_NATIVE_REPLACEMENT_AS(0x801938FC, NAND_IOS_OpenBody_HLE_801938FC, "NAND_IOS_OpenBody_HLE_801938FC");
 
 extern "C" int32_t NAND_IOS_Close_HLE(uint32_t fd) {
+    RuntimeStall::Timer nandTimer("nand close", {}, RuntimeStall::Io::Nand, 0);
     if (fd == ISFS_DEV_FD) {
         return ISFS_OK;
     }
@@ -495,6 +498,7 @@ extern "C" int32_t NAND_IOS_Read_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t l
 PPC_NATIVE_OVERRIDE(80193C80, NAND_IOS_Read_HLE, int32_t, (uint32_t fd, uint32_t bufferPtr, uint32_t length), (fd, bufferPtr, length));
 
 extern "C" int32_t NAND_IOS_Write_HLE(uint32_t fd, uint32_t bufferPtr, uint32_t length) {
+    RuntimeStall::Timer nandTimer("nand write", {}, RuntimeStall::Io::Nand, length);
     auto* handle = GetHandle(fd);
     if (!handle || !handle->file) {
         LogNandError("IOS_Write", "invalid fd=%d", fd);

@@ -3,6 +3,7 @@
 // Shared state and helpers live in nand_internal.h.
 
 #include "nand_internal.h"
+#include "runtime_stall.h"
 
 #include <atomic>
 #include <cerrno>
@@ -119,6 +120,7 @@ extern "C" int32_t NANDCheck_HLE(uint32_t blockSize, uint32_t blockCount, uint32
 PPC_NATIVE_OVERRIDE(8019EAD0, NANDCheck_HLE, int32_t, (uint32_t blockSize, uint32_t blockCount, uint32_t outResults), (blockSize, blockCount, outResults));
 
 extern "C" int32_t NANDOpen_HLE(uint32_t pathPtr, uint32_t fileInfoPtr, uint32_t mode) {
+    RuntimeStall::Timer nandTimer("nand open", {}, RuntimeStall::Io::Nand, 0);
     const char* path = pathPtr ? (const char*)Memory::GetPointer(pathPtr) : nullptr;
     if (!path || !fileInfoPtr) {
         LogNandError("NANDOpen", "invalid params: path=%p fileInfo=0x%08X", path, fileInfoPtr);
@@ -207,6 +209,7 @@ extern "C" int32_t NANDOpen_HLE(uint32_t pathPtr, uint32_t fileInfoPtr, uint32_t
 PPC_NATIVE_OVERRIDE(8019C800, NANDOpen_HLE, int32_t, (uint32_t pathPtr, uint32_t fileInfoPtr, uint32_t mode), (pathPtr, fileInfoPtr, mode));
 
 extern "C" int32_t NANDClose_HLE(uint32_t fileInfoPtr) {
+    RuntimeStall::Timer nandTimer("nand close", {}, RuntimeStall::Io::Nand, 0);
     if (!fileInfoPtr) {
         return NAND_RESULT_INVALID;
     }
@@ -259,6 +262,7 @@ extern "C" int32_t NANDRead_HLE(uint32_t fileInfoPtr, uint32_t bufferPtr, uint32
 PPC_NATIVE_OVERRIDE(8019B7A4, NANDRead_HLE, int32_t, (uint32_t fileInfoPtr, uint32_t bufferPtr, uint32_t length), (fileInfoPtr, bufferPtr, length));
 
 extern "C" int32_t NANDWrite_HLE(uint32_t fileInfoPtr, uint32_t bufferPtr, uint32_t length) {
+    RuntimeStall::Timer nandTimer("nand write", {}, RuntimeStall::Io::Nand, length);
     if (!fileInfoPtr) {
         return NAND_RESULT_INVALID;
     }

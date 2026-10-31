@@ -1,4 +1,5 @@
 #include "network_internal.h"
+#include "runtime_stall.h"
 
 #include "console_identity.h"
 #include "hle/net/network.h"
@@ -693,6 +694,7 @@ extern "C" int32_t Network_HLE_Close(uint32_t fd) {
 
 extern "C" int32_t Network_HLE_Ioctl(uint32_t fd, uint32_t cmd, uint32_t inBuf, uint32_t inLen,
                                       uint32_t outBuf, uint32_t outLen) {
+    RuntimeStall::Timer netTimer("net ioctl", "fd=" + std::to_string(fd) + " cmd=" + std::to_string(cmd));
     const auto device = GetDeviceKind(fd);
     if (!device) {
         return -101;
@@ -714,6 +716,7 @@ extern "C" int32_t Network_HLE_Ioctl(uint32_t fd, uint32_t cmd, uint32_t inBuf, 
 
 extern "C" int32_t Network_HLE_Ioctlv(uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut,
                                        uint32_t vectorPtr) {
+    RuntimeStall::Timer netTimer("net ioctlv", "fd=" + std::to_string(fd) + " cmd=" + std::to_string(cmd));
     const auto device = GetDeviceKind(fd);
     if (!device) {
         return -101;
