@@ -1,0 +1,72 @@
+--- a/sdk/linux/net.c
++++ b/sdk/linux/net.c
+@@ -302,6 +302,8 @@
+ };
+ 
+ void hbxl_call_on_stack(void (*fn)(void *), void *arg, void *stack_top);
++
++extern volatile int hbxl_net_resolving;
+ 
+ struct resolve_call {
+     char *name;
+@@ -341,7 +343,9 @@
+     call.hints = hints;
+     call.results = results;
+     call.status = -1;
++    __atomic_fetch_add(&hbxl_net_resolving, 1, __ATOMIC_RELAXED);
+     hbxl_call_on_stack(resolve_on_sdk_stack, &call, stack + RESOLVER_STACK);
++    __atomic_fetch_sub(&hbxl_net_resolving, 1, __ATOMIC_RELAXED);
+     if (call.status != 0) {
+         hbxl_logf("hbxl: resolver failed for %s: %d, errno %d", name, (int64_t)call.status, (int64_t)net_errno());
+     } else {
+@@ -360,7 +364,16 @@
+     return status;
+ }
+ 
+-long hbxl_net_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled) {
++/* What the socket layer is doing, for a freeze watchdog: a call that never returns stays here. */
++volatile long hbxl_net_inflight_call, hbxl_net_inflight_fd;
++volatile int hbxl_net_resolving;
++static int g_net_trace_budget = 800;
++
++static int net_trace_allow(void) {
++    return __atomic_fetch_sub(&g_net_trace_budget, 1, __ATOMIC_RELAXED) > 0;
++}
++
++static long net_dispatch(long n, long a, long b, long c, long d, long e, long f, int *handled) {
+     switch (n) {
+     case 25: case 29: case 57: case 63: case 64:
+         if (!IS_SOCK(a)) return 0;
+@@ -380,6 +393,17 @@
+         return 0;
+     }
+     *handled = 1;
++    hbxl_net_inflight_fd = a;
++    hbxl_net_inflight_call = n;
++    if (n == 203) {
++        const uint8_t *sa = (const uint8_t *)b;
++        if (net_trace_allow()) {
++            hbxl_logf("hbxl: net connect fd %d to %u.%u.%u.%u:%u", (int64_t)a, (uint64_t)sa[4], (uint64_t)sa[5],
++                      (uint64_t)sa[6], (uint64_t)sa[7], (uint64_t)((sa[2] << 8) | sa[3]));
++        }
++    } else if (n != 73 && n != 207 && n != 209 && net_trace_allow()) {
++        hbxl_logf("hbxl: net call %d fd %d", (int64_t)n, (int64_t)a);
++    }
+     switch (n) {
+     case 25:  return net_fcntl(a, b, c);
+     case 29:
+@@ -418,3 +442,14 @@
+     default:  return -HBXL_ENOSYS;
+     }
+ }
++
++long hbxl_net_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled) {
++    long r = net_dispatch(n, a, b, c, d, e, f, handled);
++    if (*handled) {
++        hbxl_net_inflight_call = 0;
++        if (n != 73 && r != -11 && net_trace_allow()) {
++            hbxl_logf("hbxl: net call %d fd %d -> %d", (int64_t)n, (int64_t)a, (int64_t)r);
++        }
++    }
++    return r;
++}

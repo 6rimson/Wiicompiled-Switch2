@@ -39,14 +39,26 @@ std::atomic<uint64_t> g_hbxMemorySlowCalls{0};
 #define MKW_HBX_COUNT_MEMORY_SLOW() ((void)0)
 #endif
 
+uintptr_t MemoryInline::MixedPageWritableBias(uint32_t address) {
+    const uint32_t page = address >> kPageShift;
+    const uint32_t dataStart = g_mixedPageDataStart[page];
+    return dataStart != 0 && address >= dataStart ? g_fullPageBias[page] : 0;
+}
+
 bool MemoryInline::TryGetWritablePointerOutOfLine(
     uint32_t address, size_t length, uint8_t*& pointer) {
+    // The store has already proved it stays inside this page.
+    if (const uintptr_t mixedBias = MixedPageWritableBias(address)) {
+        pointer = reinterpret_cast<uint8_t*>((mixedBias - kBiasEncoding) + address);
+        return true;
+    }
     return TryGetWritablePointerFast(address, length, pointer);
 }
 
 uintptr_t MemoryInline::g_fullPageBias[MemoryInline::kPageCount]{};
 uintptr_t MemoryInline::g_fullReadablePageBias[MemoryInline::kPageCount]{};
 uintptr_t MemoryInline::g_fullWritablePageBias[MemoryInline::kPageCount]{};
+uint32_t MemoryInline::g_mixedPageDataStart[MemoryInline::kPageCount]{};
 const MemoryInline::SparseWritablePageTable*
     MemoryInline::g_sparseWritablePageTables[MemoryInline::kPageCount]{};
 uint8_t MemoryInline::g_deferredReadCoveredPages[MemoryInline::kPageCount]{};
@@ -151,6 +163,7 @@ void ClearPageTable() {
         MemoryInline::g_fullPageBias[i] = 0;
         MemoryInline::g_fullReadablePageBias[i] = 0;
         MemoryInline::g_fullWritablePageBias[i] = 0;
+        MemoryInline::g_mixedPageDataStart[i] = 0;
         MemoryInline::g_deferredReadCoveredPages[i] = 0;
         MemoryInline::g_sparseWritablePageTables[i] = nullptr;
         SparseWritablePageTableStorage()[i].reset();
@@ -294,11 +307,13 @@ void RefreshFastPathTables() {
             RecompMod::g_executableWriteGuardCoarsePages[page].load(
                 std::memory_order_relaxed) != 0;
         MemoryInline::g_fullWritablePageBias[page] = coarseExecutable ? 0 : bias;
+        MemoryInline::g_mixedPageDataStart[page] = 0;
         if (!coarseExecutable || bias == 0)
             continue;
 
         auto sparse = std::make_unique<MemoryInline::SparseWritablePageTable>();
         bool hasExecutableSubPage = false;
+        uint32_t lastExecutableSubPage = 0;
         bool hasWritableSubPage = false;
         const uint32_t firstExactPage =
             page * MemoryInline::kWritableSubPagesPerPage;
@@ -310,6 +325,9 @@ void RefreshFastPathTables() {
             hasExecutableSubPage |= executable;
             hasWritableSubPage |= !executable;
             sparse->encodedBias[subPage] = executable ? 0 : bias;
+            if (executable) {
+                lastExecutableSubPage = subPage;
+            }
         }
 
         // A homogeneous executable page has no writable fast path; a
@@ -318,6 +336,10 @@ void RefreshFastPathTables() {
         if (hasExecutableSubPage && hasWritableSubPage) {
             MemoryInline::g_sparseWritablePageTables[page] = sparse.get();
             sparseStorage[page] = std::move(sparse);
+            if (lastExecutableSubPage + 1u < MemoryInline::kWritableSubPagesPerPage) {
+                MemoryInline::g_mixedPageDataStart[page] = (page << MemoryInline::kPageShift) +
+                    ((lastExecutableSubPage + 1u) << MemoryInline::kWritableSubPageShift);
+            }
         }
     }
     std::lock_guard lock{DeferredReadMutex()};

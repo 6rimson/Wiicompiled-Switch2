@@ -14,6 +14,8 @@ bool Enabled() noexcept;
 // Times integer work, a small buffer and guest RAM on this thread and on five new ones, which land
 // on cores 1-5. Compares each core's speed and shows what guest memory costs.
 void LogCoreCalibration(const uint8_t* guestRam, size_t size);
+// Rough CPU clock from a two-cycle integer loop; takes about 40 ms.
+float MeasureCpuMhz();
 #endif
 void AddWait(std::chrono::steady_clock::duration wait) noexcept;
 void OnFramePresented() noexcept;

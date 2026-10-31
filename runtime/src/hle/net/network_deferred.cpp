@@ -9,6 +9,10 @@
 void OS_HLE_WakeupThreadNoReschedule(CpuContext* ctx, uint32_t waitQueue);
 void NandQueueIosCallback(uint32_t callbackPtr, int32_t result, uint32_t callbackArg);
 
+#if defined(HBX_SWITCH2)
+extern "C" int hbxl_resolve_ipv4(const char* name, uint32_t* ipv4) __attribute__((weak));
+#endif
+
 namespace NetworkHle {
 
 enum class DeferredDnsKind {
@@ -250,6 +254,20 @@ static DeferredDnsCompletion ResolveDeferredDns(DeferredDnsWork work) {
     addrinfo* nativeResults = nullptr;
     const char* node = completion.work.node.empty() ? nullptr : completion.work.node.c_str();
     const char* service = completion.work.service.empty() ? nullptr : completion.work.service.c_str();
+#if defined(HBX_SWITCH2)
+    // musl's resolver needs a nameserver; the console's own resolver already knows its network.
+    char resolvedNode[INET_ADDRSTRLEN];
+    uint32_t resolvedIpv4 = 0;
+    if (node != nullptr && hbxl_resolve_ipv4 != nullptr) {
+        // One lookup at a time: the first time two overlapped, the game froze.
+        static std::mutex resolverMutex;
+        std::lock_guard<std::mutex> lock(resolverMutex);
+        if (hbxl_resolve_ipv4(node, &resolvedIpv4) == 0 &&
+            inet_ntop(AF_INET, &resolvedIpv4, resolvedNode, sizeof(resolvedNode)) != nullptr) {
+            node = resolvedNode;
+        }
+    }
+#endif
     const int gai = getaddrinfo(node, service, hintPtr, &nativeResults);
     if (gai != 0 || !nativeResults) {
         completion.result = DeferredDnsFailureResult(completion.work.kind);

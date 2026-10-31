@@ -1,0 +1,65 @@
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstring>
+ #include <limits>
+ #include <mutex>
+@@ -16,6 +17,11 @@
+ extern "C" void hbxl_pin_next_thread(int core) __attribute__((weak));
+ #endif
+ 
++#if defined(HBX_SWITCH2)
++std::atomic<uint64_t> aurora_hbx_drain_us{0};
++std::atomic<uint64_t> aurora_hbx_drain_count{0};
++#endif
++
+ namespace aurora::gx::fifo {
+ namespace detail {
+ uint8_t* sBufferData = nullptr;
+@@ -91,8 +97,14 @@
+     }
+     processed += result.bytesProcessed;
+     sProcessed.store(processed, order);
++#if !defined(HBX_SWITCH2)
+     sProcessed.notify_all();
++#endif
+   }
++#if defined(HBX_SWITCH2)
++  // Once per batch: a wake-up per command costs more than the commands do here.
++  sProcessed.notify_all();
++#endif
+ }
+ 
+ void worker_main(std::stop_token token) noexcept {
+@@ -285,12 +297,27 @@
+     wake_worker();
+ 
+     uint64_t processed = sProcessed.load(std::memory_order_acquire);
++#if defined(HBX_SWITCH2)
++    // The game thread and this worker have cores of their own, so polling is cheaper than sleeping.
++    const auto hbxDrainStart = std::chrono::steady_clock::now();
++    for (int spin = 0; spin < 400000 && processed < target; ++spin) {
++      __asm__ volatile("yield");
++      processed = sProcessed.load(std::memory_order_acquire);
++    }
++#endif
+     if (processed < target) {
+       do {
+         sProcessed.wait(processed, std::memory_order_acquire);
+         processed = sProcessed.load(std::memory_order_acquire);
+       } while (processed < target);
+     }
++#if defined(HBX_SWITCH2)
++    aurora_hbx_drain_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
++                                      std::chrono::steady_clock::now() - hbxDrainStart)
++                                      .count(),
++                                  std::memory_order_relaxed);
++    aurora_hbx_drain_count.fetch_add(1, std::memory_order_relaxed);
++#endif
+     break;
+   }
+   }

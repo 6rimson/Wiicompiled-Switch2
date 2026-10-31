@@ -1,0 +1,453 @@
+--- a/sdk/linux/runtime.c
++++ b/sdk/linux/runtime.c
+@@ -33,6 +33,19 @@
+     0x141590ull, /* nnsocketSetSockOpt */
+     0x12c770ull, /* nn::os::SetUserExceptionHandler */
+     0x12c7f0ull, /* nn::os::DefaultUserExceptionHandler */
++    0x141530ull, /* nnsocketBind */
++    0x141580ull, /* nnsocketListen */
++    0x141520ull, /* nnsocketAccept */
++    0x141510ull, /* nnsocketSendTo */
++    0x1414f0ull, /* nnsocketRecvFrom */
++    0x1415b0ull, /* nnsocketShutdown */
++    0x141560ull, /* nnsocketGetSockName */
++    0x141550ull, /* nnsocketGetPeerName */
++    0x141570ull, /* nnsocketGetSockOpt */
++    0x141620ull, /* nnsocketFcntl */
++    0x141610ull, /* nnsocketPoll */
++    0x141800ull, /* nnsocketGetAddrInfo */
++    0x1418a0ull, /* nnsocketFreeAddrInfo */
+ };
+ 
+ /* ------------------------------------------------------------------ */
+@@ -323,6 +336,8 @@
+         if (hbxl_gettid() != 1) hbxl_thread_exit(0);   /* draining for exit */
+         hbxl_return_to_host(hbxl_exiting & 0xff);
+     }
++    r = hbxl_net_syscall(n, a, b, c, d, e, f, &handled);
++    if (handled) return r;
+     r = hbxl_vfs_syscall(n, a, b, c, d, e, f, &handled);
+     if (handled) return r;
+     switch (n) {
+--- a/sdk/linux/hbxl.h
++++ b/sdk/linux/hbxl.h
+@@ -28,7 +28,10 @@
+     IMP_MEMALIGN, IMP_FREE, IMP_OS_CREATE, IMP_OS_START, IMP_OS_WAIT, IMP_OS_DESTROY,
+     IMP_OS_CURRENT, IMP_OS_PRIORITY, IMP_OS_CORE, IMP_OS_COREMASK, IMP_SOCKET,
+     IMP_CONNECT, IMP_RECV, IMP_SEND, IMP_CLOSE, IMP_ERRNO, IMP_SETSOCKOPT,
+-    IMP_SET_EXCEPTION_HANDLER, IMP_DEFAULT_EXCEPTION_HANDLER, IMP_COUNT
++    IMP_SET_EXCEPTION_HANDLER, IMP_DEFAULT_EXCEPTION_HANDLER, IMP_SOCK_BIND, IMP_SOCK_LISTEN,
++    IMP_SOCK_ACCEPT, IMP_SOCK_SENDTO, IMP_SOCK_RECVFROM, IMP_SOCK_SHUTDOWN, IMP_SOCK_GETSOCKNAME,
++    IMP_SOCK_GETPEERNAME, IMP_SOCK_GETSOCKOPT, IMP_SOCK_FCNTL, IMP_SOCK_POLL, IMP_SOCK_GETADDRINFO,
++    IMP_SOCK_FREEADDRINFO, IMP_COUNT
+ };
+ extern uint64_t hbxl_imp[IMP_COUNT];
+ #define HBXL_CALL(index, type) ((type)(uintptr_t)hbxl_imp[index])
+@@ -63,6 +66,10 @@
+ int hbxl_threads_live(void);
+ void hbxl_threads_reap(int wait);
+ 
++/* Sockets */
++long hbxl_net_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled);
++int hbxl_resolve_ipv4(const char *name, uint32_t *ipv4);
++
+ /* Files over TCP */
+ int hbxl_vfs_init(void);
+ long hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled);
+--- a/sdk/tools/hbxl-build.py
++++ b/sdk/tools/hbxl-build.py
+@@ -27,7 +27,7 @@
+ PREFIX = TOOLCHAIN / "bin" / "aarch64-linux-musl-"
+ COMMON = ["-O2", "-g0", "-mbranch-protection=bti", "-fno-pie", "-fno-pic",
+           "-ffunction-sections", "-fdata-sections", "-fno-plt", "-D_GNU_SOURCE"]
+-RUNTIME = ["start.S", "runtime.c", "memory.c", "thread.c", "vfs.c"]
++RUNTIME = ["start.S", "runtime.c", "memory.c", "thread.c", "vfs.c", "net.c"]
+ 
+ 
+ def fail(message):
+--- /dev/null
++++ b/sdk/linux/net.c
+@@ -0,0 +1,383 @@
++/*
++ * net.c - Linux socket syscalls for the Linux personality.
++ *
++ * Sockets are nnsocket descriptors, offset so they never meet the file
++ * descriptors of vfs.c.  The socket service cannot read or write the app's
++ * Vulkan-backed memory (see vfs.c), so every buffer, address and option goes
++ * through SDK-heap memory.  The SDK speaks BSD: sockaddr has a length byte,
++ * and SOL_SOCKET, its options and the MSG_ and O_NONBLOCK flags have BSD
++ * values.  errno values are already Linux's, apart from any BSD ones mapped
++ * in net_errno().
++ */
++#include "hbxl.h"
++
++#define NET_FD_BASE 4096
++#define IS_SOCK(fd) ((long)(fd) >= NET_FD_BASE)
++#define TO_NN(fd) ((int)((fd) - NET_FD_BASE))
++
++#define NET_ENOTTY 25
++#define NET_ENOPROTOOPT 92
++#define NET_EAFNOSUPPORT 97
++
++void *hbxl_sdk_memalign(size_t align, size_t size);
++void hbxl_sdk_free(void *p);
++
++struct linux_iovec { void *base; size_t len; };
++struct linux_msghdr {
++    void *name;
++    uint32_t namelen;
++    struct linux_iovec *iov;
++    int iovlen;
++    void *control;
++    uint32_t controllen;
++    int flags;
++};
++struct linux_timespec { int64_t sec, nsec; };
++struct nn_pollfd { int fd; short events, revents; };
++
++static long net_errno(void) {
++    int e = HBXL_CALL(IMP_ERRNO, int (*)(void))();
++    switch (e) {
++    case 35: return 11;   /* EWOULDBLOCK */
++    case 36: return 115;  /* EINPROGRESS */
++    case 37: return 114;  /* EALREADY */
++    case 38: return 88;   /* ENOTSOCK */
++    case 48: return 98;   /* EADDRINUSE */
++    case 49: return 99;   /* EADDRNOTAVAIL */
++    case 50: return 100;  /* ENETDOWN */
++    case 51: return 101;  /* ENETUNREACH */
++    case 53: return 103;  /* ECONNABORTED */
++    case 54: return 104;  /* ECONNRESET */
++    case 55: return 105;  /* ENOBUFS */
++    case 56: return 106;  /* EISCONN */
++    case 57: return 107;  /* ENOTCONN */
++    case 60: return 110;  /* ETIMEDOUT */
++    case 61: return 111;  /* ECONNREFUSED */
++    case 64: return 112;  /* EHOSTDOWN */
++    case 65: return 113;  /* EHOSTUNREACH */
++    default: return e ? e : HBXL_EIO;
++    }
++}
++
++static long net_result(long r) { return r < 0 ? -net_errno() : r; }
++
++static void *net_alloc(size_t size) { return hbxl_sdk_memalign(16, size ? size : 16); }
++
++/* Linux sockaddr to the SDK's. */
++static void addr_in(uint8_t *out, const void *in, uint32_t len) {
++    uint16_t family;
++    hbxl_memset(out, 0, 16);
++    if (len > 16) len = 16;
++    hbxl_memcpy(out, in, len);
++    hbxl_memcpy(&family, in, 2);
++    out[0] = 16;
++    out[1] = (uint8_t)family;
++}
++
++/* The SDK's sockaddr to Linux's. */
++static void addr_out(const uint8_t *in, uint32_t in_len, void *out, uint32_t *out_len) {
++    uint8_t tmp[16];
++    uint16_t family = in[1];
++    uint32_t room;
++    if (!out || !out_len) return;
++    hbxl_memcpy(tmp, in, 16);
++    hbxl_memcpy(tmp, &family, 2);
++    room = *out_len < 16 ? *out_len : 16;
++    hbxl_memcpy(out, tmp, room);
++    *out_len = in_len ? (in_len > 16 ? 16 : in_len) : 16;
++}
++
++static int msg_flags(long flags) {
++    int out = 0;
++    if (flags & 0x1) out |= 0x1;     /* MSG_OOB */
++    if (flags & 0x2) out |= 0x2;     /* MSG_PEEK */
++    if (flags & 0x4) out |= 0x4;     /* MSG_DONTROUTE */
++    if (flags & 0x40) out |= 0x80;   /* MSG_DONTWAIT */
++    if (flags & 0x100) out |= 0x40;  /* MSG_WAITALL */
++    return out;                      /* MSG_NOSIGNAL: nothing raises signals here */
++}
++
++static int sock_level(long level) { return level == 1 ? 0xffff : (int)level; }
++
++static int sock_option(long level, long name) {
++    if (level != 1) return (int)name;
++    switch (name) {
++    case 2:  return 0x0004;  /* SO_REUSEADDR */
++    case 3:  return 0x1008;  /* SO_TYPE */
++    case 4:  return 0x1007;  /* SO_ERROR */
++    case 5:  return 0x0010;  /* SO_DONTROUTE */
++    case 6:  return 0x0020;  /* SO_BROADCAST */
++    case 7:  return 0x1001;  /* SO_SNDBUF */
++    case 8:  return 0x1002;  /* SO_RCVBUF */
++    case 9:  return 0x0008;  /* SO_KEEPALIVE */
++    case 10: return 0x0100;  /* SO_OOBINLINE */
++    case 13: return 0x0080;  /* SO_LINGER */
++    case 15: return 0x0200;  /* SO_REUSEPORT */
++    case 20: return 0x1006;  /* SO_RCVTIMEO */
++    case 21: return 0x1005;  /* SO_SNDTIMEO */
++    default: return -1;
++    }
++}
++
++static long net_nonblock(int fd, int on) {
++    int flags = HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(fd, 3, 0);
++    if (flags < 0) return -net_errno();
++    flags = on ? (flags | 4) : (flags & ~4);
++    return net_result(HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(fd, 4, flags));
++}
++
++static long net_socket(long family, long type, long protocol) {
++    int fd;
++    if (family != 2) return -NET_EAFNOSUPPORT;
++    fd = HBXL_CALL(IMP_SOCKET, int (*)(int, int, int))((int)family, (int)(type & 0xf), (int)protocol);
++    if (fd < 0) return -net_errno();
++    if (type & 0x800) net_nonblock(fd, 1);
++    return (long)fd + NET_FD_BASE;
++}
++
++static long net_address_call(int index, long fd, const void *addr, uint32_t len) {
++    uint8_t *sa = net_alloc(16);
++    long r;
++    if (!sa) return -HBXL_ENOMEM;
++    addr_in(sa, addr, len);
++    r = net_result(HBXL_CALL(index, int (*)(int, const void *, uint32_t))(TO_NN(fd), sa, 16));
++    hbxl_sdk_free(sa);
++    return r;
++}
++
++static long net_get_address(int index, long fd, void *addr, uint32_t *len) {
++    uint8_t *sa = net_alloc(32);
++    uint32_t *sa_len = (uint32_t *)(sa + 16);
++    long r;
++    if (!sa) return -HBXL_ENOMEM;
++    hbxl_memset(sa, 0, 32);
++    *sa_len = 16;
++    r = net_result(HBXL_CALL(index, int (*)(int, void *, uint32_t *))(TO_NN(fd), sa, sa_len));
++    if (r == 0) addr_out(sa, *sa_len, addr, len);
++    hbxl_sdk_free(sa);
++    return r;
++}
++
++static long net_send(long fd, const void *data, size_t size, long flags, const void *addr, uint32_t addr_len) {
++    uint8_t *block = net_alloc(32 + size);
++    uint8_t *sa = block, *body = block + 32;
++    long r;
++    if (!block) return -HBXL_ENOMEM;
++    hbxl_memcpy(body, data, size);
++    if (addr) {
++        addr_in(sa, addr, addr_len);
++        r = HBXL_CALL(IMP_SOCK_SENDTO, int64_t (*)(int, const void *, uint64_t, int, const void *, uint32_t))(
++            TO_NN(fd), body, size, msg_flags(flags), sa, 16);
++    } else {
++        r = HBXL_CALL(IMP_SEND, int64_t (*)(int, const void *, uint64_t, int))(TO_NN(fd), body, size, msg_flags(flags));
++    }
++    r = net_result(r);
++    hbxl_sdk_free(block);
++    return r;
++}
++
++static long net_recv(long fd, void *data, size_t size, long flags, void *addr, uint32_t *addr_len) {
++    uint8_t *block = net_alloc(32 + size);
++    uint8_t *sa = block, *body = block + 32;
++    uint32_t *sa_len = (uint32_t *)(block + 16);
++    long r;
++    if (!block) return -HBXL_ENOMEM;
++    hbxl_memset(block, 0, 32);
++    *sa_len = 16;
++    if (addr) {
++        r = HBXL_CALL(IMP_SOCK_RECVFROM, int64_t (*)(int, void *, uint64_t, int, void *, uint32_t *))(
++            TO_NN(fd), body, size, msg_flags(flags), sa, sa_len);
++    } else {
++        r = HBXL_CALL(IMP_RECV, int64_t (*)(int, void *, uint64_t, int))(TO_NN(fd), body, size, msg_flags(flags));
++    }
++    r = net_result(r);
++    if (r > 0) hbxl_memcpy(data, body, (size_t)r);
++    if (r >= 0 && addr) addr_out(sa, *sa_len, addr, addr_len);
++    hbxl_sdk_free(block);
++    return r;
++}
++
++static long net_sendmsg(long fd, const struct linux_msghdr *msg, long flags) {
++    size_t total = 0, at = 0;
++    uint8_t *flat;
++    long r;
++    int i;
++    for (i = 0; i < msg->iovlen; i++) total += msg->iov[i].len;
++    flat = net_alloc(total);
++    if (!flat) return -HBXL_ENOMEM;
++    for (i = 0; i < msg->iovlen; i++) {
++        hbxl_memcpy(flat + at, msg->iov[i].base, msg->iov[i].len);
++        at += msg->iov[i].len;
++    }
++    r = net_send(fd, flat, total, flags, msg->name, msg->namelen);
++    hbxl_sdk_free(flat);
++    return r;
++}
++
++static long net_recvmsg(long fd, struct linux_msghdr *msg, long flags) {
++    long r;
++    if (msg->iovlen < 1) return -HBXL_EINVAL;
++    r = net_recv(fd, msg->iov[0].base, msg->iov[0].len, flags, msg->name, &msg->namelen);
++    msg->flags = 0;
++    msg->controllen = 0;
++    return r;
++}
++
++static long net_setsockopt(long fd, long level, long name, const void *value, uint32_t size) {
++    int option = sock_option(level, name);
++    uint8_t *copy;
++    long r;
++    if (option < 0) return -NET_ENOPROTOOPT;
++    copy = net_alloc(size);
++    if (!copy) return -HBXL_ENOMEM;
++    hbxl_memcpy(copy, value, size);
++    r = net_result(HBXL_CALL(IMP_SETSOCKOPT, int (*)(int, int, int, const void *, uint32_t))(
++        TO_NN(fd), sock_level(level), option, copy, size));
++    hbxl_sdk_free(copy);
++    return r;
++}
++
++static long net_getsockopt(long fd, long level, long name, void *value, uint32_t *size) {
++    int option = sock_option(level, name);
++    uint8_t *block;
++    uint32_t *block_size;
++    long r;
++    if (option < 0) return -NET_ENOPROTOOPT;
++    block = net_alloc(80);
++    if (!block) return -HBXL_ENOMEM;
++    block_size = (uint32_t *)(block + 64);
++    *block_size = *size > 64 ? 64 : *size;
++    r = net_result(HBXL_CALL(IMP_SOCK_GETSOCKOPT, int (*)(int, int, int, void *, uint32_t *))(
++        TO_NN(fd), sock_level(level), option, block, block_size));
++    if (r == 0) {
++        hbxl_memcpy(value, block, *block_size);
++        *size = *block_size;
++    }
++    hbxl_sdk_free(block);
++    return r;
++}
++
++static long net_fcntl(long fd, long command, long argument) {
++    int flags;
++    switch (command) {
++    case 1: case 2: return 0;      /* F_GETFD/F_SETFD */
++    case 3:                        /* F_GETFL */
++        flags = HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(TO_NN(fd), 3, 0);
++        if (flags < 0) return -net_errno();
++        return 2 | ((flags & 4) ? 0x800 : 0);
++    case 4:                        /* F_SETFL */
++        return net_nonblock(TO_NN(fd), (argument & 0x800) != 0);
++    default:
++        return -HBXL_EINVAL;
++    }
++}
++
++static long net_ppoll(struct nn_pollfd *fds, long count, const struct linux_timespec *timeout) {
++    struct nn_pollfd *copy = net_alloc(sizeof *copy * (size_t)count);
++    int ms = -1;
++    long i, r;
++    if (!copy) return -HBXL_ENOMEM;
++    for (i = 0; i < count; i++) {
++        copy[i] = fds[i];
++        copy[i].fd = fds[i].fd >= 0 ? TO_NN(fds[i].fd) : -1;
++        copy[i].revents = 0;
++    }
++    if (timeout) ms = (int)(timeout->sec * 1000 + (timeout->nsec + 999999) / 1000000);
++    r = net_result(HBXL_CALL(IMP_SOCK_POLL, int (*)(void *, uint64_t, int))(copy, (uint64_t)count, ms));
++    if (r >= 0) {
++        for (i = 0; i < count; i++) fds[i].revents = copy[i].revents;
++    }
++    hbxl_sdk_free(copy);
++    return r;
++}
++
++/* Name to IPv4 through the console's resolver.  The address sits at offset 24
++ * or 32 of nn's addrinfo depending on the BSD or Linux field order; with no
++ * canonical name requested, one of the two is null.  0 on success. */
++struct nn_addrinfo {
++    int flags, family, socktype, protocol;
++    uint32_t addrlen;
++    void *slots[2];
++    struct nn_addrinfo *next;
++};
++
++int hbxl_resolve_ipv4(const char *name, uint32_t *ipv4) {
++    size_t length = hbxl_strlen(name);
++    uint8_t *block = net_alloc(sizeof(struct nn_addrinfo) + 16 + length + 1);
++    struct nn_addrinfo *hints = (struct nn_addrinfo *)block;
++    struct nn_addrinfo **results = (struct nn_addrinfo **)(block + sizeof *hints);
++    char *copy = (char *)(block + sizeof *hints + 16);
++    int status = -1;
++    if (!block) return -1;
++    hbxl_memset(block, 0, sizeof *hints + 16);
++    hbxl_memcpy(copy, name, length + 1);
++    hints->family = 2;
++    hints->socktype = 1;
++    if (HBXL_CALL(IMP_SOCK_GETADDRINFO, int (*)(const char *, const char *, const void *, void *))(copy, 0, hints, results) == 0) {
++        struct nn_addrinfo *entry;
++        for (entry = *results; entry && status != 0; entry = entry->next) {
++            const uint8_t *sa = entry->slots[0] ? entry->slots[0] : entry->slots[1];
++            if (sa && sa[1] == 2) {
++                hbxl_memcpy(ipv4, sa + 4, 4);
++                status = 0;
++            }
++        }
++        HBXL_CALL(IMP_SOCK_FREEADDRINFO, void (*)(void *))(*results);
++    }
++    hbxl_sdk_free(block);
++    return status;
++}
++
++long hbxl_net_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled) {
++    switch (n) {
++    case 25: case 29: case 57: case 63: case 64:
++        if (!IS_SOCK(a)) return 0;
++        break;
++    case 73:
++        if (b < 1 || !IS_SOCK(((struct nn_pollfd *)a)[0].fd)) return 0;
++        break;
++    case 198: case 200: case 201: case 202: case 203: case 204: case 205: case 206:
++    case 207: case 208: case 209: case 210: case 211: case 212: case 242:
++        break;
++    default:
++        return 0;
++    }
++    *handled = 1;
++    switch (n) {
++    case 25:  return net_fcntl(a, b, c);
++    case 29:
++        if (b == 0x5421) return net_nonblock(TO_NN(a), *(int *)c != 0);   /* FIONBIO */
++        return -NET_ENOTTY;
++    case 57:  return net_result(HBXL_CALL(IMP_CLOSE, int (*)(int))(TO_NN(a)));
++    case 63:  return net_recv(a, (void *)b, (size_t)c, 0, 0, 0);
++    case 64:  return net_send(a, (const void *)b, (size_t)c, 0, 0, 0);
++    case 73:  return net_ppoll((struct nn_pollfd *)a, b, (const struct linux_timespec *)c);
++    case 198: return net_socket(a, b, c);
++    case 200: return net_address_call(IMP_SOCK_BIND, a, (const void *)b, (uint32_t)c);
++    case 201: return net_result(HBXL_CALL(IMP_SOCK_LISTEN, int (*)(int, int))(TO_NN(a), (int)b));
++    case 202: case 242: {
++        uint8_t *sa = net_alloc(32);
++        uint32_t *sa_len = (uint32_t *)(sa + 16);
++        int fd;
++        long r;
++        if (!sa) return -HBXL_ENOMEM;
++        *sa_len = 16;
++        fd = HBXL_CALL(IMP_SOCK_ACCEPT, int (*)(int, void *, uint32_t *))(TO_NN(a), sa, sa_len);
++        r = fd < 0 ? -net_errno() : (long)fd + NET_FD_BASE;
++        if (fd >= 0) addr_out(sa, *sa_len, (void *)b, (uint32_t *)c);
++        hbxl_sdk_free(sa);
++        return r;
++    }
++    case 203: return net_address_call(IMP_CONNECT, a, (const void *)b, (uint32_t)c);
++    case 204: return net_get_address(IMP_SOCK_GETSOCKNAME, a, (void *)b, (uint32_t *)c);
++    case 205: return net_get_address(IMP_SOCK_GETPEERNAME, a, (void *)b, (uint32_t *)c);
++    case 206: return net_send(a, (const void *)b, (size_t)c, d, (const void *)e, (uint32_t)f);
++    case 207: return net_recv(a, (void *)b, (size_t)c, d, (void *)e, (uint32_t *)f);
++    case 208: return net_setsockopt(a, b, c, (const void *)d, (uint32_t)e);
++    case 209: return net_getsockopt(a, b, c, (void *)d, (uint32_t *)e);
++    case 210: return net_result(HBXL_CALL(IMP_SOCK_SHUTDOWN, int (*)(int, int))(TO_NN(a), (int)b));
++    case 211: return net_sendmsg(a, (const struct linux_msghdr *)b, c);
++    case 212: return net_recvmsg(a, (struct linux_msghdr *)b, c);
++    default:  return -HBXL_ENOSYS;
++    }
++}

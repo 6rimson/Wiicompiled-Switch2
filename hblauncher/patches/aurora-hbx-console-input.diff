@@ -1,0 +1,99 @@
+--- a/lib/dolphin/pad/pad.cpp
++++ b/lib/dolphin/pad/pad.cpp
+@@ -140,10 +140,18 @@
+ }};
+ 
+ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsProCon{{
++#if defined(HBX_SWITCH2)
++    // SDL buttons are positions, so the Switch's A (right) is east and B (bottom) is south.
++    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_A},
++    {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_B},
++    {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_X},
++    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_Y},
++#else
+     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
+     {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_B},
+     {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_X},
+     {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_Y},
++#endif
+     {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
+     {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_TRIGGER_Z},
+     {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_L},
+
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -12,6 +12,10 @@
+ 
+ #include <tracy/Tracy.hpp>
+ 
++#if defined(HBX_SWITCH2)
++extern "C" void hbxl_pin_next_thread(int core) __attribute__((weak));
++#endif
++
+ namespace aurora::gx::fifo {
+ namespace detail {
+ uint8_t* sBufferData = nullptr;
+@@ -113,6 +117,11 @@
+   if (kProcessingMode != ProcessingMode::Thread || sWorkerThread.joinable()) {
+     return;
+   }
++#if defined(HBX_SWITCH2)
++  if (hbxl_pin_next_thread != nullptr) {
++    hbxl_pin_next_thread(4);
++  }
++#endif
+   sWorkerThread = thread::Thread{{
+                                      .name = "Aurora FIFO processor",
+                                      .affinity = thread::Affinity::SharedCache,
+
+--- a/lib/dolphin/thp/THPDec.cpp
++++ b/lib/dolphin/thp/THPDec.cpp
+@@ -608,6 +608,23 @@
+   return 0;
+ }
+ 
++BOOL THPVideoFrameSize(const void* file, u16* width, u16* height) {
++  if (file == nullptr) {
++    return FALSE;
++  }
++  DecodeContext context{};
++  if (parse_headers(file, std::numeric_limits<size_t>::max(), context) != 0) {
++    return FALSE;
++  }
++  if (width != nullptr) {
++    *width = context.width;
++  }
++  if (height != nullptr) {
++    *height = context.height;
++  }
++  return TRUE;
++}
++
+ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void*) {
+   return aurora_thp_decode_video(file, std::numeric_limits<size_t>::max(), tileY, tileU, tileV, 0, 0);
+ }
+
+--- a/include/dolphin/thp.h
++++ b/include/dolphin/thp.h
+@@ -9,6 +9,9 @@
+ 
+ BOOL THPInit(void);
+ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void* work /* unused */);
++// aurora extension: the frame's luma dimensions, read from its headers. A host caller decoding
++// straight into guest RAM needs them to report which bytes it wrote.
++BOOL THPVideoFrameSize(const void* file, u16* width, u16* height);
+ u32 THPAudioDecode(s16* audioBuffer, const u8* audioFrame, s32 flag);
+ 
+ #ifdef __cplusplus
+
+--- a/cmake/aurora_thp.cmake
++++ b/cmake/aurora_thp.cmake
+@@ -1 +1,7 @@
+ add_subdirectory(lib/dolphin/thp)
++
++# Movies decode every frame on menus. -O3 lets the compiler vectorise the IDCT, and
++# fp-contract=off keeps the decoder's float arithmetic exactly as written.
++if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++  target_compile_options(aurora_thp PRIVATE -O3 -ffp-contract=off)
++endif ()
+

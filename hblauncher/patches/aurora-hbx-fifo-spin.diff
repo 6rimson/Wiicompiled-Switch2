@@ -1,0 +1,23 @@
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -108,7 +108,19 @@
+ 
+     if (token.stop_requested()) {
+       break;
++    }
++#if defined(HBX_SWITCH2)
++    // This thread has its own core. Polling briefly means a producer's publish finds nobody
++    // asleep and makes no kernel call, which saves hundreds of wake-ups per frame.
++    bool hbxWork = false;
++    for (int spin = 0; spin < 4096 && !hbxWork; ++spin) {
++      __asm__ volatile("yield");
++      hbxWork = sPublished.load(std::memory_order_acquire) != processed;
+     }
++    if (hbxWork) {
++      continue;
++    }
++#endif
+     sWorkerWake.wait(event, std::memory_order_acquire);
+   }
+ }
+

@@ -1,0 +1,97 @@
+--- a/sdk/linux/net.c
++++ b/sdk/linux/net.c
+@@ -5,8 +5,8 @@
+  * descriptors of vfs.c.  The socket service cannot read or write the app's
+  * Vulkan-backed memory (see vfs.c), so every buffer, address and option goes
+  * through SDK-heap memory.  The SDK speaks BSD: sockaddr has a length byte,
+- * and SOL_SOCKET, its options and the MSG_ and O_NONBLOCK flags have BSD
+- * values.  errno values are already Linux's, apart from any BSD ones mapped
++ * and SOL_SOCKET, its options and the MSG_ flags have BSD values, but
++ * O_NONBLOCK keeps Linux's 0x800 (BSD's 4 is accepted and does nothing).  errno values are already Linux's, apart from any BSD ones mapped
+  * in net_errno().
+  */
+ #include "hbxl.h"
+@@ -119,11 +119,27 @@
+     }
+ }
+ 
++#define NET_O_NONBLOCK 0x800
++#define NET_TRACKED_FDS 256
++
++/* Remembered here too, so a read or send on a non-blocking socket can't wait
++ * even if the service ignores the flag: one stuck call stops the whole game. */
++static uint8_t g_net_nonblock[NET_TRACKED_FDS];
++
++static int net_is_nonblock(int fd) {
++    return fd >= 0 && fd < NET_TRACKED_FDS && g_net_nonblock[fd];
++}
++
+ static long net_nonblock(int fd, int on) {
+     int flags = HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(fd, 3, 0);
++    long r;
+     if (flags < 0) return -net_errno();
+-    flags = on ? (flags | 4) : (flags & ~4);
+-    return net_result(HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(fd, 4, flags));
++    flags = on ? (flags | NET_O_NONBLOCK) : (flags & ~NET_O_NONBLOCK);
++    r = net_result(HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(fd, 4, flags));
++    if (r >= 0 && fd >= 0 && fd < NET_TRACKED_FDS) g_net_nonblock[fd] = on != 0;
++    hbxl_logf("hbxl: net nonblock fd %d on %d: set %d, reads back %x", (int64_t)fd, (int64_t)on, (int64_t)r,
++              (uint64_t)(uint32_t)HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(fd, 3, 0));
++    return r;
+ }
+ 
+ static long net_socket(long family, long type, long protocol) {
+@@ -159,6 +175,7 @@
+ }
+ 
+ static long net_send(long fd, const void *data, size_t size, long flags, const void *addr, uint32_t addr_len) {
++    if (net_is_nonblock(TO_NN(fd))) flags |= 0x40;   /* MSG_DONTWAIT */
+     uint8_t *block = net_alloc(32 + size);
+     uint8_t *sa = block, *body = block + 32;
+     long r;
+@@ -177,6 +194,7 @@
+ }
+ 
+ static long net_recv(long fd, void *data, size_t size, long flags, void *addr, uint32_t *addr_len) {
++    if (net_is_nonblock(TO_NN(fd))) flags |= 0x40;   /* MSG_DONTWAIT */
+     uint8_t *block = net_alloc(32 + size);
+     uint8_t *sa = block, *body = block + 32;
+     uint32_t *sa_len = (uint32_t *)(block + 16);
+@@ -264,7 +282,7 @@
+     case 3:                        /* F_GETFL */
+         flags = HBXL_CALL(IMP_SOCK_FCNTL, int (*)(int, int, int))(TO_NN(fd), 3, 0);
+         if (flags < 0) return -net_errno();
+-        return 2 | ((flags & 4) ? 0x800 : 0);
++        return 2 | ((flags & NET_O_NONBLOCK) ? 0x800 : 0);
+     case 4:                        /* F_SETFL */
+         return net_nonblock(TO_NN(fd), (argument & 0x800) != 0);
+     default:
+@@ -401,7 +419,7 @@
+             hbxl_logf("hbxl: net connect fd %d to %u.%u.%u.%u:%u", (int64_t)a, (uint64_t)sa[4], (uint64_t)sa[5],
+                       (uint64_t)sa[6], (uint64_t)sa[7], (uint64_t)((sa[2] << 8) | sa[3]));
+         }
+-    } else if (n != 73 && n != 207 && n != 209 && net_trace_allow()) {
++    } else if (n != 73 && n != 207 && n != 209 && !(n == 198 && a == 1) && net_trace_allow()) {
+         hbxl_logf("hbxl: net call %d fd %d", (int64_t)n, (int64_t)a);
+     }
+     switch (n) {
+@@ -409,7 +427,9 @@
+     case 29:
+         if (b == 0x5421) return net_nonblock(TO_NN(a), *(int *)c != 0);   /* FIONBIO */
+         return -NET_ENOTTY;
+-    case 57:  return net_result(HBXL_CALL(IMP_CLOSE, int (*)(int))(TO_NN(a)));
++    case 57:
++        if (TO_NN(a) >= 0 && TO_NN(a) < NET_TRACKED_FDS) g_net_nonblock[TO_NN(a)] = 0;
++        return net_result(HBXL_CALL(IMP_CLOSE, int (*)(int))(TO_NN(a)));
+     case 63:  return net_recv(a, (void *)b, (size_t)c, 0, 0, 0);
+     case 64:  return net_send(a, (const void *)b, (size_t)c, 0, 0, 0);
+     case 73:  return net_ppoll((struct nn_pollfd *)a, b, (const struct linux_timespec *)c);
+@@ -447,7 +467,7 @@
+     long r = net_dispatch(n, a, b, c, d, e, f, handled);
+     if (*handled) {
+         hbxl_net_inflight_call = 0;
+-        if (n != 73 && r != -11 && net_trace_allow()) {
++        if (n != 73 && r != -11 && !(n == 198 && a == 1) && net_trace_allow()) {
+             hbxl_logf("hbxl: net call %d fd %d -> %d", (int64_t)n, (int64_t)a, (int64_t)r);
+         }
+     }

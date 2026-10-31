@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -121,8 +122,36 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
     if (s_autoPad) {
         static uint32_t s_polls = 0;
         statuses[0].err = PAD_ERR_NONE;
-        if ((s_polls++ % 40) < 3) {
-            statuses[0].button |= PAD_BUTTON_A;
+        // MKW_AUTOPAD_SCRIPT lists tap times, "12.5:A,14:D" (seconds from the first poll; A, B or
+        // U/D/L/R on the d-pad). With a script set, only those taps happen.
+        static const char* s_script = std::getenv("MKW_AUTOPAD_SCRIPT");
+        if (s_script == nullptr) {
+            if ((s_polls++ % 40) < 3) {
+                statuses[0].button |= PAD_BUTTON_A;
+            }
+        } else {
+            static const auto s_start = std::chrono::steady_clock::now();
+            const double now =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count();
+            for (const char* entry = s_script; *entry != '\0';) {
+                char* end = nullptr;
+                const double when = std::strtod(entry, &end);
+                if (end == entry || *end != ':' || end[1] == '\0') {
+                    break;
+                }
+                if (now >= when && now < when + 0.12) {
+                    switch (end[1]) {
+                    case 'A': statuses[0].button |= PAD_BUTTON_A; break;
+                    case 'B': statuses[0].button |= PAD_BUTTON_B; break;
+                    case 'U': statuses[0].button |= PAD_BUTTON_UP; break;
+                    case 'D': statuses[0].button |= PAD_BUTTON_DOWN; break;
+                    case 'L': statuses[0].button |= PAD_BUTTON_LEFT; break;
+                    case 'R': statuses[0].button |= PAD_BUTTON_RIGHT; break;
+                    default: break;
+                    }
+                }
+                entry = end[2] == ',' ? end + 3 : end + 2;
+            }
         }
     }
 #endif

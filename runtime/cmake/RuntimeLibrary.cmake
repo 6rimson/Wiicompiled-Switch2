@@ -65,7 +65,7 @@ endfunction()
 # scope is PRIVATE for a compiled target and INTERFACE for the imported archive.
 function(mkw_runtime_link_dependencies target scope)
     target_link_libraries(${target} ${scope}
-        aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
+        aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx aurora::thp)
     target_link_libraries(${target} ${scope} mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
     if(MKW_PLATFORM_WINDOWS)
         target_link_libraries(${target} ${scope} shell32 windowsapp bthprops)

@@ -1,5 +1,7 @@
 #include "perf_stats.h"
 
+#include "guest_abi/guest_region.h"
+#include "memory.h"
 #include "runtime_log.h"
 
 #include <algorithm>
@@ -26,7 +28,13 @@ extern std::atomic<uint64_t> aurora_hbx_gpu_wait_us;
 extern std::atomic<uint64_t> aurora_hbx_render_cb_us;
 extern std::atomic<uint64_t> aurora_hbx_gpu_done_us;
 extern std::atomic<uint64_t> aurora_hbx_gpu_done_count;
+extern std::atomic<uint64_t> aurora_hbx_drain_us;
+extern std::atomic<uint64_t> aurora_hbx_drain_count;
 extern "C" uint64_t hbxl_syscall_counts[512] __attribute__((weak));
+extern "C" volatile long hbxl_net_inflight_call __attribute__((weak));
+extern "C" volatile long hbxl_net_inflight_fd __attribute__((weak));
+extern "C" volatile int hbxl_net_resolving __attribute__((weak));
+extern "C" void hbxl_logf(const char* format, ...) __attribute__((weak));
 #endif
 
 namespace PerfStats {
@@ -52,6 +60,70 @@ struct FrameWindow {
 
 FrameWindow g_window;
 
+#if defined(HBX_SWITCH2)
+std::atomic<int64_t> g_lastFrameMs{0};
+
+int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+// Says what the console is doing when frames stop. It writes to the launcher's log as well as the
+// file server's, so a stuck connection to the file server can't hide the report.
+void FreezeWatchdog() {
+    constexpr uint32_t kRunningThreadAddr = 0x800000E4u;
+    const uint32_t kSchedulerDisableAddr = MKW_GADDR(80386918);
+    constexpr int kMaxReports = 20;
+    std::array<uint64_t, 512> previous{};
+    int reports = 0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        int topCall[3] = {};
+        uint64_t topDelta[3] = {};
+        if (hbxl_syscall_counts != nullptr) {
+            for (int i = 0; i < 512; ++i) {
+                const uint64_t count = __atomic_load_n(&hbxl_syscall_counts[i], __ATOMIC_RELAXED);
+                uint64_t delta = count - previous[i];
+                int call = i;
+                previous[i] = count;
+                for (int slot = 0; slot < 3; ++slot) {
+                    if (delta > topDelta[slot]) {
+                        std::swap(delta, topDelta[slot]);
+                        std::swap(call, topCall[slot]);
+                    }
+                }
+            }
+        }
+        const int64_t age = NowMs() - g_lastFrameMs.load(std::memory_order_relaxed);
+        if (age < 3000) {
+            reports = 0;
+            continue;
+        }
+        if (reports >= kMaxReports) {
+            continue;
+        }
+        ++reports;
+        const uint32_t thread = Memory::Read32(kRunningThreadAddr);
+        const bool validThread = Memory::Contains(thread + 0x2C8u, 0x20u);
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "watchdog: no frame for %lld ms; net call %ld fd %ld, lookups %d; guest thread 0x%x "
+                      "state %u queue 0x%x, scheduler off %u; syscalls/s %d:%llu %d:%llu %d:%llu",
+                      static_cast<long long>(age), &hbxl_net_inflight_call != nullptr ? hbxl_net_inflight_call : 0L,
+                      &hbxl_net_inflight_fd != nullptr ? hbxl_net_inflight_fd : 0L,
+                      &hbxl_net_resolving != nullptr ? hbxl_net_resolving : 0, thread,
+                      validThread ? Memory::Read16(thread + 0x2C8u) : 0u,
+                      validThread ? Memory::Read32(thread + 0x2DCu) : 0u, Memory::Read32(kSchedulerDisableAddr),
+                      topCall[0], static_cast<unsigned long long>(topDelta[0]), topCall[1],
+                      static_cast<unsigned long long>(topDelta[1]), topCall[2],
+                      static_cast<unsigned long long>(topDelta[2]));
+        if (hbxl_logf != nullptr) {
+            hbxl_logf("hbxl: %s", line);
+        }
+        RT_LOGF("perf", "%s\n", line);
+    }
+}
+#endif
+
 } // namespace
 
 bool Enabled() noexcept {
@@ -74,6 +146,11 @@ void OnFramePresented() noexcept {
     if (!Enabled()) {
         return;
     }
+#if defined(HBX_SWITCH2)
+    if (g_lastFrameMs.exchange(NowMs(), std::memory_order_relaxed) == 0) {
+        std::thread(FreezeWatchdog).detach();
+    }
+#endif
     const auto now = Clock::now();
     const Clock::duration wait = t_wait;
     t_wait = {};
@@ -128,6 +205,12 @@ void OnFramePresented() noexcept {
                 ms(g_phases[0]), ms(g_phases[1]), ms(g_phases[2]), (gpuWait - lastGpuWait) / 1000.0 / kWindow,
                 (render - lastRender) / 1000.0 / kWindow, frames ? (done - lastDone) / 1000.0 / frames : 0.0,
                 static_cast<unsigned long long>(frames));
+        static uint64_t lastDrain = 0, lastDrainCount = 0;
+        const uint64_t drain = aurora_hbx_drain_us.load(), drainCount = aurora_hbx_drain_count.load();
+        RT_LOGF("perf", "game thread waiting on GX FIFO %.1f ms/frame over %.1f waits/frame\n",
+                (drain - lastDrain) / 1000.0 / kWindow, static_cast<double>(drainCount - lastDrainCount) / kWindow);
+        lastDrain = drain;
+        lastDrainCount = drainCount;
         lastGpuWait = gpuWait;
         lastRender = render;
         lastDone = done;
@@ -221,6 +304,17 @@ void CalibrateThisThread(const char* who, const uint8_t* guestRam, size_t size) 
             who, alu, hostMemory, guestMemory, static_cast<unsigned long long>(sum & 1));
 }
 } // namespace
+
+float MeasureCpuMhz() {
+    constexpr uint64_t kOps = 20000000;
+    const auto start = std::chrono::steady_clock::now();
+    uint64_t value = 1;
+    for (uint64_t i = 0; i < kOps; ++i) {
+        value = value * 3 + 1;
+        __asm__ volatile("" : "+r"(value));
+    }
+    return static_cast<float>(2000.0 / NsPer(kOps, start));
+}
 
 void LogCoreCalibration(const uint8_t* guestRam, size_t size) {
     CalibrateThisThread("main thread", guestRam, size);

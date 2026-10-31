@@ -24,6 +24,9 @@
 #include <cryptopp/ec2n.h>
 #include <cryptopp/oids.h>
 #include <cryptopp/osrng.h>
+#if defined(HBX_SWITCH2)
+#include <sys/random.h>
+#endif
 #include <cryptopp/sha.h>
 
 #include <algorithm>
@@ -143,6 +146,23 @@ inline CryptoEcdsa::PrivateKey MakePrivateKey(const uint8_t* key) {
     return privateKey;
 }
 
+#if defined(HBX_SWITCH2)
+// The console has no /dev/urandom, which AutoSeededRandomPool needs; this asks the system directly.
+class SystemRandom final : public CryptoPP::RandomNumberGenerator {
+public:
+    void GenerateBlock(CryptoPP::byte* output, size_t size) override {
+        while (size != 0) {
+            const ssize_t written = getrandom(output, size, 0);
+            if (written <= 0) {
+                throw std::runtime_error("getrandom failed");
+            }
+            output += written;
+            size -= static_cast<size_t>(written);
+        }
+    }
+};
+#endif
+
 inline EcSignature SignMessage(const uint8_t* key, const uint8_t* data, size_t size) {
     const CryptoEcdsa::PrivateKey privateKey = MakePrivateKey(key);
     const CryptoEcdsa::Signer signer(privateKey);
@@ -150,7 +170,11 @@ inline EcSignature SignMessage(const uint8_t* key, const uint8_t* data, size_t s
         throw std::runtime_error("Crypto++ returned an unexpected sect233r1 signature size");
     }
 
+#if defined(HBX_SWITCH2)
+    SystemRandom random;
+#else
     thread_local CryptoPP::AutoSeededRandomPool random;
+#endif
     EcSignature signature{};
     const size_t written = signer.SignMessage(random, data, size, signature.data());
     if (written != signature.size()) {

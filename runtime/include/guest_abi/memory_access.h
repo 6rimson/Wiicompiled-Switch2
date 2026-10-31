@@ -68,6 +68,10 @@ extern uintptr_t g_fullReadablePageBias[kPageCount];
 // Same encoding, but only for pages proven not to contain executable bytes.
 // Executable-range registration invalidates entries before guest execution.
 extern uintptr_t g_fullWritablePageBias[kPageCount];
+// For a 1 MiB page holding code below plain data, the first address above its last executable
+// 4 KiB page; 0 otherwise. The guest stack shares such a page with .text, so stores there would
+// otherwise take the exact guard path tens of thousands of times a frame.
+extern uint32_t g_mixedPageDataStart[kPageCount];
 
 // Allocated only for mapped 1 MiB pages that contain both executable and data
 // 4 KiB pages. Entries use the same encoded host bias as the coarse table.
@@ -242,6 +246,15 @@ MKW_MEMORY_FORCE_INLINE bool TryGetWritablePointerFast(
 MKW_MEMORY_NO_INLINE bool TryGetWritablePointerOutOfLine(
     uint32_t address, size_t length, uint8_t*& pointer);
 
+// Out of line: this runs at every translated store, and inlining the mixed-page check there added
+// 28 MB of code. Defined in memory.cpp.
+MKW_MEMORY_NO_INLINE uintptr_t MixedPageWritableBias(uint32_t address);
+
+MKW_MEMORY_FORCE_INLINE uintptr_t WritableBias(uint32_t address) {
+    const uintptr_t encodedBias = g_fullWritablePageBias[address >> kPageShift];
+    return encodedBias != 0 ? encodedBias : MixedPageWritableBias(address);
+}
+
 // Flat form: guest_flat_memory.h's page protections already answer mapped/non-deferred/non-executable, so resolving is pure address arithmetic.
 // Two checks stay inline: a wrapped guest address can't survive 64-bit `host + rangeOffset`, and an MMIO write's value isn't recoverable from a
 // fault record, so a write touching that window must resolve null and fall back to Memory::Write*. Checking both range endpoints is a complete
@@ -259,12 +272,12 @@ MKW_MEMORY_FORCE_INLINE uint8_t* ResolveRangeHost(uint32_t base, int32_t minOffs
         const uint32_t firstPage = guestStart >> kPageShift;
         const uint32_t lastPage = (guestStart + (length - 1)) >> kPageShift;
         const uintptr_t encodedBias =
-            needsWrite ? g_fullWritablePageBias[firstPage] : g_fullReadablePageBias[firstPage];
+            needsWrite ? WritableBias(guestStart) : g_fullReadablePageBias[firstPage];
         if (encodedBias == 0) [[unlikely]] return nullptr;
         if (needsRead && needsWrite && g_fullReadablePageBias[firstPage] != encodedBias) [[unlikely]]
             return nullptr;
         if (lastPage != firstPage) {
-            if (needsWrite && g_fullWritablePageBias[lastPage] != encodedBias) [[unlikely]]
+            if (needsWrite && WritableBias(guestStart + (length - 1)) != encodedBias) [[unlikely]]
                 return nullptr;
             if ((needsRead || !needsWrite) && g_fullReadablePageBias[lastPage] != encodedBias) [[unlikely]]
                 return nullptr;

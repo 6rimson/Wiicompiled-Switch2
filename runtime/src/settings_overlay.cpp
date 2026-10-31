@@ -75,6 +75,9 @@ const char* GraphicsApiDisplayName() {
 }
 
 bool g_topBarVisible = false;
+#if defined(HBX_SWITCH2)
+bool g_consoleMenuOpen = false;
+#endif
 bool g_exitPromptOpen = false;
 bool g_restartPromptOpen = false;
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
@@ -1407,7 +1410,11 @@ void DrawStartupScreen() {
             ImGui::TextUnformatted(line);
             nextY = ImGui::GetCursorPosY() + 4.0f;
         }
+#if defined(HBX_SWITCH2)
+        constexpr const char* kHint = "Press Minus to open settings";
+#else
         constexpr const char* kHint = "Press F10 to open settings";
+#endif
         ImGui::SetWindowFontScale(0.8f);
         const ImVec2 hintSize = ImGui::CalcTextSize(kHint);
         ImGui::SetCursorPos(ImVec2(std::max(0.0f, (viewport->Size.x - hintSize.x) * 0.5f), nextY));
@@ -1607,7 +1614,11 @@ void PersistDisplayModeIfChanged() {
 }
 
 void ApplyInputBlockState() {
+#if defined(HBX_SWITCH2)
+    const bool blocked = g_consoleMenuOpen || controller_mapping_wizard::IsActive() || g_rebind.active ||
+#else
     const bool blocked = controller_mapping_wizard::IsActive() || g_rebind.active ||
+#endif
                          g_exitPromptOpen || g_restartPromptOpen || g_topBarVisible || StartupScreenVisible();
     PADBlockInput(blocked);
     InputBindings::SetInputBlocked(blocked);
@@ -1713,6 +1724,236 @@ void ReleaseControllers() noexcept {
     if (queued) SDL_Delay(120);
 }
 
+#if defined(HBX_SWITCH2)
+// The desktop menus need a mouse and F10. On the console, Minus opens this list instead: D-pad up
+// and down move, left and right change a value, A rebinds or confirms, B or Minus closes.
+constexpr std::array<float, 4> kConsoleScales = {1.0f, 1.5f, 2.0f, 3.0f};
+
+// nn::oe, in the running SDK. These reach system services, which can't read Vulkan-backed memory,
+// so they run on a stack from the SDK heap. A refused request may end the session, so they only
+// ever run when the player picks them in this menu.
+extern "C" void* hbxl_sdk_proc(uint64_t offset) __attribute__((weak));
+extern "C" void* hbxl_sdk_memalign(size_t align, size_t size) __attribute__((weak));
+extern "C" void hbxl_call_on_stack(void (*fn)(void*), void* arg, void* stackTop) __attribute__((weak));
+constexpr uint64_t kOeIsCpuOverclockEnabled = 0x39d840;
+constexpr uint64_t kOeSetCpuOverclockEnabled = 0x39d850;
+constexpr uint64_t kOeSetCpuBoostMode = 0x39bf70;
+constexpr uint64_t kOeGetPerformanceMode = 0x39bf30;
+constexpr uint64_t kOeGetPerformanceConfiguration = 0x39d770;
+constexpr size_t kOeStackBytes = 256 * 1024;
+
+struct OeCall {
+    bool overclock = false;
+    int boostMode = 0;
+    bool setOverclock = false;
+    bool setBoost = false;
+    bool readConfiguration = false;
+    bool reported = false;
+    int performanceMode = 0;
+    int configuration[2] = {};
+};
+
+bool g_consoleOverclock = false;
+int g_consoleBoostMode = 0;
+float g_consoleCpuMhz = 0.0f;
+int g_consoleMeasureIn = 0;
+
+void OeCallOnStack(void* arg) {
+    auto* call = static_cast<OeCall*>(arg);
+    if (call->setOverclock) {
+        reinterpret_cast<void (*)(bool)>(hbxl_sdk_proc(kOeSetCpuOverclockEnabled))(call->overclock);
+    }
+    if (call->setBoost) {
+        reinterpret_cast<void (*)(int)>(hbxl_sdk_proc(kOeSetCpuBoostMode))(call->boostMode);
+    }
+    call->reported = reinterpret_cast<bool (*)()>(hbxl_sdk_proc(kOeIsCpuOverclockEnabled))();
+    if (call->readConfiguration) {
+        call->performanceMode = reinterpret_cast<int (*)()>(hbxl_sdk_proc(kOeGetPerformanceMode))();
+        for (int mode = 0; mode < 2; ++mode) {
+            call->configuration[mode] =
+                reinterpret_cast<int (*)(int)>(hbxl_sdk_proc(kOeGetPerformanceConfiguration))(mode);
+        }
+    }
+}
+
+void ConsoleApplyCpuSettings(bool setOverclock, bool setBoost, bool readConfiguration = true) {
+    if (hbxl_sdk_proc == nullptr || hbxl_sdk_memalign == nullptr || hbxl_call_on_stack == nullptr) {
+        return;
+    }
+    static void* stack = hbxl_sdk_memalign(4096, kOeStackBytes);
+    if (stack == nullptr) {
+        return;
+    }
+    OeCall call{g_consoleOverclock, g_consoleBoostMode, setOverclock, setBoost, readConfiguration};
+    RT_LOGF("perf", "requesting cpu overclock %d boost mode %d\n", g_consoleOverclock ? 1 : 0, g_consoleBoostMode);
+    std::fflush(stderr);
+    hbxl_call_on_stack(OeCallOnStack, &call, static_cast<char*>(stack) + kOeStackBytes);
+    RT_LOGF("perf", "cpu overclock reported %d\n", call.reported ? 1 : 0);
+    if (readConfiguration) {
+        RT_LOGF("perf", "performance mode %d, configurations 0x%x 0x%x\n", call.performanceMode, call.configuration[0],
+                call.configuration[1]);
+    }
+    g_consoleMeasureIn = 90;
+}
+
+int g_consoleMenuRow = 0;
+std::array<bool, SDL_GAMEPAD_BUTTON_COUNT> g_consoleButtons{};
+
+SDL_Gamepad* ConsolePad() {
+    const int index = PADGetIndexForPort(0);
+    return index >= 0 ? PADGetSDLGamepadForIndex(static_cast<u32>(index)) : nullptr;
+}
+
+int ConsoleScaleIndex() {
+    for (size_t i = 0; i < kConsoleScales.size(); ++i) {
+        if (std::fabs(kConsoleScales[i] - g_resolutionScale) < 0.01f) {
+            return static_cast<int>(i);
+        }
+    }
+    return 0;
+}
+
+void ConsoleChangeVolume(int delta) {
+    g_audioVolumePercent = std::clamp(g_audioVolumePercent + delta, 0, 100);
+    AudioBackend::Instance().SetMasterVolume(static_cast<float>(g_audioVolumePercent) / 100.0f);
+    RuntimeConfigFile::SetAudioVolume(static_cast<float>(g_audioVolumePercent) / 100.0f);
+}
+
+void ConsoleMenuInput(int rows) {
+    auto* pad = ConsolePad();
+    if (pad == nullptr) {
+        return;
+    }
+    std::array<bool, SDL_GAMEPAD_BUTTON_COUNT> now{};
+    for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
+        now[i] = SDL_GetGamepadButton(pad, static_cast<SDL_GamepadButton>(i));
+    }
+    const auto pressed = [&](SDL_GamepadButton button) { return now[button] && !g_consoleButtons[button]; };
+    if (!g_rebind.active) {
+        if (pressed(SDL_GAMEPAD_BUTTON_BACK)) {
+            g_consoleMenuOpen = !g_consoleMenuOpen;
+        } else if (g_consoleMenuOpen) {
+            int change = 0;
+            if (pressed(SDL_GAMEPAD_BUTTON_SOUTH)) g_consoleMenuOpen = false;
+            if (pressed(SDL_GAMEPAD_BUTTON_DPAD_UP)) g_consoleMenuRow = (g_consoleMenuRow + rows - 1) % rows;
+            if (pressed(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) g_consoleMenuRow = (g_consoleMenuRow + 1) % rows;
+            if (pressed(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) change = -1;
+            if (pressed(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) change = 1;
+            const bool confirm = pressed(SDL_GAMEPAD_BUTTON_EAST);
+            const int firstButton = 5;
+            if (g_consoleMenuRow == 0 && change != 0) {
+                const int count = static_cast<int>(kConsoleScales.size());
+                SetResolutionScale(kConsoleScales[(ConsoleScaleIndex() + count + change) % count]);
+            } else if (g_consoleMenuRow == 1 && (change != 0 || confirm)) {
+                g_showFps = !g_showFps;
+                RuntimeConfigFile::SetShowFps(g_showFps);
+            } else if (g_consoleMenuRow == 2 && change != 0) {
+                ConsoleChangeVolume(change * 5);
+            } else if (g_consoleMenuRow == 3 && (change != 0 || confirm)) {
+                g_consoleOverclock = !g_consoleOverclock;
+                ConsoleApplyCpuSettings(true, false);
+            } else if (g_consoleMenuRow == 4 && (change != 0 || confirm)) {
+                g_consoleBoostMode = (g_consoleBoostMode + (change < 0 ? 2 : 1)) % 3;
+                ConsoleApplyCpuSettings(false, true);
+            } else if (g_consoleMenuRow >= firstButton && g_consoleMenuRow < rows - 1 && confirm) {
+                const auto& button = kControllerButtons[static_cast<size_t>(g_consoleMenuRow - firstButton)];
+                g_controllerPort = 0;
+                BeginRebind(RebindKind::Controller, button.padButton, button.label);
+            } else if (g_consoleMenuRow == rows - 1 && confirm) {
+                PADRestoreDefaultMapping(0);
+                PADSerializeMappings();
+            }
+        }
+    }
+    g_consoleButtons = now;
+}
+
+const char* ConsoleNativeButtonName(uint32_t native) {
+    switch (native) {
+    case SDL_GAMEPAD_BUTTON_EAST: return "A";
+    case SDL_GAMEPAD_BUTTON_SOUTH: return "B";
+    case SDL_GAMEPAD_BUTTON_NORTH: return "X";
+    case SDL_GAMEPAD_BUTTON_WEST: return "Y";
+    case SDL_GAMEPAD_BUTTON_START: return "Plus";
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return "L";
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return "R";
+    case SDL_GAMEPAD_BUTTON_LEFT_STICK: return "L stick";
+    case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return "R stick";
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: return "D-pad up";
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return "D-pad down";
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return "D-pad left";
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return "D-pad right";
+    default: return "Trigger or unset";
+    }
+}
+
+void DrawConsoleMenu() {
+    const int buttons = static_cast<int>(kControllerButtons.size());
+    const int rows = 5 + buttons + 1;
+    const bool wasOpen = g_consoleMenuOpen;
+    // MKW_CPU_BOOST=<mode> in hbxl-env sets the boost mode at launch.
+    static const bool s_startupBoost = [] {
+        if (const char* mode = std::getenv("MKW_CPU_BOOST"); mode != nullptr && std::atoi(mode) > 0) {
+            g_consoleBoostMode = std::atoi(mode);
+            ConsoleApplyCpuSettings(false, true, false);
+            return true;
+        }
+        return false;
+    }();
+    (void)s_startupBoost;
+    ConsoleMenuInput(rows);
+    if (g_consoleMeasureIn > 0 && --g_consoleMeasureIn == 0) {
+        g_consoleCpuMhz = PerfStats::MeasureCpuMhz();
+        RT_LOGF("perf", "cpu measures about %.0f MHz\n", static_cast<double>(g_consoleCpuMhz));
+    }
+    if (!g_consoleMenuOpen) {
+        return;
+    }
+    if (!wasOpen && g_consoleCpuMhz == 0.0f) {
+        g_consoleMeasureIn = 1;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f, viewport->Pos.y + viewport->Size.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    if (ImGui::Begin("WiiCompiled settings", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
+        const auto row = [](int index, const std::string& text) {
+            const bool selected = g_consoleMenuRow == index;
+            ImGui::TextColored(selected ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) : ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "%s %s",
+                               selected ? ">" : " ", text.c_str());
+        };
+        char scale[32];
+        std::snprintf(scale, sizeof(scale), "%.1fx", static_cast<double>(g_resolutionScale));
+        row(0, std::string("Resolution: ") + scale);
+        row(1, std::string("Show FPS: ") + (g_showFps ? "On" : "Off"));
+        row(2, "Volume: " + std::to_string(g_audioVolumePercent) + "%");
+        row(3, std::string("CPU overclock: ") + (g_consoleOverclock ? "On" : "Off"));
+        row(4, g_consoleBoostMode == 0 ? std::string("CPU boost: Off")
+                                       : "CPU boost: Mode " + std::to_string(g_consoleBoostMode));
+        ImGui::TextDisabled("  CPU speed: about %.0f MHz", static_cast<double>(g_consoleCpuMhz));
+        ImGui::Separator();
+        uint32_t count = 0;
+        auto* mappings = PADGetButtonMappings(0, &count);
+        for (int i = 0; i < buttons; ++i) {
+            const auto& button = kControllerButtons[static_cast<size_t>(i)];
+            uint32_t native = PAD_NATIVE_BUTTON_INVALID;
+            for (uint32_t m = 0; mappings != nullptr && m < count; ++m) {
+                if (mappings[m].padButton == button.padButton) native = mappings[m].nativeButton;
+            }
+            row(5 + i, std::string(button.label) + ": " + ConsoleNativeButtonName(native));
+        }
+        ImGui::Separator();
+        row(rows - 1, "Reset buttons to default");
+        ImGui::Separator();
+        ImGui::TextDisabled("D-pad: move, change. A: rebind. B or Minus: close.");
+        DrawRebindPrompt();
+    }
+    ImGui::End();
+}
+#endif
+
 void Draw() noexcept {
     // ImGui is only touched on this thread; the render worker replays a frozen copy.
     ApplyConfiguredMappings();
@@ -1727,6 +1968,9 @@ void Draw() noexcept {
     DrawExitPrompt();
     DrawRestartPrompt();
     controller_mapping_wizard::Draw();
+#if defined(HBX_SWITCH2)
+    DrawConsoleMenu();
+#endif
     ApplyInputBlockState();
     DrawStartupScreen();
 }

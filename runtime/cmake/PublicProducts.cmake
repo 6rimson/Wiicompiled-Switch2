@@ -195,7 +195,7 @@ function(mkw_configure_product target)
         mkw_platform mkw_base_shared mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
 
     target_link_libraries(${target} PRIVATE
-        aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
+        aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx aurora::thp)
     if(MKW_PLATFORM_MACOS)
         target_link_libraries(${target} PRIVATE
             "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}" "${MKW_COREAUDIO_FRAMEWORK}")

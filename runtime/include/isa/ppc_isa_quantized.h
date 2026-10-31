@@ -289,7 +289,7 @@ MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
     // a store that crosses into the next page stays on the checked path.
     if (addr > UINT32_MAX - 7u || ((addr + 7u) >> MemoryInline::kPageShift) != (addr >> MemoryInline::kPageShift)) [[unlikely]]
         return nullptr;
-    const uintptr_t encodedBias = MemoryInline::g_fullWritablePageBias[addr >> MemoryInline::kPageShift];
+    const uintptr_t encodedBias = MemoryInline::WritableBias(addr);
     if (encodedBias == 0) [[unlikely]]
         return nullptr;
     return reinterpret_cast<uint8_t*>((encodedBias - MemoryInline::kBiasEncoding) + addr);

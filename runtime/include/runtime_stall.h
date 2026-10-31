@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace RuntimeStall {
@@ -26,7 +27,11 @@ inline long long NowUs() noexcept {
         .count();
 }
 
-inline constexpr long long kThresholdMs = 50;
+inline long long ThresholdUs() noexcept {
+    // MKW_STALL_ALL=1 logs every timed operation; test runs use it to see which files load.
+    static const long long thresholdUs = std::getenv("MKW_STALL_ALL") != nullptr ? 0 : 50 * 1000;
+    return thresholdUs;
+}
 
 enum class Io { None = -1, Dvd = 0, Nand = 1, Count = 2 };
 
@@ -54,7 +59,7 @@ public:
             totals.ops[index].fetch_add(1, std::memory_order_relaxed);
             totals.bytes[index].fetch_add(m_bytes, std::memory_order_relaxed);
         }
-        if (elapsedUs >= kThresholdMs * 1000) {
+        if (elapsedUs >= ThresholdUs()) {
             std::fprintf(stderr, "[stall] t=%lld %s took %lld ms%s%s\n", m_startUs / 1000, m_what,
                          elapsedUs / 1000, m_detail.empty() ? "" : " ", m_detail.c_str());
         }

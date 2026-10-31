@@ -72,7 +72,7 @@ RUNTIME_PATCHES = (
     "hblauncher-runtime-main-stack.diff",
     "hblauncher-runtime-file-modes.diff",
     "hblauncher-runtime-syscall-counts.diff",
-    "hblauncher-runtime-fast-clock.diff", "hblauncher-runtime-thread-pin.diff", "hblauncher-runtime-memory-log.diff",
+    "hblauncher-runtime-fast-clock.diff", "hblauncher-runtime-thread-pin.diff", "hblauncher-runtime-memory-log.diff", "hblauncher-runtime-sockets.diff", "hblauncher-runtime-net-fixes.diff", "hblauncher-runtime-net-trace.diff", "hblauncher-runtime-net-nonblock.diff",
 )
 
 
@@ -156,20 +156,26 @@ def deps():
     apply_runtime_patches(sdk)
 
 
-def apply_runtime_patches(sdk):
-    """Every patch to HBLauncher's Linux runtime; already-applied ones are skipped, so an existing
-    SDK copy picks up new patches without running deps again. Later patches change lines near
-    earlier ones, which can no longer be reversed, so the newest applied patch stands for all
-    those before it."""
+def apply_patch_series(directory, patches):
+    """Apply patches in order. Later patches change lines near earlier ones, which can no longer
+    be reversed, so the newest applied patch stands for all those before it."""
     pending = []
-    for patch in reversed(RUNTIME_PATCHES):
-        reverse = ["patch", "-d", str(sdk), "-p1", "-R", "-s", "--dry-run"]
+    for patch in reversed(patches):
+        reverse = ["patch", "-d", str(directory), "-p1", "-R", "-s", "--dry-run"]
         with open(PATCHES / patch, "rb") as p:
             if subprocess.run(reverse, stdin=p, capture_output=True).returncode == 0:
                 break
         pending.insert(0, patch)
     for patch in pending:
-        apply_patch(sdk, PATCHES / patch)
+        apply_patch(directory, PATCHES / patch)
+
+
+def apply_runtime_patches(sdk):
+    """Every patch to HBLauncher's Linux runtime; already-applied ones are skipped, so an existing
+    SDK copy picks up new patches without running deps again. Later patches change lines near
+    earlier ones, which can no longer be reversed, so the newest applied patch stands for all
+    those before it."""
+    apply_patch_series(sdk, RUNTIME_PATCHES)
 
 
 def runtime():
@@ -234,7 +240,7 @@ def apply_aurora_patch():
                   "aurora-hbx-dawn-toggles.diff", "aurora-hbx-diagnostics.diff",
                   "aurora-hbx-texture-debug.diff", "aurora-hbx-frame-timing.diff",
                   "aurora-hbx-lighting-safe.diff", "aurora-hbx-bind-diag.diff",
-                  "aurora-hbx-texture-selftest.diff", "aurora-hbx-frame-check.diff", "aurora-hbx-device-lock.diff", "aurora-hbx-upload-probe.diff", "aurora-hbx-heap-block.diff"):
+                  "aurora-hbx-texture-selftest.diff", "aurora-hbx-frame-check.diff", "aurora-hbx-device-lock.diff", "aurora-hbx-upload-probe.diff", "aurora-hbx-heap-block.diff", "aurora-hbx-console-input.diff", "aurora-hbx-fifo-spin.diff", "aurora-hbx-drain-spin.diff"):
         apply_patch(aurora, PATCHES / patch)
 
 
@@ -262,6 +268,8 @@ def link_flags(variant, build):
         "-nostartfiles", f"-Wl,-T,{ld}",
         f"-Wl,--defsym=HBXL_CODE_BASE={linux['code_base']}", f"-Wl,--defsym=HBXL_DATA_BASE={linux['data_base']}",
         f"-Wl,--defsym=HBXL_FS_PORT={FS_PORT}", f"-Wl,--defsym=HBXL_FS_HOST=0x{fs_host:08x}",
+        # Hot functions first: the game's code is 120 MB, more than the TLBs and L2 can hold.
+        f"-Wl,--section-ordering-file={HERE / 'section-order.ld'}",
         "-Wl,--eh-frame-hdr", "-Wl,-z,noexecstack", "-Wl,--build-id=none",
         f"-Wl,--whole-archive {lib} -Wl,--no-whole-archive"])
 
@@ -272,9 +280,8 @@ def build(variant, jobs, extra):
     if not (REPO / "generated/build_shards/shards.cmake").exists():
         raise SystemExit("Translate first: build.py translate [--online]")
     apply_aurora_patch()
-    apply_patch(DEPS / "dawn", PATCHES / "dawn-hbx-no-dedicated.diff")
-    apply_patch(DEPS / "dawn", PATCHES / "dawn-hbx-buffer-log.diff")
-    apply_patch(DEPS / "dawn", PATCHES / "dawn-hbx-image-info.diff")
+    apply_patch_series(DEPS / "dawn", ("dawn-hbx-no-dedicated.diff", "dawn-hbx-buffer-log.diff",
+                                       "dawn-hbx-image-info.diff"))
     out = BUILD / variant
     out.mkdir(parents=True, exist_ok=True)
     off = ["DAWN_BUILD_PROTOBUF", "TINT_BUILD_IR_BINARY", "DAWN_USE_X11", "DAWN_USE_WAYLAND",

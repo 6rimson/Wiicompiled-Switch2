@@ -91,6 +91,7 @@ void MarkExecutableGuardPages(uint32_t start, uint32_t end) {
         // Keep ordinary data stores on a single biased-page lookup. A page
         // containing any executable bytes retains the exact guard hierarchy.
         MemoryInline::g_fullWritablePageBias[page] = 0;
+        MemoryInline::g_mixedPageDataStart[page] = 0;
     }
     const uint32_t firstMidPage = start >> RecompMod::kExecutableWriteGuardMidPageShift;
     const uint32_t lastMidPage = (end - 1) >> RecompMod::kExecutableWriteGuardMidPageShift;

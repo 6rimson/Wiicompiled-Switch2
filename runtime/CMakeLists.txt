@@ -280,7 +280,7 @@ else()
     set(AURORA_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
     set(AURORA_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(AURORA_ENABLE_DVD OFF CACHE BOOL "" FORCE)
-    set(AURORA_ENABLE_THP OFF CACHE BOOL "" FORCE)
+    set(AURORA_ENABLE_THP ON CACHE BOOL "" FORCE)
     set(AURORA_ENABLE_RMLUI OFF CACHE BOOL "" FORCE)
     set(AURORA_ENABLE_CARD OFF CACHE BOOL "" FORCE)
     # The runtime implements the Wii SDK itself; Aurora stays on its GameCube SDK.
@@ -438,7 +438,7 @@ else()
         target_compile_features(mkw_macos_native_compile PRIVATE cxx_std_20)
         target_compile_definitions(mkw_macos_native_compile PRIVATE SDL_MAIN_HANDLED TARGET_PC)
         target_link_libraries(mkw_macos_native_compile PRIVATE
-            aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx
+            aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx aurora::thp
             mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
         if(MKW_PLATFORM_MACOS_X86_64)
             target_link_libraries(mkw_macos_native_compile PRIVATE mkw::libco)

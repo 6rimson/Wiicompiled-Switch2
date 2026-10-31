@@ -21,6 +21,8 @@
 // ============================================================================
 extern bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess);
 
+bool Thp_HLE_ProcessCompletions(CpuContext* cpu);
+
 namespace {
 // OSAlarm link layout matches InsertAlarm in the original RVL OS:
 //   0x10 = prev
@@ -237,6 +239,10 @@ bool ProcessAlarmQueue(CpuContext* cpu, int maxToProcess)
         completionNeedsReschedule = true;
     }
     if (Bluetooth_HLE_ProcessCompletions(cpu)) {
+        handledAny = true;
+        completionNeedsReschedule = true;
+    }
+    if (Thp_HLE_ProcessCompletions(cpu)) {
         handledAny = true;
         completionNeedsReschedule = true;
     }
