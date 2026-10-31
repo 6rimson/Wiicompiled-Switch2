@@ -249,6 +249,19 @@ int32_t HandleIpTopIoctl(uint32_t cmd, uint32_t inBuf, uint32_t inLen, uint32_t 
 int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in,
                           const std::vector<IoVector>& out);
 
+// SO_RECVFROM, shared with the deferred path (network_deferred.cpp). A blocking stream read waits
+// for data up to kStreamRecvWaitMs; PlanRecvFromWait reports the reads that would wait so the
+// deferred path can park just the calling guest thread instead of blocking the host thread.
+inline constexpr int kStreamRecvWaitMs = 1000;
+struct RecvFromWaitPlan {
+    uint32_t wiiFd = 0;
+    NativeSocket native = kInvalidSocket;
+    uint64_t generation = 0;
+};
+int32_t RecvFromNow(const std::vector<IoVector>& in, const std::vector<IoVector>& out, bool allowWait);
+std::optional<RecvFromWaitPlan> PlanRecvFromWait(const std::vector<IoVector>& in,
+                                                 const std::vector<IoVector>& out);
+
 // network_ssl.cpp
 void ClearSslSessionsForSocket(uint32_t fd);
 NasSslWriteAction PreparePlainNasTcpWrite(WiiSocket& socket, const uint8_t* data,

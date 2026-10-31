@@ -417,6 +417,79 @@ static int32_t HandleGetInterfaceOpt(const std::vector<IoVector>& in, const std:
     }
 }
 
+// SO_RECVFROM. `allowWait` = false is the deferred path's completion (network_deferred.cpp): the
+// guest thread already waited parked in the scheduler, so the bounded host wait must not run again.
+int32_t RecvFromNow(const std::vector<IoVector>& in, const std::vector<IoVector>& out, bool allowWait) {
+    if (in.empty() || out.empty()) return -SO_EINVAL;
+    const uint32_t fd = Memory::Read32(in[0].address);
+    WiiSocket* s = GetWiiSocket(fd);
+    if (!s) return -SO_EBADF;
+    const uint32_t rawFlags = Memory::Read32(in[0].address + 4);
+    uint32_t flags = rawFlags & 0x03;
+    const bool forceNonBlock = (rawFlags & 0x04u) != 0;
+    char* data = reinterpret_cast<char*>(Memory::GetPointer(out[0].address, out[0].size));
+    sockaddr_in from{};
+    socklen_t fromLen = sizeof(from);
+    sockaddr* fromPtr = out.size() > 1 && out[1].address && out[1].size >= 8 ? reinterpret_cast<sockaddr*>(&from) : nullptr;
+    int ret = 0;
+
+    ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), fromPtr,
+                   fromPtr ? &fromLen : nullptr);
+    int nativeErr = ret < 0 ? NativeLastError() : 0;
+    // Nonblocking sockets get -SO_EAGAIN immediately (Dolphin's retry predicate
+    // short-circuits on nonBlock/forceNonBlock, IOS/Network/Socket.cpp:715-718);
+    // waiting here anyway stalled the whole emulation thread on every empty read.
+    const int streamWaitMs = (forceNonBlock || s->nonblocking) ? 0 : kStreamRecvWaitMs;
+    const bool waited = ret < 0 && !fromPtr && s->type == SOCK_STREAM &&
+        IsWouldBlockError(nativeErr) && allowWait && WaitForReadable(s->native, streamWaitMs);
+    if (waited) {
+        ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), nullptr,
+                       nullptr);
+        // WaitForReadable also returns true for POLLERR/POLLHUP, so the retry
+        // is where a reset connection surfaces; the first call's would-block
+        // error must not be reused or the guest retries that socket forever.
+        nativeErr = ret < 0 ? NativeLastError() : 0;
+    }
+
+    if (ret >= 0 && fromPtr) {
+        WriteWiiSockAddr(out[1].address, from, static_cast<uint32_t>(fromLen));
+    }
+    const int32_t result = ret >= 0 ? SocketResult(ret) : SocketErrorResult(nativeErr);
+    if (ret < 0 && result != -SO_EAGAIN && result != s->lastLoggedRecvError) {
+        s->lastLoggedRecvError = result;
+        NetFail("recv failed fd=%u host=%d wii=%d", fd, nativeErr, result);
+    }
+    return result;
+}
+
+// The bounded stream wait in RecvFromNow blocks the host thread, and with it every guest thread:
+// each HTTP reply the online menus wait on (friends, worldwide, the globe, character select)
+// froze the game. When this recv would wait, report the socket so the deferred path can park only
+// the calling guest thread instead.
+std::optional<RecvFromWaitPlan> PlanRecvFromWait(const std::vector<IoVector>& in,
+                                                 const std::vector<IoVector>& out) {
+    if (in.empty() || out.empty() || !Memory::Contains(in[0].address, 8)) {
+        return std::nullopt;
+    }
+    const uint32_t fd = Memory::Read32(in[0].address);
+    WiiSocket* s = GetWiiSocket(fd);
+    if (!s || s->type != SOCK_STREAM) {
+        return std::nullopt;
+    }
+    // Same conditions as the wait in RecvFromNow: blocking, and no source-address out buffer.
+    const uint32_t rawFlags = Memory::Read32(in[0].address + 4);
+    const bool forceNonBlock = (rawFlags & 0x04u) != 0;
+    const bool hasFromPtr = out.size() > 1 && out[1].address && out[1].size >= 8;
+    if (forceNonBlock || s->nonblocking || hasFromPtr) {
+        return std::nullopt;
+    }
+    // Data (or an error/hangup) already pending: the direct path completes without waiting.
+    if (WaitForReadable(s->native, 0)) {
+        return std::nullopt;
+    }
+    return RecvFromWaitPlan{fd, s->native, s->generation};
+}
+
 int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const std::vector<IoVector>& out) {
     switch (cmd) {
     case IOCTLV_SO_STARTUP:
@@ -480,49 +553,8 @@ int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const s
         }
         return result;
     }
-    case IOCTLV_SO_RECVFROM: {
-        if (in.empty() || out.empty()) return -SO_EINVAL;
-        const uint32_t fd = Memory::Read32(in[0].address);
-        WiiSocket* s = GetWiiSocket(fd);
-        if (!s) return -SO_EBADF;
-        const uint32_t rawFlags = Memory::Read32(in[0].address + 4);
-        uint32_t flags = rawFlags & 0x03;
-        const bool forceNonBlock = (rawFlags & 0x04u) != 0;
-        char* data = reinterpret_cast<char*>(Memory::GetPointer(out[0].address, out[0].size));
-        sockaddr_in from{};
-        socklen_t fromLen = sizeof(from);
-        sockaddr* fromPtr = out.size() > 1 && out[1].address && out[1].size >= 8 ? reinterpret_cast<sockaddr*>(&from) : nullptr;
-        int ret = 0;
-
-        ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), fromPtr,
-                       fromPtr ? &fromLen : nullptr);
-        int nativeErr = ret < 0 ? NativeLastError() : 0;
-        // Nonblocking sockets get -SO_EAGAIN immediately (Dolphin's retry predicate
-        // short-circuits on nonBlock/forceNonBlock, IOS/Network/Socket.cpp:715-718);
-        // waiting here anyway stalled the whole emulation thread on every empty read.
-        constexpr int kStreamRecvWaitMs = 1000;
-        const int streamWaitMs = (forceNonBlock || s->nonblocking) ? 0 : kStreamRecvWaitMs;
-        const bool waited = ret < 0 && !fromPtr && s->type == SOCK_STREAM &&
-            IsWouldBlockError(nativeErr) && WaitForReadable(s->native, streamWaitMs);
-        if (waited) {
-            ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), nullptr,
-                           nullptr);
-            // WaitForReadable also returns true for POLLERR/POLLHUP, so the retry
-            // is where a reset connection surfaces; the first call's would-block
-            // error must not be reused or the guest retries that socket forever.
-            nativeErr = ret < 0 ? NativeLastError() : 0;
-        }
-
-        if (ret >= 0 && fromPtr) {
-            WriteWiiSockAddr(out[1].address, from, static_cast<uint32_t>(fromLen));
-        }
-        const int32_t result = ret >= 0 ? SocketResult(ret) : SocketErrorResult(nativeErr);
-        if (ret < 0 && result != -SO_EAGAIN && result != s->lastLoggedRecvError) {
-            s->lastLoggedRecvError = result;
-            NetFail("recv failed fd=%u host=%d wii=%d", fd, nativeErr, result);
-        }
-        return result;
-    }
+    case IOCTLV_SO_RECVFROM:
+        return RecvFromNow(in, out, true);
     default:
         return -SO_EINVAL;
     }

@@ -130,6 +130,19 @@ using DeferredPollPreparation =
 using DeferredConnectPreparation =
     NetworkDeferredContract::Preparation<DeferredConnectWork>;
 
+// A blocking stream SO_RECVFROM that would otherwise wait on the host thread (see
+// PlanRecvFromWait). The guest thread stays parked, so its in/out buffers are still owned by it
+// when the pump completes the read.
+struct DeferredRecvWork {
+    DeferredNetworkRoute route{};
+    std::vector<IoVector> in;
+    std::vector<IoVector> out;
+    RecvFromWaitPlan socket{};
+    NetworkPollContract::Timeout::Clock::time_point deadline{};
+};
+using DeferredRecvPreparation =
+    NetworkDeferredContract::Preparation<DeferredRecvWork>;
+
 struct DeferredNetworkStore {
     std::mutex completedMutex;
     std::deque<DeferredDnsCompletion> completed;
@@ -137,6 +150,7 @@ struct DeferredNetworkStore {
     // thread, so unlike DNS worker completions they need no cross-thread lock.
     std::vector<DeferredPollWork> pendingPolls;
     std::vector<DeferredConnectWork> pendingConnects;
+    std::vector<DeferredRecvWork> pendingRecvs;
     std::mutex resultMutex;
     std::unordered_map<uint64_t, int32_t> syncResults;
     std::mutex schedulerThreadMutex;
@@ -428,6 +442,34 @@ static DeferredPollPreparation PrepareDeferredPoll(
     return DeferredPollPreparation::Ready(std::move(work), -SO_EINVAL);
 }
 
+static DeferredRecvPreparation PrepareDeferredRecv(
+    uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut, uint32_t vectorPtr) {
+    if (!IsIpTopCommand(fd, cmd, IOCTLV_SO_RECVFROM)) {
+        return DeferredRecvPreparation::NotApplicable();
+    }
+    const uint64_t vectorCount = static_cast<uint64_t>(numIn) + numOut;
+    if (numIn == 0 || numOut == 0 || vectorCount > kMaxIoVectors || !vectorPtr ||
+        !Memory::Contains(vectorPtr, static_cast<size_t>(vectorCount) * 8u)) {
+        return DeferredRecvPreparation::NotApplicable();  // the direct path reports the error
+    }
+    const std::vector<IoVector> vectors = ReadVectors(vectorPtr, static_cast<uint32_t>(vectorCount));
+    DeferredRecvWork work{};
+    work.in.assign(vectors.begin(), vectors.begin() + numIn);
+    work.out.assign(vectors.begin() + numIn, vectors.end());
+    if (!work.out[0].address || !Memory::Contains(work.out[0].address, work.out[0].size)) {
+        return DeferredRecvPreparation::NotApplicable();
+    }
+    const std::optional<RecvFromWaitPlan> plan = PlanRecvFromWait(work.in, work.out);
+    if (!plan) {
+        return DeferredRecvPreparation::NotApplicable();
+    }
+    work.socket = *plan;
+    // Same bound as the host wait it replaces.
+    work.deadline = NetworkPollContract::Timeout::Clock::now() +
+                    std::chrono::milliseconds(kStreamRecvWaitMs);
+    return DeferredRecvPreparation::Ready(std::move(work), -SO_EINVAL);
+}
+
 static DeferredConnectPreparation PrepareDeferredConnect(
     uint32_t fd, uint32_t cmd, uint32_t inBuf, uint32_t inLen) {
     if (!IsIpTopCommand(fd, cmd, IOCTL_SO_CONNECT)) {
@@ -685,6 +727,11 @@ static bool InstallDeferredDns(DeferredDnsWork work) {
     return LaunchDeferredDns(std::move(work));
 }
 
+static bool InstallDeferredRecv(DeferredRecvWork work) {
+    GetDeferredNetworkStore().pendingRecvs.push_back(std::move(work));
+    return true;
+}
+
 static bool InstallDeferredPoll(DeferredPollWork work) {
     GetDeferredNetworkStore().pendingPolls.push_back(std::move(work));
     return true;
@@ -800,6 +847,18 @@ NetworkDeferredContract::StartOutcome Network_HLE_StartIoctlSync(
 NetworkDeferredContract::StartOutcome Network_HLE_StartIoctlvSync(
     uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut,
     uint32_t vectorPtr, uint32_t waitQueue) {
+    if (IsIpTopCommand(fd, cmd, IOCTLV_SO_RECVFROM)) {
+        const DeferredStartOutcome outcome = RunDeferredEntry(-SO_EINVAL, -SO_EINVAL, [&] {
+            return StartDeferred(PrepareDeferredRecv(fd, cmd, numIn, numOut, vectorPtr),
+                                 SyncRoute(waitQueue), InstallDeferredRecv);
+        });
+        // Parking is only an optimisation: if it could not be set up, the direct path still
+        // performs the read correctly (with the bounded host wait) instead of failing it.
+        if (outcome.disposition == NetworkDeferredContract::StartDisposition::ImmediateResult) {
+            return DeferredStartOutcome::NotApplicable();
+        }
+        return outcome;
+    }
     if (!IsIpTopCommand(fd, cmd, IOCTLV_SO_GETADDRINFO)) {
         return DeferredStartOutcome::NotApplicable();
     }
@@ -825,6 +884,18 @@ NetworkDeferredContract::StartOutcome Network_HLE_StartIoctlAsync(
 NetworkDeferredContract::StartOutcome Network_HLE_StartIoctlvAsync(
     uint32_t fd, uint32_t cmd, uint32_t numIn, uint32_t numOut,
     uint32_t vectorPtr, uint32_t callback, uint32_t callbackArg) {
+    if (IsIpTopCommand(fd, cmd, IOCTLV_SO_RECVFROM)) {
+        const DeferredStartOutcome outcome = RunDeferredEntry(-SO_EINVAL, -SO_EINVAL, [&] {
+            return StartDeferred(PrepareDeferredRecv(fd, cmd, numIn, numOut, vectorPtr),
+                                 AsyncRoute(callback, callbackArg), InstallDeferredRecv);
+        });
+        // Parking is only an optimisation: if it could not be set up, the direct path still
+        // performs the read correctly (with the bounded host wait) instead of failing it.
+        if (outcome.disposition == NetworkDeferredContract::StartDisposition::ImmediateResult) {
+            return DeferredStartOutcome::NotApplicable();
+        }
+        return outcome;
+    }
     if (!IsIpTopCommand(fd, cmd, IOCTLV_SO_GETADDRINFO)) {
         return DeferredStartOutcome::NotApplicable();
     }
@@ -1020,6 +1091,32 @@ bool Network_HLE_ProcessCompletions(CpuContext* cpu) {
             result = -SO_EINVAL;
         }
         it = store.pendingPolls.erase(it);
+        DeliverDeferredNetworkResult(cpu, store, route, result);
+        handledAny = true;
+    }
+
+    for (auto it = store.pendingRecvs.begin(); it != store.pendingRecvs.end();) {
+        DeferredRecvWork& work = *it;
+        const DeferredNetworkRoute route = work.route;
+        if (route.kind == DeferredNetworkCompletionKind::SyncWaitQueue &&
+            !DeferredNetworkWaiterIsValid(route)) {
+            it = store.pendingRecvs.erase(it);
+            continue;
+        }
+        int32_t result = 0;
+        if (!SocketIdentityIsCurrent(work.socket.wiiFd, work.socket.native, work.socket.generation)) {
+            result = -SO_EBADF;  // closed (and maybe recycled) while this read was parked
+        } else if (WaitForReadable(work.socket.native, 0) || now >= work.deadline) {
+            try {
+                result = RecvFromNow(work.in, work.out, false);
+            } catch (const Memory::AccessViolation&) {
+                result = -SO_EINVAL;
+            }
+        } else {
+            ++it;
+            continue;
+        }
+        it = store.pendingRecvs.erase(it);
         DeliverDeferredNetworkResult(cpu, store, route, result);
         handledAny = true;
     }
