@@ -37,7 +37,12 @@ endif()
 
 function(mkw_apply_translated_compile_options target)
     target_compile_options(${target} PRIVATE
-        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize -mllvm -hot-cold-split=true -w -pipe)
+        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize -w -pipe)
+    # Hot-cold splitting builds any function it judges cold for size, and the machine outliner then
+    # breaks it up. Checked-memory builds have too many false "cold" verdicts for that to be safe.
+    if(NOT MKW_GUEST_FLAT_CHECKED_ONLY)
+        target_compile_options(${target} PRIVATE -mllvm -hot-cold-split=true)
+    endif()
 endfunction()
 
 # Translated shard TUs are the memory-hungry compiles; everything else in the build is

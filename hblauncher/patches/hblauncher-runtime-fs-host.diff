@@ -1,0 +1,19 @@
+diff --git a/sdk/linux/vfs.c b/sdk/linux/vfs.c
+index d0cfd28..bd46e44 100644
+--- a/sdk/linux/vfs.c
++++ b/sdk/linux/vfs.c
+@@ -238,7 +238,13 @@ int hbxl_vfs_init(void) {
+         if (!port || port > 65535) port = 39501;
+         sa.port = (uint16_t)((port >> 8) | ((port & 0xff) << 8));
+     }
+-    sa.addr = 10u | (42u << 8) | (0u << 16) | (1u << 24);
++    {
++        /* The PC's address: the link may pass --defsym=HBXL_FS_HOST=<a|b<<8|c<<16|d<<24>
++         * for a.b.c.d (e.g. a PC on the home LAN); 10.42.0.1 otherwise. */
++        extern char HBXL_FS_HOST[] __attribute__((weak));
++        uint32_t host = (uint32_t)(uintptr_t)HBXL_FS_HOST;
++        sa.addr = host ? host : 10u | (42u << 8) | (0u << 16) | (1u << 24);
++    }
+     HBXL_CALL(IMP_SETSOCKOPT, int (*)(int, int, int, const void *, uint32_t))(s, 0xffff, 0x1006, &timeout, sizeof timeout);
+     HBXL_CALL(IMP_SETSOCKOPT, int (*)(int, int, int, const void *, uint32_t))(s, 6, 1, &one, sizeof one); /* TCP_NODELAY */
+     if (HBXL_CALL(IMP_CONNECT, int (*)(int, const void *, uint32_t))(s, &sa, sizeof sa) < 0) {

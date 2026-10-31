@@ -1,0 +1,60 @@
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -35,6 +35,21 @@
+ #include <tracy/Tracy.hpp>
+ #include <magic_enum.hpp>
+ 
++#if defined(HBX_SWITCH2)
++#include <atomic>
++#include <chrono>
++// Read by the runtime's MKW_PERF_STATS report (microseconds and counts).
++std::atomic<uint64_t> aurora_hbx_gpu_wait_us{0};
++std::atomic<uint64_t> aurora_hbx_render_cb_us{0};
++std::atomic<uint64_t> aurora_hbx_gpu_done_us{0};
++std::atomic<uint64_t> aurora_hbx_gpu_done_count{0};
++static uint64_t aurora_hbx_now_us() {
++  return std::chrono::duration_cast<std::chrono::microseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++#endif
++
+ namespace aurora::gfx {
+ using namespace detail;
+ using webgpu::g_device;
+@@ -207,6 +222,12 @@
+ }
+ 
+ void wait_for_gpu_progress(std::chrono::nanoseconds sleepDuration) {
++#if defined(HBX_SWITCH2)
++  struct WaitTimer {
++    uint64_t start = aurora_hbx_now_us();
++    ~WaitTimer() { aurora_hbx_gpu_wait_us.fetch_add(aurora_hbx_now_us() - start, std::memory_order_relaxed); }
++  } waitTimer;
++#endif
+   uint64_t generation;
+   {
+     std::lock_guard lock{g_progressMutex};
+@@ -819,9 +840,22 @@
+     g_resources.stats.lastStorageSize = stats.lastStorageSize;
+     g_resources.stats.lastTextureUploadSize = stats.lastTextureUploadSize;
+ 
++#if defined(HBX_SWITCH2)
++    const uint64_t renderStart = aurora_hbx_now_us();
++#endif
+     if (callback) {
+       callback(encoder, std::move(afterSubmitCallbacks), replay);
+     }
++#if defined(HBX_SWITCH2)
++    const uint64_t submitted = aurora_hbx_now_us();
++    aurora_hbx_render_cb_us.fetch_add(submitted - renderStart, std::memory_order_relaxed);
++    webgpu::g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
++                                        [submitted](wgpu::QueueWorkDoneStatus, wgpu::StringView) {
++                                          aurora_hbx_gpu_done_us.fetch_add(aurora_hbx_now_us() - submitted,
++                                                                           std::memory_order_relaxed);
++                                          aurora_hbx_gpu_done_count.fetch_add(1, std::memory_order_relaxed);
++                                        });
++#endif
+     packet = {};
+ 
+     g_frameSlots.release(frameSlot);

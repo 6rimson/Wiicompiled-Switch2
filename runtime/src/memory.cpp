@@ -30,6 +30,20 @@
 #endif
 
 MemoryInline::PageEntry MemoryInline::g_pageTable[MemoryInline::kPageCount]{};
+#if defined(HBX_SWITCH2)
+#include <atomic>
+// Read by the MKW_PERF_STATS report.
+std::atomic<uint64_t> g_hbxMemorySlowCalls{0};
+#define MKW_HBX_COUNT_MEMORY_SLOW() g_hbxMemorySlowCalls.fetch_add(1, std::memory_order_relaxed)
+#else
+#define MKW_HBX_COUNT_MEMORY_SLOW() ((void)0)
+#endif
+
+bool MemoryInline::TryGetWritablePointerOutOfLine(
+    uint32_t address, size_t length, uint8_t*& pointer) {
+    return TryGetWritablePointerFast(address, length, pointer);
+}
+
 uintptr_t MemoryInline::g_fullPageBias[MemoryInline::kPageCount]{};
 uintptr_t MemoryInline::g_fullReadablePageBias[MemoryInline::kPageCount]{};
 uintptr_t MemoryInline::g_fullWritablePageBias[MemoryInline::kPageCount]{};
@@ -263,7 +277,7 @@ void BuildPageTable() {
             continue;
         const uintptr_t guestPageBase = static_cast<uintptr_t>(page) << MemoryInline::kPageShift;
         const uintptr_t bias = reinterpret_cast<uintptr_t>(current.base) - guestPageBase;
-        MemoryInline::g_fullPageBias[page] = bias + 1u;
+        MemoryInline::g_fullPageBias[page] = bias + MemoryInline::kBiasEncoding;
     }
 }
 
@@ -627,6 +641,7 @@ namespace {
 } // namespace
 
 uint8_t MemoryInline::Read8Slow(uint32_t addr) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsMmioAddress(addr)) {
         ThrowMmioReadBlocked(addr, sizeof(uint8_t));
     }
@@ -635,6 +650,7 @@ uint8_t MemoryInline::Read8Slow(uint32_t addr) {
 }
 
 uint16_t MemoryInline::Read16Slow(uint32_t addr) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsMmioAddress(addr)) {
         ThrowMmioReadBlocked(addr, sizeof(uint16_t));
     }
@@ -643,6 +659,7 @@ uint16_t MemoryInline::Read16Slow(uint32_t addr) {
 }
 
 uint32_t MemoryInline::Read32Slow(uint32_t addr) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsMmioAddress(addr)) {
         if (uint32_t value = 0; HollywoodGpio_Read32(addr, value)) {
             return value;
@@ -655,6 +672,7 @@ uint32_t MemoryInline::Read32Slow(uint32_t addr) {
 }
 
 uint64_t MemoryInline::Read64Slow(uint32_t addr) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsMmioAddress(addr)) {
         ThrowMmioReadBlocked(addr, sizeof(uint64_t));
     }
@@ -663,6 +681,7 @@ uint64_t MemoryInline::Read64Slow(uint32_t addr) {
 }
 
 float MemoryInline::ReadFloat32Slow(uint32_t addr) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsMmioAddress(addr)) {
         ThrowMmioReadBlocked(addr, sizeof(float));
     }
@@ -674,6 +693,7 @@ float MemoryInline::ReadFloat32Slow(uint32_t addr) {
 }
 
 double MemoryInline::ReadFloat64Slow(uint32_t addr) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsMmioAddress(addr)) {
         ThrowMmioReadBlocked(addr, sizeof(double));
     }
@@ -685,6 +705,7 @@ double MemoryInline::ReadFloat64Slow(uint32_t addr) {
 }
 
 void MemoryInline::Write8Slow(uint32_t addr, uint8_t val) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsGpuFifoAddress(addr)) {
         GX_HLE_FIFO_Write8(val);
         return;
@@ -696,6 +717,7 @@ void MemoryInline::Write8Slow(uint32_t addr, uint8_t val) {
 }
 
 void MemoryInline::Write16Slow(uint32_t addr, uint16_t val) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsGpuFifoAddress(addr)) {
         GX_HLE_FIFO_Write16(val);
         return;
@@ -707,6 +729,7 @@ void MemoryInline::Write16Slow(uint32_t addr, uint16_t val) {
 }
 
 void MemoryInline::Write32Slow(uint32_t addr, uint32_t val) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsGpuFifoAddress(addr)) {
         GX_HLE_FIFO_Write32(val);
         return;
@@ -721,6 +744,7 @@ void MemoryInline::Write32Slow(uint32_t addr, uint32_t val) {
 }
 
 void MemoryInline::Write64Slow(uint32_t addr, uint64_t val) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     if (IsGpuFifoAddress(addr)) {
         // The gather pipe is a byte-stream FIFO; a 64-bit store is two big-endian
         // 32-bit pushes, high word first. Without this arm the write fell through
@@ -737,6 +761,7 @@ void MemoryInline::Write64Slow(uint32_t addr, uint64_t val) {
 }
 
 void MemoryInline::WriteFloat32Slow(uint32_t addr, double val) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     // stfs stores the IEEE-754 bit pattern of the single-precision value, never a
     // truncated integer.
     const uint32_t bits = ConvertPpcDoubleToSingleBits(val);
@@ -752,6 +777,7 @@ void MemoryInline::WriteFloat32Slow(uint32_t addr, double val) {
 }
 
 void MemoryInline::WriteFloat64Slow(uint32_t addr, double val) {
+    MKW_HBX_COUNT_MEMORY_SLOW();
     // stfd stores the full 64-bit FPR bit pattern - load-bearing for the
     // fctiwz->stfd->lwz idiom, where the integer result lives in the low word.
     uint64_t bits;

@@ -1,0 +1,155 @@
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -490,8 +490,60 @@
+       known.config);
+ }
+ 
++#if defined(HBX_SWITCH2)
++// HBLauncher (Switch 2): a pipeline the driver refused is stored empty, so its draws are skipped,
++// and retried after a growing delay, up to HbxPipelineAttempts times.
++struct HbxFailedPipeline {
++  uint32_t attempts = 0;
++  uint64_t retryFrame = 0;
++};
++static absl::flat_hash_map<PipelineRef, HbxFailedPipeline> g_hbxFailedPipelines;
++static uint64_t g_hbxFrame;
++static uint64_t g_hbxPipelineFailures;
++constexpr uint32_t HbxPipelineAttempts = 5;
++constexpr uint64_t HbxPipelineRetryFrames = 30;
++
++static void note_hbx_pipeline_result_locked(PipelineRef hash, bool compiled) {
++  const auto it = g_hbxFailedPipelines.find(hash);
++  if (compiled) {
++    if (it != g_hbxFailedPipelines.end()) {
++      Log.info("Pipeline {:x} built on attempt {}", hash, it->second.attempts + 1);
++      g_hbxFailedPipelines.erase(it);
++    }
++    return;
++  }
++  auto& failed = g_hbxFailedPipelines[hash];
++  ++failed.attempts;
++  ++g_hbxPipelineFailures;
++  failed.retryFrame = g_hbxFrame + HbxPipelineRetryFrames * failed.attempts;
++  if (failed.attempts < HbxPipelineAttempts) {
++    Log.warn("Pipeline {:x} failed (attempt {}, {} failures in total); its draws are skipped, retry in {} frames",
++             hash, failed.attempts, g_hbxPipelineFailures, HbxPipelineRetryFrames * failed.attempts);
++  } else {
++    Log.warn("Pipeline {:x} failed {} times; giving up, its draws stay skipped", hash, failed.attempts);
++  }
++}
++
++static void retry_hbx_failed_pipelines() {
++  std::lock_guard lock{g_pipelineMutex};
++  ++g_hbxFrame;
++  for (const auto& [hash, failed] : g_hbxFailedPipelines) {
++    if (failed.attempts >= HbxPipelineAttempts || failed.retryFrame > g_hbxFrame) {
++      continue;
++    }
++    // Dropping the empty entry makes the next draw that needs it queue a new build.
++    if (const auto it = g_pipelines.find(hash); it != g_pipelines.end() && !it->second.main) {
++      g_pipelines.erase(it);
++    }
++  }
++}
++#endif
++
+ static void store_pipeline_locked(PipelineRef hash, HashType cacheKey, CompiledPipeline&& pipeline) {
+   const bool compiled = static_cast<bool>(pipeline.main);
++#if defined(HBX_SWITCH2)
++  note_hbx_pipeline_result_locked(hash, compiled);
++#endif
+   g_pipelines.try_emplace(hash, std::move(pipeline));
+   if (compiled) {
+     persist_known_pipeline_locked(cacheKey);
+@@ -1316,6 +1368,9 @@
+ }
+ 
+ void begin_pipeline_frame() {
++#if defined(HBX_SWITCH2)
++  retry_hbx_failed_pipelines();
++#endif
+   if (!g_hasPipelineThread) {
+     g_pipelinesPerFrame = 0;
+   }
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -26,6 +26,13 @@
+ #include <utility>
+ 
+ static aurora::Module Log("aurora::gx");
++
++#if defined(HBX_SWITCH2)
++#include <memory>
++#include <string>
++extern "C" void* hbxl_sdk_memalign(size_t align, size_t size);
++extern "C" void hbxl_sdk_free(void* p);
++#endif
+ 
+ namespace aurora::gx {
+ using webgpu::g_device;
+@@ -461,6 +468,43 @@
+ }
+ 
+ const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
++
++#if defined(HBX_SWITCH2)
++// HBLauncher (Switch 2): the console's driver sometimes refuses a pipeline (VK_ERROR_UNKNOWN, a
++// different one every run). Catch that here instead of letting the uncaptured-error callback end
++// the game; the pipeline cache skips the pipeline's draws and retries it later.
++static bool pop_hbx_scope(std::string& error) {
++  auto message = std::make_shared<std::string>();
++  auto future = g_device.PopErrorScope(
++      wgpu::CallbackMode::WaitAnyOnly,
++      [message](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView text) {
++        if (status != wgpu::PopErrorScopeStatus::Success || type != wgpu::ErrorType::NoError) {
++          const std::string_view detail{text};
++          *message = detail.empty() ? "pipeline creation failed" : std::string(detail);
++        }
++      });
++  if (webgpu::g_instance.WaitAny(future, 5000000000) != wgpu::WaitStatus::Success) {
++    error = "timed out checking pipeline creation";
++    return false;
++  }
++  if (!message->empty()) {
++    error = *message;
++    return false;
++  }
++  return true;
++}
++
++// The largest free block in the SDK heap (which the driver allocates from), to the nearest power of two.
++static uint32_t hbx_sdk_heap_free_mib() {
++  for (uint32_t mib = 128; mib >= 1; mib /= 2) {
++    if (void* p = hbxl_sdk_memalign(4096, size_t{mib} << 20)) {
++      hbxl_sdk_free(p);
++      return mib;
++    }
++  }
++  return 0;
++}
++#endif
+ 
+ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                     const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+@@ -512,7 +556,21 @@
+       .multisample = wgpu::MultisampleState{.count = layout.sampleCount},
+       .fragment = &fragmentState,
+   };
++#if defined(HBX_SWITCH2)
++  g_device.PushErrorScope(wgpu::ErrorFilter::OutOfMemory);
++  g_device.PushErrorScope(wgpu::ErrorFilter::Internal);
++  auto pipeline = g_device.CreateRenderPipeline(&descriptor);
++  std::string error;
++  const bool internalOk = pop_hbx_scope(error);
++  const bool memoryOk = pop_hbx_scope(error);
++  if (!internalOk || !memoryOk) {
++    Log.warn("{} failed: {} (largest free SDK heap block: {} MiB)", label, error, hbx_sdk_heap_free_mib());
++    return {};
++  }
++  return pipeline;
++#else
+   return g_device.CreateRenderPipeline(&descriptor);
++#endif
+ }
+ 
+ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {

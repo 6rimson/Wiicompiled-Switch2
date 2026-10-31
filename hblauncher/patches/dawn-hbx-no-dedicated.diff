@@ -1,0 +1,34 @@
+--- a/src/dawn/native/vulkan/TextureVk.cpp
++++ b/src/dawn/native/vulkan/TextureVk.cpp
+@@ -54,6 +54,16 @@
+ #include "src/utils/assert.h"
+ #include "src/utils/compiler.h"
+ #include "src/utils/numeric.h"
++
++#if defined(HBX_SWITCH2)
++// Textures the Switch 2 driver merely prefers to see in dedicated memory stay in Dawn's shared heaps
++// unless this is set. Large textures came out black on the console, and this is the one path in
++// Dawn that depends on a texture's size in that range.
++extern "C" {
++bool dawn_hbx_keep_dedicated = false;
++uint32_t dawn_hbx_last_dedicated = 0;
++}
++#endif
+ 
+ namespace dawn::native::vulkan {
+ 
+@@ -1555,6 +1565,14 @@
+                               dedicatedRequirements.prefersDedicatedAllocation)
+                                  ? mHandle
+                                  : VkImage{};
++#if defined(HBX_SWITCH2)
++    // A self-test in aurora compares both routes on the console; see dawn_hbx_keep_dedicated.
++    dawn_hbx_last_dedicated = (dedicatedRequirements.requiresDedicatedAllocation ? 1u : 0u) |
++                              (dedicatedRequirements.prefersDedicatedAllocation ? 2u : 0u);
++    if (!dedicatedRequirements.requiresDedicatedAllocation && !dawn_hbx_keep_dedicated) {
++        dedicatedImage = VkImage{};
++    }
++#endif
+ 
+     bool forceDisableSubAllocation =
+         (device->IsToggleEnabled(

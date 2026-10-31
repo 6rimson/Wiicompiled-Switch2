@@ -24,7 +24,7 @@ fi
 exec docker run --rm ${TTY[@]+"${TTY[@]}"} \
   -v "$REPO:/host" -v "$HBL_ROOT:/hbl:ro" -v "${HBX_VOLUME:-wiicompiled-hbx}:/opt/work" \
   -e HBL_ROOT=/hbl -e HBXL_TOOLCHAIN=/opt/work/toolchain \
-  -e HBX_DEPS=/opt/work/deps -e HBX_BUILD=/opt/work/build \
+  -e HBX_DEPS=/opt/work/deps -e HBX_BUILD=/opt/work/build -e HBX_FS_HOST="${HBX_FS_HOST:-10.42.0.1}" \
   "$IMAGE" bash -c '
 set -euo pipefail
 SRC=/opt/work/src

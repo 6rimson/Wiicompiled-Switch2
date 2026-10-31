@@ -1,0 +1,472 @@
+--- a/lib/gfx/texture.hpp
++++ b/lib/gfx/texture.hpp
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <cstdio>
+ #include <bit>
+ #include <dolphin/gx.h>
+ 
+@@ -56,6 +58,17 @@
+   , gxFormat(gxFormat) {}
+ };
+ 
++#if defined(HBX_SWITCH2)
++// AURORA_HBX_VERIFY=1: reads uploaded textures back from the GPU and compares them with what was
++// sent, shortly after the upload and again later. Mismatches go to /UserData/Captures.
++void hbx_verify_process() noexcept;
++// AURORA_HBX_CAPTURE=1: every 300th frame, saves the screen and a list of its draws there too.
++bool hbx_capture_frame(uint32_t frame) noexcept;
++std::FILE* hbx_draw_file(uint32_t frame) noexcept;
++wgpu::Buffer hbx_capture_encode(wgpu::CommandEncoder& encoder, const wgpu::Texture& texture, wgpu::Extent3D size);
++void hbx_capture_finish(const wgpu::Buffer& buffer, wgpu::Extent3D size, uint32_t frame) noexcept;
++#endif
++
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
+ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -13,6 +13,17 @@
+ #include <memory>
+ #include <utility>
+ 
++#if defined(HBX_SWITCH2)
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <vector>
++#define XXH_STATIC_LINKING_ONLY
++#include <xxhash.h>
++#endif
++
+ #include <fmt/format.h>
+ #include <tracy/Tracy.hpp>
+ #include <webgpu/webgpu_cpp.h>
+@@ -97,6 +108,196 @@
+ }
+ } // namespace
+ 
++#if defined(HBX_SWITCH2)
++namespace {
++struct HbxCheck {
++  TextureHandle strong;
++  std::weak_ptr<TextureRef> weak;
++  uint64_t hash = 0;
++  uint32_t bytesPerRow = 0;
++  uint32_t rows = 0;
++  wgpu::Extent3D size{};
++  uint32_t readyAt = 0;
++};
++
++std::mutex s_hbxCheckMutex;
++std::deque<HbxCheck> s_hbxPending;
++std::deque<HbxCheck> s_hbxRecheck;
++std::atomic<uint32_t> s_hbxFrames{0};
++uint64_t s_hbxChecked = 0;
++uint64_t s_hbxBad = 0;
++uint64_t s_hbxDropped = 0;
++
++bool hbx_verify_enabled() noexcept {
++  static const bool enabled = std::getenv("AURORA_HBX_VERIFY") != nullptr;
++  return enabled;
++}
++
++bool hbx_capture_enabled() noexcept {
++  static const bool enabled = std::getenv("AURORA_HBX_CAPTURE") != nullptr;
++  return enabled;
++}
++
++bool hbx_read_buffer(const wgpu::Buffer& buffer, uint64_t size) {
++  bool ok = false;
++  const auto future = buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
++                                      [&ok](wgpu::MapAsyncStatus status, wgpu::StringView) {
++                                        ok = status == wgpu::MapAsyncStatus::Success;
++                                      });
++  return webgpu::g_instance.WaitAny(future, 5000000000) == wgpu::WaitStatus::Success && ok;
++}
++
++void hbx_check_texture(HbxCheck& check, TextureRef& ref, bool first) {
++  const uint32_t alignedRow = AURORA_ALIGN(check.bytesPerRow, 256);
++  const uint64_t bytes = uint64_t{alignedRow} * check.rows;
++  const wgpu::BufferDescriptor descriptor{.label = "HBX texture check",
++                                          .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++                                          .size = bytes};
++  auto buffer = webgpu::g_device.CreateBuffer(&descriptor);
++  auto encoder = webgpu::g_device.CreateCommandEncoder();
++  const wgpu::TexelCopyTextureInfo source{.texture = ref.texture};
++  const wgpu::TexelCopyBufferInfo target{.layout = {.bytesPerRow = alignedRow, .rowsPerImage = check.rows},
++                                         .buffer = buffer};
++  encoder.CopyTextureToBuffer(&source, &target, &check.size);
++  const auto commands = encoder.Finish();
++  webgpu::g_queue.Submit(1, &commands);
++  if (!hbx_read_buffer(buffer, bytes)) {
++    Log.warn("texture check: readback failed for {}x{}", ref.size.width, ref.size.height);
++    return;
++  }
++  const auto* mapped = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, bytes));
++  std::vector<uint8_t> tight(uint64_t{check.bytesPerRow} * check.rows);
++  for (uint32_t row = 0; row < check.rows; ++row) {
++    std::memcpy(tight.data() + uint64_t{row} * check.bytesPerRow, mapped + uint64_t{row} * alignedRow,
++                check.bytesPerRow);
++  }
++  ++s_hbxChecked;
++  if (XXH3_64bits(tight.data(), tight.size()) != check.hash) {
++    const auto zero = std::count(tight.begin(), tight.end(), uint8_t{0});
++    const uint64_t index = s_hbxBad++;
++    Log.warn("texture check {}: {}x{} gx format {} wgpu {} mips {}: GPU contents differ, {:.1f}% zero bytes ({})", index,
++             ref.size.width, ref.size.height, ref.gxFormat, static_cast<int>(ref.format), ref.mipCount,
++             100.0 * static_cast<double>(zero) / static_cast<double>(tight.size()), first ? "new" : "was correct before");
++    if (index < 24) {
++      const auto path = fmt::format("/UserData/Captures/bad_{:03}_{}x{}_gx{}_row{}.raw", index, ref.size.width,
++                                    ref.size.height, ref.gxFormat, check.bytesPerRow);
++      if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
++        std::fwrite(tight.data(), 1, tight.size(), file);
++        std::fclose(file);
++      }
++    }
++  }
++  if ((s_hbxChecked & 255) == 0) {
++    Log.info("texture check: {} checked, {} differ, {} skipped", s_hbxChecked, s_hbxBad, s_hbxDropped);
++  }
++}
++
++void hbx_verify_enqueue(const TextureHandle& handle, const uint8_t* data, uint32_t bytesPerRow, uint32_t rows,
++                        wgpu::Extent3D size) {
++  if (!hbx_verify_enabled()) {
++    return;
++  }
++  const uint64_t hash = XXH3_64bits(data, uint64_t{bytesPerRow} * rows);
++  std::lock_guard lock{s_hbxCheckMutex};
++  if (s_hbxPending.size() >= 128) {
++    ++s_hbxDropped;
++    return;
++  }
++  s_hbxPending.push_back({.strong = handle,
++                          .hash = hash,
++                          .bytesPerRow = bytesPerRow,
++                          .rows = rows,
++                          .size = size,
++                          .readyAt = s_hbxFrames.load(std::memory_order_relaxed) + 3});
++}
++} // namespace
++
++void hbx_verify_process() noexcept {
++  if (!hbx_verify_enabled()) {
++    return;
++  }
++  const uint32_t frame = s_hbxFrames.fetch_add(1, std::memory_order_relaxed);
++  for (int i = 0; i < 4; ++i) {
++    HbxCheck check;
++    {
++      std::lock_guard lock{s_hbxCheckMutex};
++      if (s_hbxPending.empty() || static_cast<int32_t>(frame - s_hbxPending.front().readyAt) < 0) {
++        break;
++      }
++      check = std::move(s_hbxPending.front());
++      s_hbxPending.pop_front();
++    }
++    hbx_check_texture(check, *check.strong, true);
++    check.weak = check.strong;
++    check.strong = {};
++    std::lock_guard lock{s_hbxCheckMutex};
++    if (s_hbxRecheck.size() < 4096) {
++      s_hbxRecheck.push_back(std::move(check));
++    }
++  }
++  if ((frame % 30) == 0) {
++    for (int i = 0; i < 2; ++i) {
++      HbxCheck check;
++      {
++        std::lock_guard lock{s_hbxCheckMutex};
++        if (s_hbxRecheck.empty()) {
++          break;
++        }
++        check = std::move(s_hbxRecheck.front());
++        s_hbxRecheck.pop_front();
++      }
++      if (const auto ref = check.weak.lock()) {
++        hbx_check_texture(check, *ref, false);
++        std::lock_guard lock{s_hbxCheckMutex};
++        s_hbxRecheck.push_back(std::move(check));
++      }
++    }
++  }
++}
++
++bool hbx_capture_frame(uint32_t frame) noexcept { return hbx_capture_enabled() && frame % 300 == 150; }
++
++std::FILE* hbx_draw_file(uint32_t frame) noexcept {
++  static std::FILE* file = nullptr;
++  static uint32_t fileFrame = UINT32_MAX;
++  if (frame != fileFrame) {
++    if (file != nullptr) {
++      std::fclose(file);
++    }
++    fileFrame = frame;
++    file = std::fopen(fmt::format("/UserData/Captures/draws_{:06}.txt", frame).c_str(), "w");
++  }
++  return file;
++}
++
++wgpu::Buffer hbx_capture_encode(wgpu::CommandEncoder& encoder, const wgpu::Texture& texture, wgpu::Extent3D size) {
++  const uint32_t row = AURORA_ALIGN(size.width * 4, 256);
++  const wgpu::BufferDescriptor descriptor{.label = "HBX frame capture",
++                                          .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++                                          .size = uint64_t{row} * size.height};
++  auto buffer = webgpu::g_device.CreateBuffer(&descriptor);
++  const wgpu::TexelCopyTextureInfo source{.texture = texture};
++  const wgpu::TexelCopyBufferInfo target{.layout = {.bytesPerRow = row, .rowsPerImage = size.height}, .buffer = buffer};
++  const wgpu::Extent3D extent{size.width, size.height, 1};
++  encoder.CopyTextureToBuffer(&source, &target, &extent);
++  return buffer;
++}
++
++void hbx_capture_finish(const wgpu::Buffer& buffer, wgpu::Extent3D size, uint32_t frame) noexcept {
++  const uint32_t row = AURORA_ALIGN(size.width * 4, 256);
++  const uint64_t bytes = uint64_t{row} * size.height;
++  if (!hbx_read_buffer(buffer, bytes)) {
++    return;
++  }
++  const auto path = fmt::format("/UserData/Captures/frame_{:06}_{}x{}_row{}.raw", frame, size.width, size.height, row);
++  if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
++    std::fwrite(buffer.GetConstMappedRange(0, bytes), 1, bytes, file);
++    std::fclose(file);
++  }
++  buffer.Unmap();
++}
++#endif
++
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
+                                     bool tlut, const char* label) noexcept {
+   ZoneScoped;
+@@ -146,7 +347,12 @@
+           .rowsPerImage = heightBlocks,
+       };
+       g_queue.WriteTexture(&dstView, data.data() + offset, dataSize, &dataLayout, &physicalSize);
++    }
++#if defined(HBX_SWITCH2)
++    if (mip == 0) {
++      hbx_verify_enqueue(handle, data.data(), bytesPerRow, heightBlocks, physicalSize);
+     }
++#endif
+     offset += dataSize;
+   }
+   if (data.size() != UINT32_MAX && offset < data.size()) {
+@@ -166,7 +372,11 @@
+   };
+   const wgpu::TextureDescriptor textureDescriptor{
+       .label = label,
++#if defined(HBX_SWITCH2)
++      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc,
++#else
+       .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
++#endif
+       .dimension = wgpu::TextureDimension::e2D,
+       .size = size,
+       .format = wgpuFormat,
+@@ -201,7 +411,12 @@
+   };
+   const wgpu::TextureDescriptor textureDescriptor{
+       .label = label,
++#if defined(HBX_SWITCH2)
++      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment |
++               wgpu::TextureUsage::CopySrc,
++#else
+       .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment,
++#endif
+       .dimension = wgpu::TextureDimension::e2D,
+       .size = size,
+       .format = wgpuFormat,
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -526,10 +526,18 @@
+ #endif
+ 
+   const auto schedule = gfx::presentation::present_schedule();
++#if defined(HBX_SWITCH2)
++  const uint32_t hbxFrame = gfx::current_frame();
++  const bool hbxCapture = gfx::hbx_capture_frame(hbxFrame);
++#endif
+   const bool black = video::is_black();
+   const float brightness = video::brightness();
+   const bool metalfxEnabled = g_metalfxRequested.load();
+-  gfx::end_frame([black, brightness, metalfxEnabled, rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport, presentSource,
++  gfx::end_frame([
++#if defined(HBX_SWITCH2)
++                  hbxFrame, hbxCapture,
++#endif
++                  black, brightness, metalfxEnabled, rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport, presentSource,
+                   displayCopy = std::move(displayCopy), schedule,
+                   imguiDrawData = std::move(imguiDrawData)](
+                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks,
+@@ -654,13 +662,27 @@
+ 
+       if (finalPresent) {
+         webgpu::gpu_prof::frame_end(encoder);
++      }
++#if defined(HBX_SWITCH2)
++      wgpu::Buffer hbxCaptureBuffer;
++      if (hbxCapture && finalPresent && presentSource.texture) {
++        hbxCaptureBuffer = gfx::hbx_capture_encode(encoder, presentSource.texture, presentSource.size);
+       }
++#endif
+       const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
+       const auto buffer = encoder.Finish(&cmdBufDescriptor);
+       {
+         ZoneScopedN("Queue Submit");
+         g_queue.Submit(1, &buffer);
+       }
++#if defined(HBX_SWITCH2)
++      if (hbxCaptureBuffer) {
++        gfx::hbx_capture_finish(hbxCaptureBuffer, presentSource.size, hbxFrame);
++      }
++      if (finalPresent) {
++        gfx::hbx_verify_process();
++      }
++#endif
+ 
+       if (g_metalfxPendingOutput) {
+         if (!g_metalfxPendingOutput->end_output()) metalfx_failed(g_metalfxPendingOutput->error());
+--- a/lib/gfx/render_worker.cpp
++++ b/lib/gfx/render_worker.cpp
+@@ -8,6 +8,10 @@
+ 
+ #include <tracy/Tracy.hpp>
+ 
++#if defined(HBX_SWITCH2)
++extern "C" void hbxl_pin_next_thread(int core) __attribute__((weak));
++#endif
++
+ namespace aurora::gfx::render_worker {
+ namespace {
+ constexpr size_t QueueCapacity = 256;
+@@ -197,6 +201,11 @@
+   }
+   g_queue.reset();
+   g_pendingItems.store(0, std::memory_order_release);
++#if defined(HBX_SWITCH2)
++  if (hbxl_pin_next_thread != nullptr) {
++    hbxl_pin_next_thread(2);
++  }
++#endif
+   g_thread = thread::Thread{{
+                                 .name = "Aurora render worker",
+                                 .affinity = thread::Affinity::SharedCache,
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -13,6 +13,12 @@
+ #include "texture.hpp"
+ 
+ #include <tracy/Tracy.hpp>
++
++#if defined(HBX_SWITCH2)
++#include <cstdio>
++#define XXH_STATIC_LINKING_ONLY
++#include <xxhash.h>
++#endif
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -596,7 +602,25 @@
+     }
+   } else if (interpolate && cache.interpRecorded && vertices != nullptr) {
+     extend_interpolation_draw(usage.mask);
++  }
++#if defined(HBX_SWITCH2)
++  if (gfx::hbx_capture_frame(gfx::current_frame())) {
++    if (std::FILE* file = gfx::hbx_draw_file(gfx::current_frame())) {
++      std::fprintf(file, "prim %d fmt %d verts %u pipe %llx uniform %u %llx", static_cast<int>(prim),
++                   static_cast<int>(fmt), static_cast<unsigned>(vtxCount),
++                   static_cast<unsigned long long>(xxh3_hash(cache.pipelineRef)), cache.uniformRange.size,
++                   static_cast<unsigned long long>(
++                       XXH3_64bits(gfx::uniform_data(cache.uniformRange), cache.uniformRange.size)));
++      for (u32 i = 0; i < MaxTextures; ++i) {
++        if (cache.shaderInfo.sampledTextures.test(i) && state.textures[i]) {
++          const auto& tex = state.textures[i];
++          std::fprintf(file, " t%u %ux%u gx%u", i, tex.ref->size.width, tex.ref->size.height, tex.ref->gxFormat);
++        }
++      }
++      std::fputc('\n', file);
++    }
+   }
++#endif
+   if (cache.config.shaderConfig.fogRangeEnabled) {
+     const auto key = fog_range_lut_key();
+     if (!cache.hasFogRange || cache.fogRangeKey != key) {
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include <condition_variable>
+ #include "../gx/frame_interpolation.hpp"
+ #include "encoding.hpp"
+@@ -810,8 +811,38 @@
+   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, interpolationSlots,
+                                              callback = std::move(callback)]() mutable {
+     auto& packet = g_framePackets[frameSlot];
++#if defined(HBX_SWITCH2)
++    // AURORA_HBX_CACHE_CLEAN=1: push staged data out of the CPU caches by hand, for testing
++    // whether the GPU sees everything the CPU wrote.
++    static const char* hbxCacheClean = std::getenv("AURORA_HBX_CACHE_CLEAN");
++    if (hbxCacheClean != nullptr && (hbxCacheClean[0] != '2' || (packet.frameId & 1) != 0)) {
++      const auto clean = [](const ByteBuffer& buffer) {
++        const auto start = reinterpret_cast<uintptr_t>(buffer.data()) & ~uintptr_t{63};
++        const auto end = reinterpret_cast<uintptr_t>(buffer.data()) + buffer.size();
++        for (uintptr_t line = start; line < end; line += 64) {
++          __asm__ volatile("dc cvac, %0" : : "r"(line) : "memory");
++        }
++      };
++      clean(packet.verts);
++      clean(packet.uniforms);
++      clean(packet.indices);
++      clean(packet.storage);
++      clean(packet.textureUpload);
++      __asm__ volatile("dsb sy" : : : "memory");
++    }
++#endif
+     g_stagingBuffers[stagingSlot].Unmap();
+     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
++#if defined(HBX_SWITCH2)
++    // Every staged upload should have an encoded copy by now. One that doesn't stays empty.
++    if (packet.copied.textureUploadCount != packet.textureUploads.size()) {
++      static uint64_t lost = 0;
++      lost += packet.textureUploads.size() - packet.copied.textureUploadCount;
++      Log.warn("frame {}: {} of {} texture uploads never encoded, {} ops ({} lost so far)", packet.frameId,
++               packet.textureUploads.size() - packet.copied.textureUploadCount, packet.textureUploads.size(),
++               packet.ops.size(), lost);
++    }
++#endif
+     auto encoder = std::move(packet.encoder);
+     const auto stats = packet.stats;
+     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
+
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -21,6 +21,7 @@
+ #endif
+ #include "../window.hpp"
+ 
++#include <cstdlib>
+ #include <array>
+ #include <cstring>
+ #include <new>
+@@ -693,6 +694,15 @@
+ 
+ void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
+                                wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
++#if defined(HBX_SWITCH2)
++  // AURORA_HBX_DIRECT_UPLOAD=1: skip the staging buffer, to test that path on its own.
++  static const bool hbxDirect = std::getenv("AURORA_HBX_DIRECT_UPLOAD") != nullptr;
++  if (hbxDirect) {
++    const wgpu::TexelCopyBufferLayout directLayout{.bytesPerRow = bytesPerRow, .rowsPerImage = rowsPerImage};
++    webgpu::g_queue.WriteTexture(&tex, data, uint64_t{bytesPerRow} * rowsPerImage, &directLayout, &size);
++    return;
++  }
++#endif
+   const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
+   auto& frame = current_frame_packet();
+   if (frame.textureUpload.size() + copyBytesPerRow * rowsPerImage <= TextureUploadSize) {
+

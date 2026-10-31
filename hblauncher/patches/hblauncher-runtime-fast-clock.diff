@@ -1,0 +1,51 @@
+--- a/sdk/linux/runtime.c
++++ b/sdk/linux/runtime.c
+@@ -135,8 +135,21 @@
+ 
+ static uint64_t g_tick_hz = 19200000ull;
+ 
++/* How to read the system tick: 0 = SVC 0x1e, 1 = cntvct_el0, 2 = cntpct_el0.  The SVC is a kernel
++ * call, and a recompiled game can read the clock tens of thousands of times a frame; on real
++ * hardware its timebase reads are near free.  The direct read is only used if nn::os::GetSystemTick
++ * itself does one, which proves it works in this process. */
++static int g_tick_read;
++
++static inline uint64_t read_tick(void) {
++    uint64_t t;
++    if (g_tick_read == 1) { __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t)); return t; }
++    if (g_tick_read == 2) { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t)); return t; }
++    return hbxl_svc_tick();
++}
++
+ static uint64_t monotonic_ns(void) {
+-    uint64_t t = hbxl_svc_tick();
++    uint64_t t = read_tick();
+     return (t / g_tick_hz) * 1000000000ull + (t % g_tick_hz) * 1000000000ull / g_tick_hz;
+ }
+ 
+@@ -299,6 +312,7 @@
+     int handled = 0;
+     long r;
+     if (n >= 0 && n < 512) __atomic_add_fetch(&hbxl_syscall_counts[n], 1, __ATOMIC_RELAXED);
++    if (n == 113 && !hbxl_exiting) return sys_clock_gettime(a, (struct kts *)b);
+     /* Log every syscall except the per-frame noise (futex, clocks, yield,
+      * sleeps, read/write) so the last line before a crash says what ran. */
+     if (g_trace && n != 98 && n != 113 && n != 124 && n != 101 && n != 115 &&
+@@ -602,6 +616,17 @@
+         hbxl_restore_host(3);
+     }
+     hbxl_log("hbxl: memory ready");
++    {
++        /* nn::os::GetSystemTick, offset from sdk/sdk-symbols.json. */
++        const uint32_t *fn = (const uint32_t *)hbxl_sdk_proc(1218112);
++        int k;
++        for (k = 0; k < 4; k++) {
++            if ((fn[k] & 0xffffffe0u) == 0xd53be040u) { g_tick_read = 1; break; }
++            if ((fn[k] & 0xffffffe0u) == 0xd53be020u) { g_tick_read = 2; break; }
++        }
++        hbxl_logf("hbxl: GetSystemTick %x %x %x %x, tick read mode %d",
++                  (uint64_t)fn[0], (uint64_t)fn[1], (uint64_t)fn[2], (uint64_t)fn[3], (int64_t)g_tick_read);
++    }
+     hbxl_threads_init();
+     hbxl_log("hbxl: threads ready");
+     install_exception_handler();

@@ -1487,7 +1487,18 @@ int RuntimeMain(int argc, char** argv) {
         }
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);
         Wiimote::Initialize();
+#if defined(HBX_SWITCH2)
+        // Without the hooks aurora re-hashes every source it validates. The console is the first
+        // host that really trusts the generations (macOS canonicalizes past them), so they stay
+        // off here until MKW_GX_WRITE_TRACKING=1 proves them.
+        if (std::getenv("MKW_GX_WRITE_TRACKING") != nullptr)
+#endif
         GxGuestWrite::InstallAuroraHooks();
+#if defined(HBX_SWITCH2)
+        if (std::getenv("MKW_CALIBRATE") != nullptr) {
+            PerfStats::LogCoreCalibration(Memory::GetPointer(Memory::kMem2CachedBase, Memory::kMem2Size), Memory::kMem2Size);
+        }
+#endif
         UpdateMkwDynamicAspectSurface(auroraInfo.windowSize.native_fb_width,
                                       auroraInfo.windowSize.native_fb_height);
         settings_overlay::InitializeRuntimeSettings();

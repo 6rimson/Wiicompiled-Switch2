@@ -303,6 +303,9 @@ struct IsPureTypedNativeCpuCall<T, std::void_t<decltype(T::kPure)>> : std::bool_
 // working set while staying L1/L2 resident, unlike 4096 which would thrash L2. Must stay a
 // power of two, the index masks with (size - 1).
 inline constexpr size_t kIndirectDispatchCacheEntries = 512;
+// A multiplicative hash mixes upward, so the index comes from the top bits.
+inline constexpr uint32_t kIndirectDispatchCacheShift = 32 - 9;
+static_assert((size_t{1} << (32 - kIndirectDispatchCacheShift)) == kIndirectDispatchCacheEntries);
 
 // Namespace-scope `inline thread_local`, not function-local `static thread_local`, to avoid a
 // thread-static init epoch check on every bctrl (same as g_currentCpuContext in guest_abi/cpu_context.h).
@@ -335,7 +338,7 @@ public:
         }
 
         auto& cached = g_indirectResolvedDispatchMemo[
-            ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+            ((address >> 2) * 2654435761u) >> kIndirectDispatchCacheShift];
         if (cached.valid && cached.address == address) {
             return cached.info;
         }
@@ -355,7 +358,7 @@ public:
         }
 
         auto& cached = g_indirectRawDispatchMemo[
-            ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+            ((address >> 2) * 2654435761u) >> kIndirectDispatchCacheShift];
         if (cached.valid && cached.address == address) {
             return cached.record;
         }

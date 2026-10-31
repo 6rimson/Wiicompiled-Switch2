@@ -1,0 +1,23 @@
+--- a/src/dawn/native/vulkan/TextureVk.cpp
++++ b/src/dawn/native/vulkan/TextureVk.cpp
+@@ -62,6 +62,7 @@
+ extern "C" {
+ bool dawn_hbx_keep_dedicated = false;
+ uint32_t dawn_hbx_last_dedicated = 0;
++uint64_t dawn_hbx_last_image[3] = {};
+ }
+ #endif
+ 
+@@ -1587,6 +1588,11 @@
+                         requirements2.memoryRequirements, memoryKind, forceDisableSubAllocation,
+                         dedicatedImage));
+ 
++#if defined(HBX_SWITCH2)
++    dawn_hbx_last_image[0] = (uint64_t)ToBackend(mMemoryAllocation.GetResourceHeap())->GetMemory().GetHandle();
++    dawn_hbx_last_image[1] = mMemoryAllocation.GetOffset();
++    dawn_hbx_last_image[2] = ToBackend(mMemoryAllocation.GetResourceHeap())->GetMemoryType();
++#endif
+     DAWN_TRY(CheckVkSuccess(
+         device->fn.BindImageMemory(device->GetVkDevice(), mHandle,
+                                    ToBackend(mMemoryAllocation.GetResourceHeap())->GetMemory(),
+

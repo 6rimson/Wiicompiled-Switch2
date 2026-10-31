@@ -1,0 +1,25 @@
+--- a/src/dawn/native/vulkan/BufferVk.cpp
++++ b/src/dawn/native/vulkan/BufferVk.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include "src/dawn/native/vulkan/BufferVk.h"
+ 
++#include <cstdio>
+ #include <algorithm>
+ #include <cstring>
+ #include <limits>
+@@ -318,6 +319,13 @@
+         device->GetDeviceInfo().memoryTypes[memoryType].propertyFlags;
+     mHostVisible = IsSubset(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memoryPropertyFlags);
+     mHostCoherent = IsSubset(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, memoryPropertyFlags);
++#if defined(HBX_SWITCH2)
++    if (requirements.size >= 32ull * 1024 * 1024) {
++        fprintf(stderr, "[dawn] %llu MiB buffer: memory type %u flags 0x%x\n",
++                static_cast<unsigned long long>(requirements.size >> 20),
++                static_cast<unsigned>(memoryType), static_cast<unsigned>(memoryPropertyFlags));
++    }
++#endif
+ 
+     // The buffers with mappedAtCreation == true will be initialized in BufferBase::MapAtCreation().
+     if (!mappedAtCreation) {
+

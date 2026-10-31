@@ -1,0 +1,22 @@
+--- a/sdk/linux/vfs.c
++++ b/sdk/linux/vfs.c
+@@ -480,7 +480,10 @@
+         int fd;
+         r = join_path((int)a, (const char *)b, path);
+         if (r) return r;
+-        hdr[0] = (uint32_t)c; hdr[1] = (uint32_t)d;
++        /* The file server applies this mode to the host's file, where a restrictive one sticks
++         * (fchmod does nothing here): std::filesystem::copy_file creates files write-only.
++         * Mode 0 makes the server use its default. */
++        hdr[0] = (uint32_t)c; hdr[1] = 0;
+         lock();
+         fd = alloc_fd();
+         if (fd < 0) { unlock(); return fd; }
+@@ -697,6 +700,7 @@
+         ((char *)a)[0] = '/'; ((char *)a)[1] = 0;
+         return 2;
+     case 49: return 0;                                  /* chdir */
++    case 52: case 53: case 54: case 55: return 0;       /* fchmod, fchmodat, fchownat, fchown */
+     case 78: {                                          /* readlinkat */
+         static const char exe[] = "/hbxl-app";
+         if (b && !__builtin_strcmp((const char *)b, "/proc/self/exe")) {

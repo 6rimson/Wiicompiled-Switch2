@@ -1,0 +1,106 @@
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -27,6 +27,14 @@
+ #include <thread>
+ #include <type_traits>
+ #include <vector>
++
++#if defined(HBX_SWITCH2)
++#include <cstdlib>
++#include <cstring>
++#include <pthread.h>
++extern "C" void* hbxl_sdk_memalign(size_t align, size_t size);
++extern "C" void hbxl_sdk_free(void* p);
++#endif
+ 
+ #include <SDL3/SDL_iostream.h>
+ #include <absl/container/flat_hash_map.h>
+@@ -1041,6 +1049,60 @@
+   }
+ }
+ 
++#if defined(HBX_SWITCH2)
++// HBLauncher (Switch 2): pipeline creation failed with VK_ERROR_UNKNOWN on worker threads whose
++// stacks live in the runtime's Vulkan-backed memory, which system services cannot access. Workers
++// get SDK-heap stacks, and their number and stack placement can be set from the environment:
++//   AURORA_PIPELINE_THREADS  worker count, 0 = build on the frame thread (default 1)
++//   AURORA_PIPELINE_STACK    "sdk" (default) or "default" (the runtime's own thread stacks)
++struct HbxPipelineThread {
++  pthread_t thread;
++  void* stack;
++};
++static std::vector<HbxPipelineThread> g_hbxPipelineThreads;
++constexpr size_t HbxPipelineStackSize = 8u << 20;
++
++static void* hbx_pipeline_worker_entry(void*) {
++  pipeline_worker();
++  return nullptr;
++}
++
++static unsigned int start_hbx_pipeline_threads() {
++  const char* countEnv = std::getenv("AURORA_PIPELINE_THREADS");
++  const char* stackEnv = std::getenv("AURORA_PIPELINE_STACK");
++  const unsigned int count = countEnv != nullptr ? std::clamp(std::atoi(countEnv), 0, 4) : 1;
++  const bool sdkStack = stackEnv == nullptr || std::strcmp(stackEnv, "default") != 0;
++  unsigned int sdkStacks = 0;
++  for (unsigned int i = 0; i < count; ++i) {
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    void* stack = sdkStack ? hbxl_sdk_memalign(4096, HbxPipelineStackSize) : nullptr;
++    if (stack != nullptr) {
++      pthread_attr_setstack(&attr, stack, HbxPipelineStackSize);
++    }
++    pthread_t thread;
++    if (pthread_create(&thread, &attr, hbx_pipeline_worker_entry, nullptr) != 0) {
++      hbxl_sdk_free(stack);
++      pthread_attr_destroy(&attr);
++      break;
++    }
++    pthread_attr_destroy(&attr);
++    sdkStacks += stack != nullptr ? 1 : 0;
++    g_hbxPipelineThreads.push_back({thread, stack});
++  }
++  Log.info("Pipeline workers: {} ({} on SDK-heap stacks)", g_hbxPipelineThreads.size(), sdkStacks);
++  return static_cast<unsigned int>(g_hbxPipelineThreads.size());
++}
++
++static void join_hbx_pipeline_threads() {
++  for (auto& worker : g_hbxPipelineThreads) {
++    pthread_join(worker.thread, nullptr);
++    hbxl_sdk_free(worker.stack);
++  }
++  g_hbxPipelineThreads.clear();
++}
++#endif
++
+ template <typename PipelineConfig>
+ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersion) {
+   if (!prepare_pipeline_cache_db()) {
+@@ -1191,11 +1253,17 @@
+     g_hasPipelineThread = false;
+   } else {
+     g_hasPipelineThread = true;
++#if defined(HBX_SWITCH2)
++    if (start_hbx_pipeline_threads() == 0) {
++      g_hasPipelineThread = false;
++    }
++#else
+     const auto workerCount = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
+ 
+     for (unsigned int i = 0; i < workerCount; ++i) {
+       g_pipelineThreads.emplace_back(pipeline_worker);
+     }
++#endif
+   }
+ 
+   const size_t loadedCount = load_pipeline_cache();
+@@ -1221,6 +1289,9 @@
+     for (auto& worker : g_pipelineThreads) {
+       worker.join();
+     }
++#if defined(HBX_SWITCH2)
++    join_hbx_pipeline_threads();
++#endif
+ 
+     g_pipelineThreads.clear();
+   }

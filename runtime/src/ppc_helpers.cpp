@@ -1,3 +1,4 @@
+#include <atomic>
 #include "ppc_runtime.h"
 // ppc_runtime.h re-exports the rest of the ISA package; the CR tier is pulled in
 // by abi_bridge.h for generated code, so this TU asks for it directly.
@@ -30,6 +31,11 @@ extern "C" void PPC_TrapWord(uint32_t trapOptions, uint32_t lhs, uint32_t rhs)
         throw std::runtime_error("PowerPC trap condition fired");
     }
 }
+
+#if defined(HBX_SWITCH2)
+// Read by the MKW_PERF_STATS report.
+std::atomic<uint64_t> g_hbxTimeBaseReads{0};
+#endif
 
 namespace {
 
@@ -83,6 +89,9 @@ uint64_t InitialTimeBase()
 const uint64_t g_timeBaseOrigin = InitialTimeBase();
 
 uint64_t GetTimeBase() {
+#if defined(HBX_SWITCH2)
+    g_hbxTimeBaseReads.fetch_add(1, std::memory_order_relaxed);
+#endif
     const auto elapsed = std::chrono::steady_clock::now() - g_timeBaseStart;
     const auto nanoseconds =
         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();

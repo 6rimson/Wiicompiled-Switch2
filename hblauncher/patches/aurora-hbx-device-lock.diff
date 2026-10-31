@@ -1,0 +1,17 @@
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -1045,6 +1045,13 @@
+       }
+ #endif
+     }
++#if defined(HBX_SWITCH2)
++    // Without this Dawn has no device lock at all, and aurora calls the device from the game,
++    // render and pipeline threads at once. Slower cores make the collisions visible.
++    if (g_adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
++      requiredFeatures.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
++    }
++#endif
+     std::string featureList;
+     for (auto featureName : requiredFeatures) {
+       featureList += "\n  ";
+

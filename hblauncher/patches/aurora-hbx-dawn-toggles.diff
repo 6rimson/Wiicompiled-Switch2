@@ -1,0 +1,73 @@
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -5,6 +5,8 @@
+ #include <array>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
++#include <deque>
+ #include <span>
+ #include <string>
+ #include <string_view>
+@@ -35,6 +37,32 @@
+ 
+ namespace aurora::webgpu {
+ static Module Log("aurora::gpu");
++
++#if defined(HBX_SWITCH2)
++// HBLauncher (Switch 2): extra Dawn device toggles from the environment (hbxl-env), comma-separated,
++// so toggle experiments need no rebuild: AURORA_DAWN_ENABLE and AURORA_DAWN_DISABLE.
++static std::deque<std::string> g_hbxToggleNames; // stable storage for the toggle names
++
++static void hbx_append_toggles(const char* variable, std::vector<const char*>& toggles) {
++  const char* value = std::getenv(variable);
++  if (value == nullptr) {
++    return;
++  }
++  std::string_view rest{value};
++  while (!rest.empty()) {
++    const auto comma = rest.find(',');
++    const auto name = rest.substr(0, comma);
++    if (!name.empty()) {
++      toggles.push_back(g_hbxToggleNames.emplace_back(name).c_str());
++      Log.info("{}: {}", variable, name);
++    }
++    if (comma == std::string_view::npos) {
++      break;
++    }
++    rest.remove_prefix(comma + 1);
++  }
++}
++#endif
+ 
+ wgpu::Device g_device;
+ wgpu::Queue g_queue;
+@@ -1058,14 +1086,28 @@
+         // https://github.com/TwilitRealm/dusklight/issues/2563
+         "use_spirv_reconvergence_mode",
+     };
++#if defined(HBX_SWITCH2)
++    std::vector<const char*> enabledToggles(enableToggles.begin(), enableToggles.end());
++    std::vector<const char*> disabledToggles(disableToggles.begin(), disableToggles.end());
++    hbx_append_toggles("AURORA_DAWN_ENABLE", enabledToggles);
++    hbx_append_toggles("AURORA_DAWN_DISABLE", disabledToggles);
+     wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
+         .nextInChain = &cacheDescriptor,
++        .enabledToggleCount = enabledToggles.size(),
++        .enabledToggles = enabledToggles.data(),
++        .disabledToggleCount = disabledToggles.size(),
++        .disabledToggles = disabledToggles.data(),
++    });
++#else
++    wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
++        .nextInChain = &cacheDescriptor,
+         .enabledToggleCount = enableToggles.size(),
+         .enabledToggles = enableToggles.data(),
+         .disabledToggleCount = disableToggles.size(),
+         .disabledToggles = disableToggles.data(),
+     });
+ #endif
++#endif
+     wgpu::DeviceDescriptor deviceDescriptor({
+ #ifdef WEBGPU_DAWN
+         .nextInChain = &togglesDescriptor,

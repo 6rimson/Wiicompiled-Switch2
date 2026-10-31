@@ -1,0 +1,45 @@
+--- a/sdk/linux/thread.c
++++ b/sdk/linux/thread.c
+@@ -49,6 +49,8 @@
+ static volatile int g_lock;
+ static int g_next_tid = 2;
+ static int g_next_core;
++static int g_pin_core = -1;
++static uint64_t g_pinned_cores;
+ static uint64_t g_core_mask = 1;
+ static int g_arbitration_broken;
+ 
+@@ -57,6 +59,17 @@
+ }
+ static void unlock(void) { __atomic_store_n(&g_lock, 0, __ATOMIC_RELEASE); }
+ 
++/* The next new thread runs on `core`, and later unpinned threads stay off it.
++ * A busy thread that shares a core with another one waits for it to block. */
++void hbxl_pin_next_thread(int core) {
++    lock();
++    if (core > 0 && core < 64 && ((g_core_mask >> core) & 1)) {
++        g_pin_core = core;
++        g_pinned_cores |= 1ull << core;
++    }
++    unlock();
++}
++
+ void hbxl_threads_init(void) {
+     g_core_mask = HBXL_CALL(IMP_OS_COREMASK, uint64_t (*)(void))();
+     if (!g_core_mask) g_core_mask = 1;
+@@ -180,9 +193,15 @@
+     g_threads[slot] = t;
+     /* Round-robin over the available cores, skipping core 0 (the host's). */
+     for (tries = 0; tries < 64; tries++) {
++        if (g_pin_core >= 0) {
++            core = g_pin_core;
++            g_pin_core = -1;
++            break;
++        }
+         core = g_next_core++ % 64;
+         if ((g_core_mask >> core) & 1) {
+             if (core == 0 && (g_core_mask & ~1ull)) continue;
++            if ((g_pinned_cores >> core) & 1) continue;
+             break;
+         }
+     }

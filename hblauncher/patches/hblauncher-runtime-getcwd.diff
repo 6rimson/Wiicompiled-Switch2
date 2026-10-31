@@ -1,0 +1,13 @@
+--- a/sdk/linux/vfs.c
++++ b/sdk/linux/vfs.c
+@@ -678,8 +678,8 @@
+     case 23: case 24:                                   /* dup / dup3 */
+         if (a < 3) return n == 23 ? a : b;
+         return hbxl_vfs_syscall(25, a, 0, 0, 0, 0, 0, handled);
+-    case 17:                                            /* getcwd */
+-        if (c < 2) return -34;
++    case 17:                                            /* getcwd(buf, size): size is argument 2 */
++        if (b < 2) return -34;
+         ((char *)a)[0] = '/'; ((char *)a)[1] = 0;
+         return 2;
+     case 49: return 0;                                  /* chdir */

@@ -1,0 +1,165 @@
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -842,8 +842,150 @@
+     return false;
+   }
+   return true;
++}
++
++#if defined(HBX_SWITCH2)
++extern "C" bool dawn_hbx_keep_dedicated;
++extern "C" uint32_t dawn_hbx_last_dedicated;
++
++namespace {
++// AURORA_HBX_SELFTEST=1: uploads each size the way the game does, then reads it back directly and
++// through a shader, with and without dedicated memory. Black track art came with large textures,
++// and this tells apart a failed upload, a failed sample and the memory route.
++bool hbx_map_read(wgpu::Buffer& buffer, uint64_t size) {
++  bool ok = false;
++  const auto future = buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::WaitAnyOnly,
++                                      [&ok](wgpu::MapAsyncStatus status, wgpu::StringView) {
++                                        ok = status == wgpu::MapAsyncStatus::Success;
++                                      });
++  return g_instance.WaitAny(future, 5000000000) == wgpu::WaitStatus::Success && ok;
+ }
+ 
++void hbx_texture_self_test() {
++  static constexpr char source[] = R"(
++@group(0) @binding(0) var t: texture_2d<f32>;
++@group(0) @binding(1) var s: sampler;
++@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
++  var p = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
++  return vec4f(p[i], 0.0, 1.0);
++}
++@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
++  return textureSampleLevel(t, s, p.xy / 16.0, 0.0);
++}
++)";
++  wgpu::ShaderSourceWGSL wgsl;
++  wgsl.code = source;
++  const wgpu::ShaderModuleDescriptor moduleDesc{.nextInChain = &wgsl, .label = "HBX self-test"};
++  const auto module = g_device.CreateShaderModule(&moduleDesc);
++  const wgpu::ColorTargetState colorTarget{.format = wgpu::TextureFormat::RGBA8Unorm};
++  const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs", .targetCount = 1, .targets = &colorTarget};
++  const wgpu::RenderPipelineDescriptor pipelineDesc{
++      .label = "HBX self-test",
++      .vertex = {.module = module, .entryPoint = "vs"},
++      .fragment = &fragment,
++  };
++  const auto pipeline = g_device.CreateRenderPipeline(&pipelineDesc);
++  const wgpu::SamplerDescriptor samplerDesc{.label = "HBX self-test"};
++  const auto sampler = g_device.CreateSampler(&samplerDesc);
++
++  static constexpr std::array<std::array<uint32_t, 2>, 6> sizes{
++      {{256, 128}, {512, 512}, {832, 140}, {832, 316}, {1024, 512}, {1024, 1024}}};
++  static constexpr uint32_t pixel = 0xFF336699u;
++  for (const bool keepDedicated : {true, false}) {
++    dawn_hbx_keep_dedicated = keepDedicated;
++    for (const auto& [width, height] : sizes) {
++      const uint32_t bytesPerRow = width * 4;
++      const uint32_t alignedRow = (bytesPerRow + 255u) & ~255u;
++      const uint64_t bytes = uint64_t{alignedRow} * height;
++      const wgpu::BufferDescriptor uploadDesc{.label = "HBX self-test upload",
++                                              .usage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc,
++                                              .size = bytes,
++                                              .mappedAtCreation = true};
++      auto upload = g_device.CreateBuffer(&uploadDesc);
++      std::fill_n(static_cast<uint32_t*>(upload.GetMappedRange(0, bytes)), bytes / 4, pixel);
++      upload.Unmap();
++
++      const wgpu::TextureDescriptor textureDesc{
++          .label = "HBX self-test texture",
++          .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc,
++          .size = {width, height},
++          .format = wgpu::TextureFormat::RGBA8Unorm,
++      };
++      auto texture = g_device.CreateTexture(&textureDesc);
++      const uint32_t dedicated = dawn_hbx_last_dedicated;
++      const wgpu::TextureDescriptor targetDesc{
++          .label = "HBX self-test target",
++          .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
++          .size = {16, 16},
++          .format = wgpu::TextureFormat::RGBA8Unorm,
++      };
++      auto target = g_device.CreateTexture(&targetDesc);
++      const wgpu::BufferDescriptor readDesc{.label = "HBX self-test read",
++                                            .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++                                            .size = bytes};
++      auto texels = g_device.CreateBuffer(&readDesc);
++      const wgpu::BufferDescriptor sampledDesc{.label = "HBX self-test sampled",
++                                               .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++                                               .size = 256 * 16};
++      auto sampled = g_device.CreateBuffer(&sampledDesc);
++
++      const std::array<wgpu::BindGroupEntry, 2> entries{
++          wgpu::BindGroupEntry{.binding = 0, .textureView = texture.CreateView()},
++          wgpu::BindGroupEntry{.binding = 1, .sampler = sampler},
++      };
++      const wgpu::BindGroupDescriptor groupDesc{
++          .layout = pipeline.GetBindGroupLayout(0), .entryCount = entries.size(), .entries = entries.data()};
++      const auto group = g_device.CreateBindGroup(&groupDesc);
++
++      const auto encoder = g_device.CreateCommandEncoder();
++      const wgpu::TexelCopyBufferInfo src{.layout = {.bytesPerRow = alignedRow, .rowsPerImage = height},
++                                          .buffer = upload};
++      const wgpu::TexelCopyTextureInfo dst{.texture = texture};
++      const wgpu::Extent3D copySize{width, height, 1};
++      encoder.CopyBufferToTexture(&src, &dst, &copySize);
++      const wgpu::RenderPassColorAttachment attachment{.view = target.CreateView(),
++                                                       .loadOp = wgpu::LoadOp::Clear,
++                                                       .storeOp = wgpu::StoreOp::Store,
++                                                       .clearValue = {0.0, 0.0, 0.0, 0.0}};
++      const wgpu::RenderPassDescriptor passDesc{.colorAttachmentCount = 1, .colorAttachments = &attachment};
++      const auto pass = encoder.BeginRenderPass(&passDesc);
++      pass.SetPipeline(pipeline);
++      pass.SetBindGroup(0, group);
++      pass.Draw(3);
++      pass.End();
++      const wgpu::TexelCopyTextureInfo readTexture{.texture = texture};
++      const wgpu::TexelCopyBufferInfo readTexels{.layout = {.bytesPerRow = alignedRow, .rowsPerImage = height},
++                                                 .buffer = texels};
++      encoder.CopyTextureToBuffer(&readTexture, &readTexels, &copySize);
++      const wgpu::TexelCopyTextureInfo readTarget{.texture = target};
++      const wgpu::TexelCopyBufferInfo readSampled{.layout = {.bytesPerRow = 256, .rowsPerImage = 16},
++                                                  .buffer = sampled};
++      const wgpu::Extent3D targetSize{16, 16, 1};
++      encoder.CopyTextureToBuffer(&readTarget, &readSampled, &targetSize);
++      const auto commands = encoder.Finish();
++      g_queue.Submit(1, &commands);
++
++      uint32_t texelFirst = 0;
++      uint32_t texelLast = 0;
++      uint32_t sampledPixel = 0;
++      if (hbx_map_read(texels, bytes)) {
++        const auto* data = static_cast<const uint32_t*>(texels.GetConstMappedRange(0, bytes));
++        texelFirst = data[0];
++        texelLast = data[bytes / 4 - 1 - (alignedRow - bytesPerRow) / 4];
++      }
++      if (hbx_map_read(sampled, 256 * 16)) {
++        sampledPixel = static_cast<const uint32_t*>(sampled.GetConstMappedRange(0, 256 * 16))[8 * 64 + 8];
++      }
++      Log.info("self-test {}x{} {} MiB dedicated {} (driver flags {}): first {:08x} last {:08x} sampled {:08x} {}",
++               width, height, bytesPerRow * height / 1048576.0, keepDedicated, dedicated, texelFirst, texelLast,
++               sampledPixel, texelFirst == pixel && texelLast == pixel && sampledPixel == pixel ? "ok" : "FAILED");
++    }
++  }
++  dawn_hbx_keep_dedicated = false;
++}
++} // namespace
++#endif
++
+ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+   if (!g_instance) {
+     Log.info("Creating WebGPU instance");
+@@ -1172,6 +1314,11 @@
+   auto presentMode = select_present_mode(g_surfaceCapabilities);
+   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
+            magic_enum::enum_name(presentMode));
++#if defined(HBX_SWITCH2)
++  if (std::getenv("AURORA_HBX_SELFTEST") != nullptr) {
++    hbx_texture_self_test();
++  }
++#endif
+   const auto size = window::get_window_size();
+   g_graphicsConfig = GraphicsConfig{
+       .surfaceConfiguration =

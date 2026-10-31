@@ -1,0 +1,27 @@
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -10,6 +10,7 @@
+ #include <dolphin/gx/GXEnum.h>
+ 
+ #include <absl/container/flat_hash_set.h>
++#include <cstdlib>
+ #include <mutex>
+ #include <string_view>
+ #include <utility>
+@@ -1877,6 +1878,16 @@
+   std::string fragmentOutput;
+   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
+   std::string fragmentReturn = "\n    return prev;"s;
++#if defined(HBX_SWITCH2)
++  // AURORA_HBX_DEBUG_TEXTURE=1: draw the first sampled texture directly, bypassing TEV, to split
++  // "sampling returns black" from "TEV combines it wrongly".
++  if (std::getenv("AURORA_HBX_DEBUG_TEXTURE") != nullptr) {
++    if (const auto at = fragmentFnPre.find("var sampled"); at != std::string::npos) {
++      const auto id = fragmentFnPre.substr(at + 11, fragmentFnPre.find(' ', at + 11) - (at + 11));
++      fragmentFn += fmt::format("\n    prev = vec4f(sampled{}.rgb, 1.0);", id);
++    }
++  }
++#endif
+   if (normalAttachment != UINT32_MAX) {
+     fragmentOutput = fmt::format(
+         "\nstruct FragmentOutput {{\n"

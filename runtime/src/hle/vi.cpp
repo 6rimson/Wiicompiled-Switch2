@@ -579,7 +579,10 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         aurora_set_present_schedule(0, 0);
     }
 
-    EndAuroraFrame();
+    {
+        PerfStats::PhaseScope phase(PerfStats::Phase::EndFrame);
+        EndAuroraFrame();
+    }
     if (paceThisFrame) {
         PaceToRetraceBoundary(paceDeadline);
         std::lock_guard<std::mutex> lock(g_viMutex);
@@ -596,8 +599,16 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     }
     // Pre-warm the next frame so subsequent GX work has a valid frame context.
     {
-        UpdateAuroraAndProcessEvents();
-        if (BeginAuroraFrame()) {
+        {
+            PerfStats::PhaseScope phase(PerfStats::Phase::Events);
+            UpdateAuroraAndProcessEvents();
+        }
+        bool beganFrame = false;
+        {
+            PerfStats::PhaseScope phase(PerfStats::Phase::BeginFrame);
+            beganFrame = BeginAuroraFrame();
+        }
+        if (beganFrame) {
             g_auroraFrameActive.store(true, std::memory_order_release);
         }
     }

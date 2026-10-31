@@ -27,7 +27,14 @@ namespace MemoryInline {
 #define MKW_MEMORY_FORCE_INLINE __attribute__((always_inline)) inline
 #define MKW_MEMORY_NO_INLINE __attribute__((noinline))
 #endif
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+// A checked build reaches these fallbacks from most translated functions. Marking them cold lets
+// the compiler treat those callers as cold too, which puts hot game code in .text.unlikely, builds
+// it for size and outlines it.
+#define MKW_MEMORY_COLD
+#else
 #define MKW_MEMORY_COLD __attribute__((cold))
+#endif
 inline constexpr uint32_t kPageShift = 20;
 inline constexpr uint32_t kPageSize = 1u << kPageShift;
 inline constexpr uint32_t kPageMask = kPageSize - 1u;
@@ -43,7 +50,15 @@ struct PageEntry {
 };
 
 extern PageEntry g_pageTable[kPageCount];
-// Encoded (host page base - guest page base) + 1 for full pages whose next
+// Added to a bias before it's stored, so zero can mean "no entry". A checked build's guest RAM is
+// host memory far above 4 GiB, so its bias is never zero and needs no offset, which saves one
+// subtraction on every translated access.
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+inline constexpr uintptr_t kBiasEncoding = 0;
+#else
+inline constexpr uintptr_t kBiasEncoding = 1;
+#endif
+// Encoded (host page base - guest page base) + kBiasEncoding for full pages whose next
 // page is contiguous. This permits any native access up to 8 bytes without a
 // per-access mask/limit check. Zero retains the general PageEntry fallback.
 extern uintptr_t g_fullPageBias[kPageCount];
@@ -144,7 +159,7 @@ MKW_MEMORY_FORCE_INLINE bool TryGetPointerFast(uint32_t address, size_t length, 
     if (length <= 8) {
         const uintptr_t encodedBias = g_fullPageBias[page];
         if (encodedBias != 0) {
-            pointer = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
+            pointer = reinterpret_cast<uint8_t*>((encodedBias - kBiasEncoding) + address);
             return true;
         }
     }
@@ -218,9 +233,14 @@ MKW_MEMORY_FORCE_INLINE bool TryGetWritablePointerFast(
     }
     if (encodedBias == 0)
         return false;
-    pointer = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
+    pointer = reinterpret_cast<uint8_t*>((encodedBias - kBiasEncoding) + address);
     return true;
 }
+
+// Out-of-line TryGetWritablePointerFast, so the sparse tier stays off the store path of every
+// translated store. Defined in memory.cpp.
+MKW_MEMORY_NO_INLINE bool TryGetWritablePointerOutOfLine(
+    uint32_t address, size_t length, uint8_t*& pointer);
 
 // Flat form: guest_flat_memory.h's page protections already answer mapped/non-deferred/non-executable, so resolving is pure address arithmetic.
 // Two checks stay inline: a wrapped guest address can't survive 64-bit `host + rangeOffset`, and an MMIO write's value isn't recoverable from a
@@ -232,11 +252,24 @@ MKW_MEMORY_FORCE_INLINE uint8_t* ResolveRangeHost(uint32_t base, int32_t minOffs
     const uint32_t guestStart = base + static_cast<uint32_t>(minOffset);
     if (length == 0 || length > kPageSize || guestStart > UINT32_MAX - (length - 1)) return nullptr;
     if (GuestFlat::RequiresCheckedAccess()) {
-        // A host page can cover multiple independently-special Wii pages.
-        // Returning null keeps resolved accesses on the checked Memory::*
-        // path, which materializes deferred reads and applies write policy.
-        (void)needsWrite;
-        return nullptr;
+        // A checked build has no flat view, so a range resolves through the bias tables, which
+        // already exclude deferred, executable and MMIO pages. A cross-page range needs its last
+        // page mapped by the same bias, which also proves the two pages are contiguous. Anything
+        // else resolves null and stays on the checked Memory::* path.
+        const uint32_t firstPage = guestStart >> kPageShift;
+        const uint32_t lastPage = (guestStart + (length - 1)) >> kPageShift;
+        const uintptr_t encodedBias =
+            needsWrite ? g_fullWritablePageBias[firstPage] : g_fullReadablePageBias[firstPage];
+        if (encodedBias == 0) [[unlikely]] return nullptr;
+        if (needsRead && needsWrite && g_fullReadablePageBias[firstPage] != encodedBias) [[unlikely]]
+            return nullptr;
+        if (lastPage != firstPage) {
+            if (needsWrite && g_fullWritablePageBias[lastPage] != encodedBias) [[unlikely]]
+                return nullptr;
+            if ((needsRead || !needsWrite) && g_fullReadablePageBias[lastPage] != encodedBias) [[unlikely]]
+                return nullptr;
+        }
+        return reinterpret_cast<uint8_t*>((encodedBias - kBiasEncoding) + guestStart);
     }
     if (needsWrite &&
         (FlatWriteNeedsPolicy(guestStart) || FlatWriteNeedsPolicy(guestStart + (length - 1))))
@@ -357,7 +390,7 @@ MKW_MEMORY_FORCE_INLINE bool TryReadGuestScalar(uint32_t address, T& outValue) {
     const uintptr_t encodedBias = g_fullReadablePageBias[address >> kPageShift];
     if (encodedBias == 0) [[unlikely]]
         return false;
-    auto* ptr = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
+    auto* ptr = reinterpret_cast<uint8_t*>((encodedBias - kBiasEncoding) + address);
     if constexpr (sizeof(T) == 1) {
         outValue = *ptr;
     } else {
@@ -384,8 +417,8 @@ MKW_MEMORY_FORCE_INLINE bool TryWriteGuestScalar(uint32_t address, T value) {
     const uintptr_t encodedBias = g_fullWritablePageBias[coarsePage];
     uint8_t* ptr = nullptr;
     if (encodedBias != 0) {
-        ptr = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
-    } else if (!TryGetWritablePointerFast(address, sizeof(T), ptr)) [[unlikely]] {
+        ptr = reinterpret_cast<uint8_t*>((encodedBias - kBiasEncoding) + address);
+    } else if (!TryGetWritablePointerOutOfLine(address, sizeof(T), ptr)) [[unlikely]] {
         return false;
     }
     if constexpr (sizeof(T) == 1) {

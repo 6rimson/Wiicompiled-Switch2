@@ -115,6 +115,18 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
     PADStatus statuses[PAD_CHANMAX]{};
     uint32_t rumbleMask = PADRead(statuses);
 
+#if defined(HBX_SWITCH2)
+    // MKW_AUTOPAD=1 taps A on port 1, so a headless test run can reach a race without a person.
+    static const bool s_autoPad = std::getenv("MKW_AUTOPAD") != nullptr;
+    if (s_autoPad) {
+        static uint32_t s_polls = 0;
+        statuses[0].err = PAD_ERR_NONE;
+        if ((s_polls++ % 40) < 3) {
+            statuses[0].button |= PAD_BUTTON_A;
+        }
+    }
+#endif
+
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);
     MotionTrick::Apply(statuses);

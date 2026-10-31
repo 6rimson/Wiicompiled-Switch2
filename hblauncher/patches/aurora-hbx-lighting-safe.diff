@@ -1,0 +1,158 @@
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -888,6 +888,10 @@
+   std::string_view intMax = alpha ? "255"sv : "vec3i(255)"sv;
+   std::string_view shift7 = alpha ? "7u"sv : "vec3u(7u)"sv;
+   std::string_view shift8 = alpha ? "8u"sv : "vec3u(8u)"sv;
++  // NVIDIA's driver follows the spec on NaN and Inf: normalize(0) is NaN and converting one to an
++  // integer gives a large negative value, which clamps a lit surface to black. Integer lighting
++  // goes through these, so a bad term contributes nothing instead.
++  std::string_view toInt = alpha ? "hbx_light1"sv : "hbx_light3"sv;
+   std::string outVar = fmt::format("out.cc{}", i);
+   std::string_view posVar = "mv_pos"sv;
+   std::string_view nrmVar = "mv_nrm"sv;
+@@ -909,9 +913,9 @@
+   if (!cc.lightingEnabled) {
+     // The XF lighting block consumes and produces 8-bit channel values even when lighting is disabled.
+     if (alpha) {
+-      return fmt::format("\n    {0}.a = f32(i32(round({1}.a * 255.0))) / 255.0;", outVar, matSrc);
++      return fmt::format("\n    {0}.a = f32(hbx_light1({1}.a * 255.0)) / 255.0;", outVar, matSrc);
+     }
+-    return fmt::format("\n    {0} = vec4f(vec3f(vec3i(round({1}.rgb * 255.0))) / 255.0, 1.0);", outVar, matSrc);
++    return fmt::format("\n    {0} = vec4f(vec3f(hbx_light3({1}.rgb * 255.0)) / 255.0, 1.0);", outVar, matSrc);
+   }
+ 
+   GXDiffuseFn diffFn = cc.diffFn;
+@@ -926,7 +930,7 @@
+           var dist_attn = dot(light.dist_att, vec3f(1.0, dist, dist2));
+           attn = max(0.0, cos_attn / dist_attn);)""");
+   } else if (cc.attnFn == GX_AF_SPEC) {
+-    std::string dist_attn = diffFn != GX_DF_NONE ? "dot(normalize(light.dist_att), vec3f(1.0, attn, attn * attn))"
++    std::string dist_attn = diffFn != GX_DF_NONE ? "dot(hbx_norm(light.dist_att), vec3f(1.0, attn, attn * attn))"
+                                                  : "dot(light.dist_att, vec3f(1.0, attn, attn * attn))";
+     // A zero distance term saturates rather than dividing by zero.
+     lightAttnFn = fmt::format(R"""(
+@@ -950,7 +954,7 @@
+           var ldir = light.pos - {0};
+           var dist2 = dot(ldir, ldir);
+           var dist = sqrt(dist2);
+-          ldir = ldir / dist;)""",
++          ldir = select(vec3f(0.0), ldir / max(dist, 1e-20), dist > 0.0);)""",
+                                 posVar);
+   }
+ 
+@@ -971,20 +975,20 @@
+             : fmt::format("vec4f(vec3f((material * (lacc + (lacc >> {}))) >> {}) / 255.0, 1.0)", shift7, shift8);
+   return fmt::format(R"""(
+     {{
+-      var lighting = {8}(round({4}{6} * 255.0));
++      var lighting = {14}({4}{6} * 255.0);
+       for (var i = 0u; i < {1}u; i++) {{
+           if ((ubuf.lightState{0}{7} & (1u << i)) == 0u) {{ continue; }}
+           var light = ubuf.lights[i];{5}
+           var attn: f32;{2}
+           var diff = {3};
+-          lighting = lighting + {8}(round(attn * diff * light.color{6} * 255.0));
++          lighting = lighting + {14}(attn * diff * light.color{6} * 255.0);
+       }}
+       let lacc = clamp(lighting, {9}, {10});
+-      let material = {8}(round({11}{6} * 255.0));
++      let material = {14}({11}{6} * 255.0);
+       {12} = {13};
+     }})""",
+                      i, GX::MaxLights, lightAttnFn, lightDiffFn, ambSrc, lightDirSetup, swizzle,
+-                     alpha ? "a"sv : ""sv, intType, intZero, intMax, matSrc, outputTarget, outputValue);
++                     alpha ? "a"sv : ""sv, intType, intZero, intMax, matSrc, outputTarget, outputValue, toInt);
+ }
+ 
+ absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
+@@ -1367,7 +1371,7 @@
+       // Emboss bump: offset the source texcoord by the light projected onto tangent/binormal
+       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
+       vtxXfrAttrs += fmt::format(
+-          "\n    let bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
++          "\n    let bump_ldir{0} = hbx_norm(ubuf.lights[{1}].pos - mv_pos);"
+           "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+           "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+           "\n    out.tex{0}_uv = tc{2}_proj.xy + vec2f(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, "
+@@ -1420,7 +1424,7 @@
+     }
+ 
+     if (tcg.normalize) {
+-      vtxXfrAttrs += fmt::format("\n    tc{0}_tmp = normalize(tc{0}_tmp);", i);
++      vtxXfrAttrs += fmt::format("\n    tc{0}_tmp = hbx_norm(tc{0}_tmp);", i);
+     }
+ 
+     if (tcg.postMtx == GX_PTIDENTITY) {
+@@ -1676,7 +1680,7 @@
+         fragmentFnPre += fmt::format("\n    t_TexCoord = {};", finalCoord);
+       }
+       // Coordinates wrap at 24 bits
+-      fragmentFnPre += "\n    t_TexCoord = (t_TexCoord << vec2u(8u)) >> vec2u(8u);";
++      fragmentFnPre += "\n    t_TexCoord = tev_s24_fixed_vec2i(t_TexCoord);";
+ 
+       if (needsTextureSample && hasBaseTexture) {
+         fragmentFnPre += fmt::format("\n    var ind{0}_uv = vec2f(t_TexCoord) / (ubuf.tex{1}_size_bias.xy * 128.0);",
+@@ -1879,12 +1883,23 @@
+   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
+   std::string fragmentReturn = "\n    return prev;"s;
+ #if defined(HBX_SWITCH2)
+-  // AURORA_HBX_DEBUG_TEXTURE=1: draw the first sampled texture directly, bypassing TEV, to split
+-  // "sampling returns black" from "TEV combines it wrongly".
+-  if (std::getenv("AURORA_HBX_DEBUG_TEXTURE") != nullptr) {
+-    if (const auto at = fragmentFnPre.find("var sampled"); at != std::string::npos) {
+-      const auto id = fragmentFnPre.substr(at + 11, fragmentFnPre.find(' ', at + 11) - (at + 11));
+-      fragmentFn += fmt::format("\n    prev = vec4f(sampled{}.rgb, 1.0);", id);
++  // AURORA_HBX_DEBUG_TEXTURE=1, 2 or 3: draw that surface's first, second or third sampled texture
++  // directly, bypassing TEV. =rast: draw its lit vertex colour instead. These split "sampling
++  // returns black" from "lighting or TEV combines it wrongly".
++  if (const char* view = std::getenv("AURORA_HBX_DEBUG_TEXTURE"); view != nullptr) {
++    if (view[0] == 'r') {
++      if (fragmentFnPre.find("var rast0") != std::string::npos) {
++        fragmentFn += "\n    prev = vec4f(rast0.rgb, 1.0);";
++      }
++    } else {
++      auto at = fragmentFnPre.find("var sampled");
++      for (int n = view[0] - '1'; n > 0 && at != std::string::npos; --n) {
++        at = fragmentFnPre.find("var sampled", at + 1);
++      }
++      if (at != std::string::npos) {
++        const auto id = fragmentFnPre.substr(at + 11, fragmentFnPre.find(' ', at + 11) - (at + 11));
++        fragmentFn += fmt::format("\n    prev = vec4f(sampled{}.rgb, 1.0);", id);
++      }
+     }
+   }
+ #endif
+@@ -1951,6 +1966,20 @@
+   return select(((v & 0xFFu) << 8u) | (v >> 8u), v, le);
+ }}
+ 
++fn hbx_light1(v: f32) -> i32 {{
++  let finite = (bitcast<u32>(v) & 0x7f800000u) != 0x7f800000u;
++  return i32(round(clamp(select(0.0, v, finite), -65536.0, 65536.0)));
++}}
++
++fn hbx_light3(v: vec3f) -> vec3i {{
++  return vec3i(hbx_light1(v.x), hbx_light1(v.y), hbx_light1(v.z));
++}}
++
++fn hbx_norm(v: vec3f) -> vec3f {{
++  let len2 = dot(v, v);
++  return select(vec3f(0.0), v / sqrt(len2), len2 > 1e-20);
++}}
++
+ fn load_word(p: ptr<storage, array<u32>>, word_idx: u32) -> u32 {{
+   // This guard is not expected to handle routine out-of-bounds accesses.
+   // It appears to discourage some Adreno drivers/optimizers from storage buffer
+@@ -2271,6 +2300,11 @@
+   return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;
+ }}
+ 
++fn tev_s24_fixed_vec2i(in: vec2i) -> vec2i {{
++  let low = in & vec2i(0x00FFFFFF);
++  return select(low, low - vec2i(0x01000000), low >= vec2i(0x00800000));
++}}
++
+ fn tev_overflow_vec4f(in: vec4f) -> vec4f {{
+   let byte_space = in * 255.0;
+   return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;

@@ -1,0 +1,35 @@
+--- a/sdk/linux/runtime.c
++++ b/sdk/linux/runtime.c
+@@ -478,12 +478,18 @@
+ void hbxl_restore_host(long code) __attribute__((noreturn));
+ void hbxl_call_on_stack(void (*fn)(void *), void *arg, void *stack_top);
+ extern uint64_t hbxl_host_frame[24];
++
++static void *g_main_stack_sdk;
+ 
+ static void final_cleanup(void *arg) {
+     hbxl_vfs_shutdown();
+     /* Threads that never reached a wait or syscall still run on this memory:
+      * leaking it beats crashing SmileBASIC under them. */
+-    if (!hbxl_threads_live()) hbxl_mem_release_all();
++    if (!hbxl_threads_live()) {
++        hbxl_mem_release_all();
++        hbxl_sdk_free(g_main_stack_sdk);
++        g_main_stack_sdk = 0;
++    }
+     hbxl_restore_host((long)(intptr_t)arg);
+ }
+ 
+@@ -693,7 +699,11 @@
+     g_initial[i++] = 25; g_initial[i++] = (long)g_random16;            /* AT_RANDOM */
+     g_initial[i++] = 0;  g_initial[i++] = 0;
+ 
+-    stack = hbxl_mmap(main_stack);
++    /* System services (AudioOut, sockets) cannot read or write the Vulkan-backed
++     * pool, and SDK calls keep their request buffers on the caller's stack: the
++     * main thread's stack comes from the SDK heap. */
++    stack = g_main_stack_sdk = hbxl_sdk_memalign(4096, main_stack);
++    if (!stack) stack = hbxl_mmap(main_stack);
+     if (!stack) hbxl_return_to_host(3);
+     hbxl_logf("hbxl: main stack 0x%x", (uint64_t)(uintptr_t)stack);
+     hbxl_logf("hbxl: starting main, %u MiB mapped so far", hbxl_mem_used() >> 20);

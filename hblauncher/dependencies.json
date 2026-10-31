@@ -4,7 +4,8 @@
     "commit": "18b4748ba98eeac7df17beb5d3418985eb74897c",
     "abi": 3,
     "patches": [
-      "hblauncher-runtime-file-locks.diff"
+      "hblauncher-runtime-file-locks.diff",
+      "hblauncher-runtime-fs-host.diff"
     ],
     "host_patch": "hblauncher-host-range-mapping.diff",
     "reference": {

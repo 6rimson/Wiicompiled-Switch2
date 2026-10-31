@@ -1,0 +1,17 @@
+--- a/sdk/linux/runtime.c
++++ b/sdk/linux/runtime.c
+@@ -291,10 +291,14 @@
+     while (key[k] && line[k] == key[k]) k++;
+     return !key[k];
+ }
++
++/* Per-syscall counts, read by the app's performance report. */
++uint64_t hbxl_syscall_counts[512];
+ 
+ long __hbx_syscall(long n, long a, long b, long c, long d, long e, long f) {
+     int handled = 0;
+     long r;
++    if (n >= 0 && n < 512) __atomic_add_fetch(&hbxl_syscall_counts[n], 1, __ATOMIC_RELAXED);
+     /* Log every syscall except the per-frame noise (futex, clocks, yield,
+      * sleeps, read/write) so the last line before a crash says what ran. */
+     if (g_trace && n != 98 && n != 113 && n != 124 && n != 101 && n != 115 &&

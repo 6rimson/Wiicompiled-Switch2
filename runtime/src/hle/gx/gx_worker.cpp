@@ -34,6 +34,10 @@ bool g_fifoPending = false;
 } // namespace detail
 
 namespace {
+#if defined(HBX_SWITCH2)
+extern "C" void hbxl_pin_next_thread(int core) __attribute__((weak));
+#endif
+
 struct Header {
     void (*run)(void* payload);
     uint32_t size;
@@ -353,6 +357,11 @@ void Start() {
     g_stop.store(false, std::memory_order_relaxed);
     g_abandon.store(false, std::memory_order_relaxed);
     g_exited.store(false, std::memory_order_relaxed);
+#if defined(HBX_SWITCH2)
+    if (hbxl_pin_next_thread != nullptr) {
+        hbxl_pin_next_thread(1);
+    }
+#endif
     g_thread = new std::thread(WorkerMain);
     detail::g_active.store(true, std::memory_order_release);
     RT_LOGF(RT_TAG_GX, "GX worker started\n");

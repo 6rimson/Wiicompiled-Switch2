@@ -1,0 +1,150 @@
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -1193,6 +1193,18 @@
+     if (g_adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+       requiredFeatures.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
+     }
++    // Copies into textures come out empty on the console, apparently depending on which of Dawn's
++    // 8 MiB memory blocks a texture lands in. One large block keeps every texture in the same place.
++    size_t hbxHeapBlockBytes = size_t{512} << 20;
++    if (const char* blockMib = std::getenv("AURORA_HBX_HEAP_BLOCK_MIB")) {
++      hbxHeapBlockBytes = static_cast<size_t>(std::strtoul(blockMib, nullptr, 10)) << 20;
++    }
++    const bool hbxHeapBlock = hbxHeapBlockBytes != 0 && (hbxHeapBlockBytes & (hbxHeapBlockBytes - 1)) == 0 &&
++                              g_adapter.HasFeature(wgpu::FeatureName::DawnDeviceAllocatorControl);
++    if (hbxHeapBlock) {
++      requiredFeatures.push_back(wgpu::FeatureName::DawnDeviceAllocatorControl);
++      Log.info("Dawn heap block size: {} MiB", hbxHeapBlockBytes >> 20);
++    }
+ #endif
+     std::string featureList;
+     for (auto featureName : requiredFeatures) {
+@@ -1202,6 +1214,13 @@
+     Log.info("Enabling features: {}", featureList);
+ #ifdef WEBGPU_DAWN
+     wgpu::DawnCacheDeviceDescriptor cacheDescriptor({.nextInChain = nullptr});
++#if defined(HBX_SWITCH2)
++    wgpu::DawnDeviceAllocatorControl hbxAllocatorControl{};
++    hbxAllocatorControl.allocatorHeapBlockSize = hbxHeapBlockBytes;
++    if (hbxHeapBlock) {
++      cacheDescriptor.nextInChain = &hbxAllocatorControl;
++    }
++#endif
+     cacheDescriptor.SetDawnLoadCacheDataCallback(
+         [](std::span<const std::byte> key, std::span<std::byte> value) noexcept -> size_t {
+           return load_from_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
+
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -6,6 +6,7 @@
+ #include "aurora/aurora.h"
+ #include "texture.hpp"
+ #include "texture_convert.hpp"
++#include "encoding.hpp"
+ #include "../gx/gx_fmt.hpp"
+ 
+ #include <algorithm>
+@@ -384,6 +385,9 @@
+       .sampleCount = 1,
+   };
+   auto texture = g_device.CreateTexture(&textureDescriptor);
++#if defined(HBX_SWITCH2)
++  hbx_note_image(texture.Get());
++#endif
+   const auto viewLabel = fmt::format("{} view", label);
+   wgpu::TextureViewDescriptor textureViewDescriptor{
+       .label = viewLabel.c_str(),
+
+--- a/lib/gfx/encoding.hpp
++++ b/lib/gfx/encoding.hpp
+@@ -5,6 +5,7 @@
+ namespace aurora::gfx {
+ #if defined(HBX_SWITCH2)
+ void hbx_probe_finish() noexcept;
++void hbx_note_image(WGPUTexture texture) noexcept;
+ #endif
+ 
+ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass);
+
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -5,7 +5,12 @@
+ #include <array>
+ #include <cstdlib>
+ #include <cstring>
++#include <map>
++#include <mutex>
++#include <unordered_map>
+ #include <vector>
++
++extern "C" uint64_t dawn_hbx_last_image[3];
+ #endif
+ 
+ #include "frame.hpp"
+@@ -373,7 +378,12 @@
+   uint32_t width = 0;
+   uint32_t height = 0;
+   bool cleaned = false;
++  std::array<uint64_t, 3> image{};
+ };
++
++std::mutex s_hbxImagesMutex;
++std::unordered_map<WGPUTexture, std::array<uint64_t, 3>> s_hbxImages;
++std::map<std::array<uint64_t, 3>, std::array<uint64_t, 2>> s_hbxBlocks;
+ 
+ std::vector<HbxProbe> s_hbxProbes;
+ uint64_t s_hbxProbeLastFrame = UINT64_MAX;
+@@ -415,7 +425,7 @@
+ 
+ void hbx_probe_upload(wgpu::CommandEncoder& cmd, FramePacket& frame, const TextureUpload& item, uint64_t stagingOffset) {
+   if (!hbx_probe_enabled() || item.buffer || item.tex.mipLevel != 0 || frame.frameId == s_hbxProbeLastFrame ||
+-      s_hbxProbeTotal >= 3000 || item.tex.texture.GetFormat() != wgpu::TextureFormat::RGBA8Unorm) {
++      s_hbxProbeTotal >= 1500 || item.tex.texture.GetFormat() != wgpu::TextureFormat::RGBA8Unorm) {
+     return;
+   }
+   const uint32_t bytesPerRow = item.layout.bytesPerRow;
+@@ -438,6 +448,12 @@
+                    .height = rows,
+                    .cleaned = clean != nullptr && (clean[0] != '2' || (frame.frameId & 1) != 0)};
+     std::memcpy(probe.expected.data(), line, bytes);
++    {
++      std::lock_guard lock{s_hbxImagesMutex};
++      if (const auto it = s_hbxImages.find(item.tex.texture.Get()); it != s_hbxImages.end()) {
++        probe.image = it->second;
++      }
++    }
+     cmd.CopyBufferToBuffer(staging_buffer(frame.stagingBuffer), stagingOffset + uint64_t{row} * alignedRow, probe.source,
+                            0, bytes);
+     hbx_probe_copy_row(cmd, probe, probe.dest);
+@@ -511,6 +527,11 @@
+ } // namespace
+ 
+ #if defined(HBX_SWITCH2)
++void hbx_note_image(WGPUTexture texture) noexcept {
++  std::lock_guard lock{s_hbxImagesMutex};
++  s_hbxImages[texture] = {dawn_hbx_last_image[0], dawn_hbx_last_image[1], dawn_hbx_last_image[2]};
++}
++
+ void hbx_probe_finish() noexcept {
+   for (auto& probe : s_hbxProbes) {
+     const bool source = hbx_probe_matches(probe.source, probe);
+@@ -523,6 +544,7 @@
+     const bool after = hbx_probe_matches(later, probe);
+     uint64_t& count = s_hbxProbeCounts[probe.cleaned ? 1 : 0][(source ? 4 : 0) | (dest ? 2 : 0) | (after ? 1 : 0)];
+     ++count;
++    ++s_hbxBlocks[{probe.image[0], probe.image[1] >> 23, probe.image[2]}][dest ? 0 : 1];
+     if (count <= 8) {
+       Log.warn("upload probe: {}x{} row {} staging {} after copy {} later {} cache clean {}", probe.width, probe.height,
+                probe.row, source ? "ok" : "BAD", dest ? "ok" : "BAD", after ? "ok" : "BAD", probe.cleaned);
+@@ -534,6 +556,10 @@
+       Log.info("upload probe totals, cache clean {}: all ok {}, staging bad {}, copy bad {}, wiped later {}, other {}",
+                cleaned != 0, c[7], c[0] + c[1] + c[2] + c[3], c[4] + c[5], c[6], 0);
+     }
++    for (const auto& [block, counts] : s_hbxBlocks) {
++      Log.info("upload probe block: memory {:x} offset {} MiB type {}: ok {} bad {}", block[0], block[1] * 8, block[2],
++               counts[0], counts[1]);
++    }
+   }
+   s_hbxProbes.clear();
+ }
+

@@ -32,7 +32,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 # The console build and the desktop test build compile identically (HBX_SWITCH2); only the final
 # link differs: HBLauncher's runtime + linker script for the console, desktop stubs otherwise.
-set(HBX_COMMON "--gcc-install-dir=${HBX_GCC_INSTALL_DIR} -mbranch-protection=bti -fno-pie -fno-pic -ffunction-sections -fdata-sections -DHBX_SWITCH2=1")
+set(HBX_COMMON "--gcc-install-dir=${HBX_GCC_INSTALL_DIR} -mcpu=cortex-a78c -mbranch-protection=bti -fno-pie -fno-pic -ffunction-sections -fdata-sections -DHBX_SWITCH2=1")
 set(CMAKE_C_FLAGS_INIT "${HBX_COMMON}")
 set(CMAKE_CXX_FLAGS_INIT "${HBX_COMMON}")
 set(CMAKE_ASM_FLAGS_INIT "${HBX_COMMON}")

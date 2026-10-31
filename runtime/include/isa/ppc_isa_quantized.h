@@ -264,9 +264,17 @@ inline void PpcWritePairPsqInline(uint32_t addr, T first, T second)
 // reading stale bytes, and unmapped pages commit on demand, same as MemoryInline::Flat* loads.
 MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)
 {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    // No flat view: the readable bias table gives the same answer without a call.
+    const uintptr_t encodedBias = MemoryInline::g_fullReadablePageBias[addr >> MemoryInline::kPageShift];
+    if (encodedBias == 0) [[unlikely]]
+        return nullptr;
+    return reinterpret_cast<const uint8_t*>((encodedBias - MemoryInline::kBiasEncoding) + addr);
+#else
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
     return MKW_FLAT_GUEST_BASE + addr;
+#endif
 }
 
 // Same reduction for stores. Still refuses a 32-bit address wrap (one host access can't
@@ -276,6 +284,16 @@ MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr
 // executable, and unmapped pages still trap.
 MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
 {
+#if defined(MKW_GUEST_FLAT_CHECKED_ONLY)
+    // The writable bias table excludes executable and MMIO pages, but only proves one page, so
+    // a store that crosses into the next page stays on the checked path.
+    if (addr > UINT32_MAX - 7u || ((addr + 7u) >> MemoryInline::kPageShift) != (addr >> MemoryInline::kPageShift)) [[unlikely]]
+        return nullptr;
+    const uintptr_t encodedBias = MemoryInline::g_fullWritablePageBias[addr >> MemoryInline::kPageShift];
+    if (encodedBias == 0) [[unlikely]]
+        return nullptr;
+    return reinterpret_cast<uint8_t*>((encodedBias - MemoryInline::kBiasEncoding) + addr);
+#else
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
     if (addr > UINT32_MAX - 7u) [[unlikely]]
@@ -284,6 +302,7 @@ MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
         MemoryInline::FlatWriteNeedsPolicy(addr + 7u)) [[unlikely]]
         return nullptr;
     return MKW_FLAT_GUEST_BASE + addr;
+#endif
 }
 
 inline double PpcLoadPairPsqFloatFastInline(uint32_t addr)

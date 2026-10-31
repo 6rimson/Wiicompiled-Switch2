@@ -29,6 +29,10 @@
 #include <string>
 #include <thread>
 
+#if defined(HBX_SWITCH2)
+extern "C" void hbxl_pin_next_thread(int core) __attribute__((weak));
+#endif
+
 namespace AxDspHle {
 namespace {
 
@@ -1358,6 +1362,11 @@ private:
         m_mixPending = false;
         m_mixBusy = false;
         try {
+#if defined(HBX_SWITCH2)
+            if (hbxl_pin_next_thread != nullptr) {
+                hbxl_pin_next_thread(3);
+            }
+#endif
             m_mixThread = std::thread([this] { MixWorkerMain(); });
         } catch (const std::system_error&) {
             RT_LOGF(RT_TAG_AUDIO, "failed to start the mix worker; mixing inline\n");

@@ -301,6 +301,11 @@ else()
         if(TARGET ${t})
             set_target_properties(${t} PROPERTIES UNITY_BUILD OFF)
             target_compile_options(${t} PRIVATE -O3 -ffast-math -w -pipe)
+            # Guest light and matrix data can hold NaN or Inf, and aurora's filters for them have
+            # to survive the compiler on the console, whose driver doesn't forgive them.
+            if(HBX_SWITCH2)
+                target_compile_options(${t} PRIVATE -fno-finite-math-only)
+            endif()
             if(MKW_PLATFORM_WINDOWS)
                 target_include_directories(${t} PRIVATE ${MKW_DX_STUB_DIR})
             endif()

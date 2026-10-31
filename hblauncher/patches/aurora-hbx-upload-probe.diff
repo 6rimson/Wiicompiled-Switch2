@@ -1,0 +1,185 @@
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -1,4 +1,12 @@
+ #include "encoding.hpp"
++
++#if defined(HBX_SWITCH2)
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#endif
+ 
+ #include "frame.hpp"
+ #include "depth_peek.hpp"
+@@ -350,6 +358,96 @@
+ constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
+ 
+ constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
++
++#if defined(HBX_SWITCH2)
++// AURORA_HBX_PROBE=1: follows one uploaded texture row per frame through the pipeline. It reads the
++// row from the staging buffer as the GPU sees it, from the texture right after the copy, and from
++// the texture again after the frame, which shows where an empty texture loses its data.
++struct HbxProbe {
++  wgpu::Buffer source;
++  wgpu::Buffer dest;
++  wgpu::Texture texture;
++  std::array<uint8_t, 256> expected{};
++  uint32_t bytes = 0;
++  uint32_t row = 0;
++  uint32_t width = 0;
++  uint32_t height = 0;
++  bool cleaned = false;
++};
++
++std::vector<HbxProbe> s_hbxProbes;
++uint64_t s_hbxProbeLastFrame = UINT64_MAX;
++uint32_t s_hbxProbeTotal = 0;
++uint64_t s_hbxProbeCounts[2][8]{};
++
++bool hbx_probe_enabled() noexcept {
++  static const bool enabled = std::getenv("AURORA_HBX_PROBE") != nullptr;
++  return enabled;
++}
++
++wgpu::Buffer hbx_probe_buffer() {
++  const wgpu::BufferDescriptor descriptor{.label = "HBX upload probe",
++                                          .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
++                                          .size = 256};
++  return webgpu::g_device.CreateBuffer(&descriptor);
++}
++
++bool hbx_probe_matches(const wgpu::Buffer& buffer, const HbxProbe& probe) {
++  bool ok = false;
++  const auto future = buffer.MapAsync(wgpu::MapMode::Read, 0, 256, wgpu::CallbackMode::WaitAnyOnly,
++                                      [&ok](wgpu::MapAsyncStatus status, wgpu::StringView) {
++                                        ok = status == wgpu::MapAsyncStatus::Success;
++                                      });
++  if (webgpu::g_instance.WaitAny(future, 5000000000) != wgpu::WaitStatus::Success || !ok) {
++    return false;
++  }
++  const bool same = std::memcmp(buffer.GetConstMappedRange(0, 256), probe.expected.data(), probe.bytes) == 0;
++  buffer.Unmap();
++  return same;
++}
++
++void hbx_probe_copy_row(wgpu::CommandEncoder& cmd, const HbxProbe& probe, const wgpu::Buffer& target) {
++  const wgpu::TexelCopyTextureInfo source{.texture = probe.texture, .origin = {.x = 0, .y = probe.row, .z = 0}};
++  const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = 256, .rowsPerImage = 1}, .buffer = target};
++  const wgpu::Extent3D extent{probe.bytes / 4, 1, 1};
++  cmd.CopyTextureToBuffer(&source, &destination, &extent);
++}
++
++void hbx_probe_upload(wgpu::CommandEncoder& cmd, FramePacket& frame, const TextureUpload& item, uint64_t stagingOffset) {
++  if (!hbx_probe_enabled() || item.buffer || item.tex.mipLevel != 0 || frame.frameId == s_hbxProbeLastFrame ||
++      s_hbxProbeTotal >= 3000 || item.tex.texture.GetFormat() != wgpu::TextureFormat::RGBA8Unorm) {
++    return;
++  }
++  const uint32_t bytesPerRow = item.layout.bytesPerRow;
++  const uint32_t rows = item.size.height;
++  const uint32_t alignedRow = AURORA_ALIGN(bytesPerRow, 256);
++  const uint32_t bytes = std::min<uint32_t>(bytesPerRow, 256) & ~3u;
++  const uint8_t* cpu = frame.textureUpload.data() + item.layout.offset;
++  for (const uint32_t row : {rows / 2, rows / 4, rows * 3 / 4, 0u, rows - 1}) {
++    const uint8_t* line = cpu + uint64_t{row} * alignedRow;
++    if (bytes == 0 || std::all_of(line, line + bytes, [](uint8_t value) { return value == 0; })) {
++      continue;
++    }
++    static const char* clean = std::getenv("AURORA_HBX_CACHE_CLEAN");
++    HbxProbe probe{.source = hbx_probe_buffer(),
++                   .dest = hbx_probe_buffer(),
++                   .texture = item.tex.texture,
++                   .bytes = bytes,
++                   .row = row,
++                   .width = item.size.width,
++                   .height = rows,
++                   .cleaned = clean != nullptr && (clean[0] != '2' || (frame.frameId & 1) != 0)};
++    std::memcpy(probe.expected.data(), line, bytes);
++    cmd.CopyBufferToBuffer(staging_buffer(frame.stagingBuffer), stagingOffset + uint64_t{row} * alignedRow, probe.source,
++                           0, bytes);
++    hbx_probe_copy_row(cmd, probe, probe.dest);
++    s_hbxProbes.push_back(std::move(probe));
++    s_hbxProbeLastFrame = frame.frameId;
++    ++s_hbxProbeTotal;
++    return;
++  }
++}
++#endif
+ 
+ void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
+                                uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst) {
+@@ -402,6 +500,9 @@
+           .buffer = item.buffer ? item.buffer : staging_buffer(frame.stagingBuffer),
+       };
+       cmd.CopyBufferToTexture(&buf, &item.tex, &item.size);
++#if defined(HBX_SWITCH2)
++      hbx_probe_upload(cmd, frame, item, buf.layout.offset);
++#endif
+     }
+     frame.copied.textureUpload = highWater.textureUpload;
+     frame.copied.textureUploadCount = op.textureUploads.size();
+@@ -409,6 +510,35 @@
+ }
+ } // namespace
+ 
++#if defined(HBX_SWITCH2)
++void hbx_probe_finish() noexcept {
++  for (auto& probe : s_hbxProbes) {
++    const bool source = hbx_probe_matches(probe.source, probe);
++    const bool dest = hbx_probe_matches(probe.dest, probe);
++    auto later = hbx_probe_buffer();
++    auto encoder = webgpu::g_device.CreateCommandEncoder();
++    hbx_probe_copy_row(encoder, probe, later);
++    const auto commands = encoder.Finish();
++    webgpu::g_queue.Submit(1, &commands);
++    const bool after = hbx_probe_matches(later, probe);
++    uint64_t& count = s_hbxProbeCounts[probe.cleaned ? 1 : 0][(source ? 4 : 0) | (dest ? 2 : 0) | (after ? 1 : 0)];
++    ++count;
++    if (count <= 8) {
++      Log.warn("upload probe: {}x{} row {} staging {} after copy {} later {} cache clean {}", probe.width, probe.height,
++               probe.row, source ? "ok" : "BAD", dest ? "ok" : "BAD", after ? "ok" : "BAD", probe.cleaned);
++    }
++  }
++  if (!s_hbxProbes.empty() && s_hbxProbeTotal % 128 == 0) {
++    for (int cleaned = 0; cleaned < 2; ++cleaned) {
++      const auto& c = s_hbxProbeCounts[cleaned];
++      Log.info("upload probe totals, cache clean {}: all ok {}, staging bad {}, copy bad {}, wiped later {}, other {}",
++               cleaned != 0, c[7], c[0] + c[1] + c[2] + c[3], c[4] + c[5], c[6], 0);
++    }
++  }
++  s_hbxProbes.clear();
++}
++#endif
++
+ namespace detail {
+ // Copies everything the frame staged into the device buffers, independent of what the
+ // incrementally encoded native frame has copied so far.
+
+--- a/lib/gfx/encoding.hpp
++++ b/lib/gfx/encoding.hpp
+@@ -3,6 +3,9 @@
+ #include "frame_packet.hpp"
+ 
+ namespace aurora::gfx {
++#if defined(HBX_SWITCH2)
++void hbx_probe_finish() noexcept;
++#endif
+ 
+ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass);
+ void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass);
+
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -878,6 +878,9 @@
+       callback(encoder, std::move(afterSubmitCallbacks), replay);
+     }
+ #if defined(HBX_SWITCH2)
++    hbx_probe_finish();
++#endif
++#if defined(HBX_SWITCH2)
+     const uint64_t submitted = aurora_hbx_now_us();
+     aurora_hbx_render_cb_us.fetch_add(submitted - renderStart, std::memory_order_relaxed);
+     webgpu::g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+

@@ -1,0 +1,79 @@
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -751,6 +751,18 @@
+     } else {
+       textureEntry.textureView = sEmptyTextureView.Get();
+       samplerEntry.sampler = sEmptySampler.Get();
++#if defined(HBX_SWITCH2)
++      // A shader that samples an empty slot reads zero: on the console this looks like black art
++      // or a video with no colour. Logged at each power of two, so it can't flood the log.
++      if (info.sampledTextures[i] || info.sampledIndTextures[i]) {
++        static std::atomic<uint64_t> s_emptySlots{0};
++        const uint64_t count = s_emptySlots.fetch_add(1, std::memory_order_relaxed) + 1;
++        if ((count & (count - 1)) == 0) {
++          Log.warn("sampled texture slot {} is empty ({} times so far; sampled {:08b})", i, count,
++                   info.sampledTextures.to_ulong());
++        }
++      }
++#endif
+     }
+   }
+   const WGPUBindGroupDescriptor textureBindGroupDescriptor{
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -226,7 +226,7 @@
+   if (zero) {
+     aurora_hbx_tex_zero.fetch_add(1, std::memory_order_relaxed);
+   }
+-  if (count <= 200 || (zero && count <= 2000)) {
++  if (count <= 200 || (zero && count <= 2000) || (obj.width() >= 512 && obj.format() != GX_TF_I8)) {
+     Log.info("texture upload {}: format {} {}x{} mips {} {} KiB{}", count, static_cast<int>(obj.format()), obj.width(),
+              obj.height(), obj.mip_count(), bytes / 1024, zero ? " ALL ZERO" : "");
+   }
+@@ -992,6 +992,15 @@
+       }
+     } else if (copyRef != nullptr) {
+       handle = copyRef->handle;
++#if defined(HBX_SWITCH2)
++      // Static art at an address that once held an EFB copy would draw that copy instead.
++      static int s_copyLogs = 0;
++      if (obj.width() >= 512 && s_copyLogs < 40) {
++        ++s_copyLogs;
++        Log.warn("slot {} draws an EFB copy for a {}x{} format {} texture", i, obj.width(), obj.height(),
++                 static_cast<int>(obj.format()));
++      }
++#endif
+     } else if (obj.has_data()) {
+       handle = texture::resolve_static_texture(obj);
+     }
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
++#include <set>
+ #include <unordered_map>
+ 
+ namespace {
+@@ -159,6 +160,20 @@
+   const auto rect = map_logical_scissor(g_gxState.texCopySrc);
+   const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
+   const auto texCopyFmt = g_gxState.texCopyFmt;
++#if defined(HBX_SWITCH2)
++  // Lists each kind of EFB copy once: lightmaps, shadows and post effects all arrive here.
++  {
++    static const aurora::Module Log("aurora::gx::copy");
++    static std::set<u64> s_copyKinds;
++    const u64 kind = (static_cast<u64>(texCopyFmt) << 40) | (static_cast<u64>(g_gxState.texCopyDstWidth) << 20) |
++                     g_gxState.texCopyDstHeight;
++    if (s_copyKinds.insert(kind).second && s_copyKinds.size() < 64) {
++      Log.info("EFB copy: format {} {}x{} from {}x{}+{}+{} clear {}", static_cast<int>(texCopyFmt),
++               g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, g_gxState.texCopySrc.width,
++               g_gxState.texCopySrc.height, g_gxState.texCopySrc.x, g_gxState.texCopySrc.y, static_cast<int>(clear));
++    }
++  }
++#endif
+   const auto copy = texture::resolve_copy_texture({
+       .dest = dest,
+       .width = dstWidth,

@@ -1,0 +1,82 @@
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -34,6 +34,8 @@
+ #include <pthread.h>
+ extern "C" void* hbxl_sdk_memalign(size_t align, size_t size);
+ extern "C" void hbxl_sdk_free(void* p);
++// Read by the runtime's MKW_PERF_STATS report.
++std::atomic<uint64_t> aurora_hbx_skipped_draws{0};
+ #endif
+ 
+ #include <SDL3/SDL_iostream.h>
+@@ -1421,6 +1423,9 @@
+ 
+   const auto it = g_pipelines.find(ref);
+   if (it == g_pipelines.end() || !it->second.main) {
++#if defined(HBX_SWITCH2)
++    aurora_hbx_skipped_draws.fetch_add(1, std::memory_order_relaxed);
++#endif
+     return false;
+   }
+   pipeline = it->second;
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -22,6 +22,13 @@
+ #include <optional>
+ #include <utility>
+ 
++#if defined(HBX_SWITCH2)
++#include <atomic>
++// Read by the runtime's MKW_PERF_STATS report.
++std::atomic<uint64_t> aurora_hbx_tex_misses{0};
++std::atomic<uint64_t> aurora_hbx_tex_zero{0};
++#endif
++
+ namespace aurora::gx {
+ namespace {
+ constexpr Module Log{"aurora::gx::texture"};
+@@ -207,7 +214,24 @@
+ 
+ void clear_texture_dependency(u32 texObjId, const CachedTextureEntry& entry) {
+   clear_texture_dependency(texObjId, entry.tlutObjId, entry.replacementId);
++}
++
++#if defined(HBX_SWITCH2)
++// Counts every texture upload and how many had an all-zero source, for the runtime's
++// MKW_PERF_STATS report, and describes the first uploads in the log.
++void hbx_note_texture_miss(const GXTexObj_& obj, size_t bytes) noexcept {
++  const auto* data = static_cast<const uint8_t*>(obj.data);
++  const bool zero = std::all_of(data, data + bytes, [](uint8_t value) { return value == 0; });
++  const uint64_t count = aurora_hbx_tex_misses.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (zero) {
++    aurora_hbx_tex_zero.fetch_add(1, std::memory_order_relaxed);
++  }
++  if (count <= 200 || (zero && count <= 2000)) {
++    Log.info("texture upload {}: format {} {}x{} mips {} {} KiB{}", count, static_cast<int>(obj.format()), obj.width(),
++             obj.height(), obj.mip_count(), bytes / 1024, zero ? " ALL ZERO" : "");
++  }
+ }
++#endif
+ 
+ uint64_t source_generation(const void* data, size_t size) noexcept {
+   return gfx::presentation::guest_write_generation(data, size);
+@@ -737,6 +761,9 @@
+       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
+       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                           {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
++#if defined(HBX_SWITCH2)
++      hbx_note_texture_miss(obj, sourceBytes);
++#endif
+       ++s_stats.misses;
+       s_stats.uploadBytes += texture_handle_size(handle);
+       cache_content_texture(std::move(keys->contentKey), handle);
+@@ -797,6 +824,9 @@
+       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
+                                           {converted.data.data(), converted.data.size()}, false,
+                                           "GX Static Palette Texture");
++#if defined(HBX_SWITCH2)
++      hbx_note_texture_miss(obj, textureBytes);
++#endif
+       handle->hasArbitraryMips = converted.hasArbitraryMips;
+       ++s_stats.misses;
+       s_stats.uploadBytes += texture_handle_size(handle);

@@ -7,8 +7,9 @@ that drives the HBLauncher session (macOS or Linux).
 
   toolchain   build HBLauncher's patched aarch64-linux-musl toolchain into $HBXL_TOOLCHAIN
   deps        fetch Dawn and SDL3 at their pins and apply the HBLauncher patches; copy the
-              HBLauncher SDK and apply this port's runtime patch
-  runtime     build libhbxl.a (HBLauncher's Linux runtime) from the patched SDK copy
+              HBLauncher SDK and apply this port's runtime patches
+  runtime     apply any new runtime patches, then build libhbxl.a (HBLauncher's Linux runtime)
+  address     print this machine's current address on the home network
   translate   translate the base game and Retro Rewind (add --online for the Retro-WFC payload)
   build       configure and build (--variant console: HBLauncher link; desktop: headless test)
   pack        split the console ELF into an HBLauncher package under hblauncher/dist/<id>
@@ -17,14 +18,19 @@ that drives the HBLauncher session (macOS or Linux).
   serve       run HBLauncher's file server on this app's port
 
 Environment: HBL_ROOT (HBLauncher checkout), HBXL_TOOLCHAIN (patched musl toolchain),
-HBX_DEPS (default hblauncher/deps), HBX_BUILD (default hblauncher/build).
+HBX_DEPS (default hblauncher/deps), HBX_BUILD (default hblauncher/build), HBX_FS_HOST (the PC's
+IPv4 address the console reaches, compiled into the app and used by serve; default 10.42.0.1,
+HBLauncher's wired link).
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
+import socket
 import subprocess
 import sys
 
@@ -38,6 +44,7 @@ DEPS = Path(os.environ.get("HBX_DEPS", HERE / "deps"))
 BUILD = Path(os.environ.get("HBX_BUILD", HERE / "build"))
 PATCHES = HERE / "patches"
 PRODUCT = "RetroRewind"
+FS_HOST = os.environ.get("HBX_FS_HOST", "10.42.0.1")
 TRANSLATOR = REPO / "translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll"
 RR_PACK = REPO / "PulsarPacks/completed/RetroRewind/RetroRewind6"
 WFC_PAYLOAD = REPO / "build/retro-wfc/binary/payload.RMCPD00.bin"
@@ -56,6 +63,17 @@ def required(name, relative=None):
     if not (path / relative if relative else path).exists():
         raise SystemExit(f"Invalid {name}: {path}")
     return path
+
+
+RUNTIME_PATCHES = (
+    "hblauncher-runtime-file-locks.diff",
+    "hblauncher-runtime-fs-host.diff",
+    "hblauncher-runtime-getcwd.diff",
+    "hblauncher-runtime-main-stack.diff",
+    "hblauncher-runtime-file-modes.diff",
+    "hblauncher-runtime-syscall-counts.diff",
+    "hblauncher-runtime-fast-clock.diff", "hblauncher-runtime-thread-pin.diff", "hblauncher-runtime-memory-log.diff",
+)
 
 
 def require_linux_aarch64():
@@ -135,12 +153,29 @@ def deps():
         shutil.rmtree(sdk)
     shutil.copytree(hbl / "sdk", sdk / "sdk")
     shutil.copytree(hbl / "tools", sdk / "tools")
-    apply_patch(sdk, PATCHES / "hblauncher-runtime-file-locks.diff")
+    apply_runtime_patches(sdk)
+
+
+def apply_runtime_patches(sdk):
+    """Every patch to HBLauncher's Linux runtime; already-applied ones are skipped, so an existing
+    SDK copy picks up new patches without running deps again. Later patches change lines near
+    earlier ones, which can no longer be reversed, so the newest applied patch stands for all
+    those before it."""
+    pending = []
+    for patch in reversed(RUNTIME_PATCHES):
+        reverse = ["patch", "-d", str(sdk), "-p1", "-R", "-s", "--dry-run"]
+        with open(PATCHES / patch, "rb") as p:
+            if subprocess.run(reverse, stdin=p, capture_output=True).returncode == 0:
+                break
+        pending.insert(0, patch)
+    for patch in pending:
+        apply_patch(sdk, PATCHES / patch)
 
 
 def runtime():
     require_linux_aarch64()
     required("HBXL_TOOLCHAIN", "bin/aarch64-linux-musl-gcc")
+    apply_runtime_patches(hbl_sdk())
     BUILD.mkdir(parents=True, exist_ok=True)
     run(["python3", hbl_sdk() / "sdk/tools/hbxl-build.py", "--runtime-lib", BUILD / "libhbxl.a"])
 
@@ -195,6 +230,12 @@ def apply_aurora_patch():
     if not (aurora / "CMakeLists.txt").exists():
         raise SystemExit("Run git submodule update --init aurora-main first")
     apply_patch(aurora, PATCHES / PINS["aurora"]["patch"])
+    for patch in ("aurora-hbx-pipeline-threads.diff", "aurora-hbx-pipeline-retry.diff",
+                  "aurora-hbx-dawn-toggles.diff", "aurora-hbx-diagnostics.diff",
+                  "aurora-hbx-texture-debug.diff", "aurora-hbx-frame-timing.diff",
+                  "aurora-hbx-lighting-safe.diff", "aurora-hbx-bind-diag.diff",
+                  "aurora-hbx-texture-selftest.diff", "aurora-hbx-frame-check.diff", "aurora-hbx-device-lock.diff", "aurora-hbx-upload-probe.diff", "aurora-hbx-heap-block.diff"):
+        apply_patch(aurora, PATCHES / patch)
 
 
 def link_flags(variant, build):
@@ -212,10 +253,15 @@ def link_flags(variant, build):
     linux = MANIFEST["linux"]
     if any(c.isspace() for c in f"{ld}{lib}"):
         raise SystemExit("Use build and SDK paths without whitespace")
+    octets = [int(part) for part in FS_HOST.split(".")]
+    if len(octets) != 4 or any(not 0 <= o <= 255 for o in octets):
+        raise SystemExit(f"HBX_FS_HOST must be an IPv4 address, not {FS_HOST!r}")
+    fs_host = octets[0] | octets[1] << 8 | octets[2] << 16 | octets[3] << 24   # sockaddr byte order
+    print(f"file server address compiled in: {FS_HOST}")
     return " ".join([
         "-nostartfiles", f"-Wl,-T,{ld}",
         f"-Wl,--defsym=HBXL_CODE_BASE={linux['code_base']}", f"-Wl,--defsym=HBXL_DATA_BASE={linux['data_base']}",
-        f"-Wl,--defsym=HBXL_FS_PORT={FS_PORT}",
+        f"-Wl,--defsym=HBXL_FS_PORT={FS_PORT}", f"-Wl,--defsym=HBXL_FS_HOST=0x{fs_host:08x}",
         "-Wl,--eh-frame-hdr", "-Wl,-z,noexecstack", "-Wl,--build-id=none",
         f"-Wl,--whole-archive {lib} -Wl,--no-whole-archive"])
 
@@ -226,6 +272,9 @@ def build(variant, jobs, extra):
     if not (REPO / "generated/build_shards/shards.cmake").exists():
         raise SystemExit("Translate first: build.py translate [--online]")
     apply_aurora_patch()
+    apply_patch(DEPS / "dawn", PATCHES / "dawn-hbx-no-dedicated.diff")
+    apply_patch(DEPS / "dawn", PATCHES / "dawn-hbx-buffer-log.diff")
+    apply_patch(DEPS / "dawn", PATCHES / "dawn-hbx-image-info.diff")
     out = BUILD / variant
     out.mkdir(parents=True, exist_ok=True)
     off = ["DAWN_BUILD_PROTOBUF", "TINT_BUILD_IR_BINARY", "DAWN_USE_X11", "DAWN_USE_WAYLAND",
@@ -237,7 +286,12 @@ def build(variant, jobs, extra):
            "SDL_EXAMPLES"]
     run(["cmake", "-S", REPO / "runtime", "-B", out, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
          f"-DCMAKE_TOOLCHAIN_FILE={HERE / 'cmake/switch2-musl-clang.cmake'}",
-         f"-DHBX_EXTRA_LINK={link_flags(variant, out)}",
+         # The toolchain file builds the link flags from HBX_EXTRA_LINK, but CMake only applies
+         # *_INIT values when the cache entry is new: drop it so a changed address, port or
+         # runtime always reaches the link.
+         "-UCMAKE_EXE_LINKER_FLAGS", f"-DHBX_EXTRA_LINK={link_flags(variant, out)}",
+         # The same goes for the compile flags: a changed HBX_COMMON has to reach an existing tree.
+         "-UCMAKE_C_FLAGS", "-UCMAKE_CXX_FLAGS", "-UCMAKE_ASM_FLAGS",
          "-DHBX_SWITCH2=ON", f"-DHBX_SDK_INCLUDE={hbl_sdk() / 'sdk/include'}",
          "-DMKW_GUEST_FLAT_CHECKED_ONLY=ON", "-DMKW_AARCH64_CPU=cortex-a78c",
          "-DAURORA_DAWN_PROVIDER=vendor", "-DAURORA_DAWN_LINKAGE=static",
@@ -264,6 +318,7 @@ def pack(elf):
     shutil.copy2(HERE / "app/manifest.json", dest / "manifest.json")
     for name in ("code.bin", "data.bin", "report.json"):
         shutil.copy2(HERE / "app/build" / name, dest / "build" / name)
+    write_fs_host_record(dest, FS_HOST)
     print(f"Package: {dest}")
 
 
@@ -322,21 +377,87 @@ def fsroot(root, disc, rr, nand, rr_save):
                           '[paths]\ndvd_root = "/disc/DATA"\nretro_rewind_root = "/RetroRewind/RetroRewind6"\n')
     env = root / "hbxl-env"
     if not env.exists():
-        env.write_text("# HBXL_TRACE=1 logs every syscall the runtime does not implement\n")
+        env.write_text("# HBXL_TRACE=1 logs every syscall the runtime does not implement\n"
+                       "# AURORA_PIPELINE_THREADS=N pipeline workers (default 1; 0 = on the frame thread)\n"
+                       "# AURORA_PIPELINE_STACK=default puts their stacks in the Vulkan pool (default: SDK heap)\n"
+                       "# AURORA_DAWN_ENABLE=a,b / AURORA_DAWN_DISABLE=a,b add Dawn device toggles\n")
     print(f"File-server root: {root}")
+
+
+def current_address():
+    """This machine's address on its default route, or None where that can't be found."""
+    if platform.system() != "Darwin":
+        return None
+    route = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
+    interface = re.search(r"interface:\s*(\S+)", route)
+    if not interface:
+        return None
+    return subprocess.run(["ipconfig", "getifaddr", interface[1]], capture_output=True, text=True).stdout.strip() or None
+
+
+def fs_host_bytes(address):
+    return socket.inet_aton(address) + bytes(4)
+
+
+def fs_host_slot(data, address):
+    """The 8-byte slot in data.bin that holds the file server's address."""
+    needle = fs_host_bytes(address)
+    slots = [m.start() for m in re.finditer(re.escape(needle), data) if m.start() % 8 == 0]
+    if len(slots) != 1:
+        raise SystemExit(f"Found {address} {len(slots)} times in data.bin, not once; pack again with HBX_FS_HOST")
+    return slots[0]
+
+
+def write_fs_host_record(package, address):
+    data = (package / "build/data.bin").read_bytes()
+    record = {"offset": fs_host_slot(data, address)}
+    (package / "build/fs-host.json").write_text(json.dumps(record) + "\n")
+
+
+def retarget(package, address):
+    """Point a packed app at this file-server address. The address is one word in data.bin, so a
+    new DHCP lease needs no rebuild. Returns the address the app used before."""
+    data_file = package / "build/data.bin"
+    report_file = package / "build/report.json"
+    record_file = package / "build/fs-host.json"
+    data = bytearray(data_file.read_bytes())
+    if record_file.exists():
+        offset = json.loads(record_file.read_text())["offset"]
+    else:
+        offset = fs_host_slot(data, FS_HOST)
+    if data[offset + 4:offset + 8] != bytes(4):
+        raise SystemExit(f"{data_file} has no address at offset {offset}; pack and install again")
+    before = socket.inet_ntoa(bytes(data[offset:offset + 4]))
+    record_file.write_text(json.dumps({"offset": offset}) + "\n")
+    if before == address:
+        return before
+    data[offset:offset + 8] = fs_host_bytes(address)
+    report = json.loads(report_file.read_text())
+    report["dataSha256"] = hashlib.sha256(data).hexdigest()
+    data_file.write_bytes(data)
+    report_file.write_text(json.dumps(report, indent=2) + "\n")
+    return before
 
 
 def serve(root):
     if not (root / "portable.txt").exists():
         raise SystemExit(f"{root} is not a file-server root; run build.py fsroot first")
     hbl = required("HBL_ROOT", "tools/hbxl-fileserver.py")
-    run(["python3", hbl / "tools/hbxl-fileserver.py", root.resolve(), "--port", str(FS_PORT)])
+    # Routers hand out new addresses, so the installed app follows whatever this machine has now.
+    address = current_address() or FS_HOST
+    for package in (hbl / "apps" / APP_ID, HERE / "dist" / APP_ID):
+        if (package / "build/data.bin").exists():
+            before = retarget(package, address)
+            if before != address:
+                print(f"{package}: file server address {before} -> {address}")
+    print(f"file server address: {address}")
+    run(["python3", hbl / "tools/hbxl-fileserver.py", root.resolve(), "--host", address, "--port", str(FS_PORT)])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action", choices=["toolchain", "deps", "runtime", "translate", "build", "pack", "install",
-                                           "fsroot", "serve"])
+                                           "fsroot", "serve", "address"])
     parser.add_argument("--online", action="store_true", help="translate: include the Retro-WFC payload")
     parser.add_argument("--variant", choices=["console", "desktop"], default="console")
     parser.add_argument("--jobs", type=int, default=min(6, os.cpu_count() or 1))
@@ -367,6 +488,11 @@ def main():
         fsroot(args.root, args.disc, args.rr, args.nand, args.rr_save)
     elif args.action == "serve":
         serve(args.root)
+    elif args.action == "address":
+        address = current_address()
+        if not address:
+            raise SystemExit("No network address found. Is the Mac's network cable connected?")
+        print(address)
 
 
 if __name__ == "__main__":
