@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include "abi_bridge.h"
 #include "memory.h"
 #include "runtime_config.h"
 #include "aurora_events.h"
@@ -36,14 +37,104 @@ uint32_t LookupProductRegion(uint32_t table, uint32_t stride, uint32_t count,
 
 } // namespace
 
+// Defined in runtime/src/hle/storage/nand_async.cpp.
+bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess);
+
 // SCCheckStatus is polled in OSInit's busy loop (while(SCCheckStatus()==1) waits on async SYSCONF
-// load via NAND IPC); we have no async IPC callbacks, so return 0 (SUCCESS) immediately.
+// load via NAND IPC). SCInit started that load with SCReloadConfFileAsync: a chain of NAND/IOS
+// open -> read -> close -> FinishFromReload. Our async NAND/IOS HLE does the host work at once but
+// only queues each guest completion callback, which the alarm pump drains later, after OSInit has
+// moved on.
+//
+// The original SCCheckStatus is also what parses the loaded buffer: the reload sets the SC status
+// byte to 1 (busy) and FinishFromReload to 3 (loaded); SCCheckStatus then sees 3 and runs
+// ParseConfBuf. Returning 0 without either step left SCGetSimpleAddressData with no items
+// ("[SYS] Can't get SimpleAddressData.", cached for the whole boot), so the country and globe
+// position used online stayed at their defaults.
+
+namespace {
+
+// SC library state used by the original SCCheckStatus, as PAL addresses (SDA base 0x8038CC00).
+constexpr uint32_t kScConfSize = 0x4000;
+constexpr uint32_t kScControlBufferOffset = 364;
+constexpr uint32_t kScControlSizeOffset = 380;
+constexpr uint8_t kScStatusLoaded = 3;
+
+uint32_t ScStatusAddress() { return MKW_GADDR(803869C8); }       // u8: 0 ready, 1 busy, 3 loaded
+uint32_t ScDirtyAddress() { return MKW_GADDR(803869DD); }        // u8, cleared once parsed
+uint32_t ScHeaderMagicAddress() { return MKW_GADDR(80385C20); }  // "SCv0"
+uint32_t ScFooterMagicAddress() { return MKW_GADDR(80385C28); }  // "SCed"
+uint32_t ScControlAddress() { return MKW_GADDR(80348260); }
+uint32_t ScParsedCopyAddress() { return MKW_GADDR(80348400); }   // the buffer SCFind* reads
+uint32_t ParseConfBufAddress() { return MKW_GADDR(801B07D4); }
+
+} // namespace
 
 // 0x801B0220 -> SCCheckStatus()
 // Returns: 0 = success, 1 = busy, 2 = error
 extern "C" uint32_t SCCheckStatus_HLE()
 {
-    // Return 0 (success) immediately to avoid infinite busy-wait in OSInit
+    // 1. Finish the queued SYSCONF open/read/close chain here, as the hardware busy-wait would:
+    // each callback queues the next step and the drain keeps taking from the queue until it is
+    // empty, so one call runs the whole chain through FinishFromReload. The drain runs each
+    // callback on a scratch copy of the current context, so they use the caller's real stack.
+    CpuContext* current = TryGetCpuContext();
+    NandProcessPendingCallbacks(current, 64);
+
+    // 2. Then do what the original does with a loaded buffer.
+    const CpuContext& base = current ? *current : GetPersistentCpuContext();
+    try {
+        const uint32_t statusAddress = ScStatusAddress();
+        const uint8_t status = Memory::Read8(statusAddress);
+        if (status != kScStatusLoaded) {
+            static bool loggedNotLoaded = false;
+            if (!loggedNotLoaded) {
+                loggedNotLoaded = true;
+                RT_LOGF(RT_TAG_RUNTIME, "SCCheckStatus: SYSCONF not loaded (status %u), using defaults\n",
+                        status);
+            }
+            // Never report busy: OSInit would spin forever with nothing left to finish the load.
+            return 0;
+        }
+        Memory::Write8(statusAddress, 1);
+        const uint32_t buffer = Memory::Read32(ScControlAddress() + kScControlBufferOffset);
+        const uint32_t size = Memory::Read32(ScControlAddress() + kScControlSizeOffset);
+
+        // ParseConfBuf is guest code; run it on a scratch copy of the context like the callbacks.
+        CpuContext parseCpu = base;
+        parseCpu.gpr[3] = buffer;
+        parseCpu.gpr[4] = size;
+        {
+            CpuContextScope scope(&parseCpu);
+            InvokeIndirectCpu(ParseConfBufAddress(), &parseCpu);
+        }
+        const int32_t parseResult = static_cast<int32_t>(parseCpu.gpr[3]);
+
+        const uint32_t parsedCopy = ScParsedCopyAddress();
+        if (Memory::Contains(buffer, kScConfSize) && Memory::Contains(parsedCopy, kScConfSize)) {
+            uint8_t* loaded = Memory::GetPointer(buffer, kScConfSize);
+            if (parseResult == 0) {
+                // Parsed: publish it to the buffer the SCFind* getters read.
+                if (buffer != parsedCopy) {
+                    std::memmove(Memory::GetPointer(parsedCopy, kScConfSize), loaded, kScConfSize);
+                }
+            } else {
+                // Unparsable: reset to an empty SYSCONF ("SCv0" ... "SCed", no items).
+                std::memset(loaded, 0, kScConfSize);
+                std::memcpy(loaded, Memory::GetPointer(ScHeaderMagicAddress(), 4), 4);
+                std::memcpy(loaded + kScConfSize - 4, Memory::GetPointer(ScFooterMagicAddress(), 4), 4);
+                Memory::Write16(buffer + 6, 8);
+            }
+        }
+        Memory::Write8(ScDirtyAddress(), 0);
+        Memory::Write8(statusAddress, 0);
+        RT_LOGF(RT_TAG_RUNTIME, "SCCheckStatus: SYSCONF %s (%u bytes)\n",
+                parseResult == 0 ? "parsed" : "unparsable, using an empty one", size);
+    } catch (const Memory::AccessViolation&) {
+        RT_LOGF(RT_TAG_RUNTIME, "SCCheckStatus: SC state not readable, using defaults\n");
+    }
+
+    // Still success: a missing or unreadable SYSCONF boots with the defaults, as before.
     return 0;
 }
 
