@@ -67,7 +67,15 @@ void CloseFd(int32_t fd) {
     auto it = g_fileHandles.find(fd);
     if (it != g_fileHandles.end()) {
         if (it->second.file) {
+            std::fflush(it->second.file);
             std::fclose(it->second.file);
+        }
+        // An in-place write handle closed this way still finished its writes; drop its journal.
+        if (it->second.undo) {
+            std::fclose(it->second.undo);
+        }
+        if (!it->second.undoPath.empty()) {
+            NandRemove(it->second.undoPath);
         }
         g_fileHandles.erase(it);
     }

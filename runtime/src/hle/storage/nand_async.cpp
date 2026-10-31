@@ -323,6 +323,139 @@ bool IsHostPathOpen(const std::filesystem::path& hostPath) {
     return false;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Undo journal for plain NANDOpen writes. Layout: "NANDUNDO", u64 original size, then records of
+// {u64 offset, u32 length, original bytes}. Each record is on disk before the write it protects,
+// so recovery (replaying records newest-first, then truncating to the original size) always
+// rebuilds the file as it was before the open. A torn final record is ignored: its write never
+// started.
+// ---------------------------------------------------------------------------------------------
+
+static const char kNandUndoMagic[8] = {'N', 'A', 'N', 'D', 'U', 'N', 'D', 'O'};
+
+std::filesystem::path NandUndoPathFor(const std::filesystem::path& hostPath) {
+    std::filesystem::path undoPath = hostPath;
+    undoPath += kNandUndoSuffix;
+    return undoPath;
+}
+
+void NandUndoRecover(const std::filesystem::path& hostPath) {
+    const std::filesystem::path undoPath = NandUndoPathFor(hostPath);
+    if (!PathExists(undoPath)) {
+        return;
+    }
+    struct Record {
+        uint64_t offset;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<Record> records;
+    uint64_t originalSize = 0;
+    bool headerOk = false;
+    if (FILE* journal = NandFopen(undoPath, "rb")) {
+        char magic[8]{};
+        headerOk = std::fread(magic, 1, sizeof(magic), journal) == sizeof(magic) &&
+                   std::memcmp(magic, kNandUndoMagic, sizeof(magic)) == 0 &&
+                   std::fread(&originalSize, sizeof(originalSize), 1, journal) == 1;
+        while (headerOk) {
+            uint64_t offset = 0;
+            uint32_t length = 0;
+            if (std::fread(&offset, sizeof(offset), 1, journal) != 1 ||
+                std::fread(&length, sizeof(length), 1, journal) != 1) {
+                break;
+            }
+            Record record{offset, std::vector<uint8_t>(length)};
+            if (length != 0 && std::fread(record.bytes.data(), 1, length, journal) != length) {
+                break;  // torn final record
+            }
+            records.push_back(std::move(record));
+        }
+        std::fclose(journal);
+    }
+    if (headerOk && PathExists(hostPath)) {
+        LogNandWarning("nand-undo", "WARNING: restoring '%s' from an interrupted save (%zu record(s))",
+                       HostPathText(hostPath).c_str(), records.size());
+        if (FILE* file = NandFopen(hostPath, "r+b")) {
+            for (auto it = records.rbegin(); it != records.rend(); ++it) {
+                std::fseek(file, static_cast<long>(it->offset), SEEK_SET);
+                std::fwrite(it->bytes.data(), 1, it->bytes.size(), file);
+            }
+            FlushFileToDisk(file);
+            std::fclose(file);
+            std::error_code ec;
+            std::filesystem::resize_file(hostPath, originalSize, ec);
+        }
+    }
+    // No header means no write had started yet: the journal is simply stale.
+    NandRemove(undoPath);
+}
+
+void NandUndoRecoverTree(const std::filesystem::path& hostDirectory) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(hostDirectory, ec)) {
+        return;
+    }
+    const std::string suffix = kNandUndoSuffix;
+    std::vector<std::filesystem::path> targets;
+    for (auto it = std::filesystem::recursive_directory_iterator(hostDirectory, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        const std::string name = HostPathText(it->path().filename());
+        if (name.size() > suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            targets.push_back(it->path().parent_path() / name.substr(0, name.size() - suffix.size()));
+        }
+    }
+    for (const auto& target : targets) {
+        NandUndoRecover(target);
+    }
+}
+
+void NandUndoBeforeWrite(FileHandle& handle, uint64_t offset, uint64_t length) {
+    if (handle.undoPath.empty() || length == 0 || offset >= handle.undoOriginalSize) {
+        return;  // not journaled, or only appends past the original end (undone by truncation)
+    }
+    const uint64_t end = std::min(offset + length, handle.undoOriginalSize);
+    for (const auto& saved : handle.undoSaved) {
+        if (saved.first <= offset && end <= saved.second) {
+            return;  // these original bytes are already in the journal
+        }
+    }
+    if (!handle.undo) {
+        handle.undo = NandFopen(handle.undoPath, "wb");
+        if (!handle.undo) {
+            LogNandError("nand-undo", "could not create '%s'; this save is unprotected",
+                         HostPathText(handle.undoPath).c_str());
+            handle.undoPath.clear();
+            return;
+        }
+        std::fwrite(kNandUndoMagic, 1, sizeof(kNandUndoMagic), handle.undo);
+        std::fwrite(&handle.undoOriginalSize, sizeof(handle.undoOriginalSize), 1, handle.undo);
+    }
+    std::vector<uint8_t> original(static_cast<size_t>(end - offset));
+    const long position = std::ftell(handle.file);
+    std::fseek(handle.file, static_cast<long>(offset), SEEK_SET);
+    const size_t got = std::fread(original.data(), 1, original.size(), handle.file);
+    std::fseek(handle.file, position, SEEK_SET);
+    original.resize(got);
+    const uint32_t recordLength = static_cast<uint32_t>(original.size());
+    std::fwrite(&offset, sizeof(offset), 1, handle.undo);
+    std::fwrite(&recordLength, sizeof(recordLength), 1, handle.undo);
+    std::fwrite(original.data(), 1, original.size(), handle.undo);
+    // The original bytes must be durable before the write that overwrites them.
+    FlushFileToDisk(handle.undo);
+    handle.undoSaved.emplace_back(offset, offset + recordLength);
+}
+
+// After the data file is flushed (or abandoned), retire its journal. A clean flush means the new
+// contents are durable, so the journal goes; otherwise it stays for recovery on the next boot.
+static void NandUndoFinish(FILE* undo, const std::filesystem::path& undoPath, bool dataDurable) {
+    if (undo) {
+        std::fclose(undo);
+    }
+    if (dataDurable && !undoPath.empty()) {
+        NandRemove(undoPath);
+    }
+}
+
 // Retire a handle: flush writable handles all the way to disk and, when the handle is a
 // shadow, atomically publish it over its commit target. On any failure the shadow is
 // dropped and the original is left exactly as it was, and the error is returned so the
@@ -332,6 +465,8 @@ int32_t CommitAndCloseFd(const char* who, int32_t fd, bool missingFdIsError) {
     std::filesystem::path commitPath;
     FILE* file = nullptr;
     int32_t mode = 0;
+    FILE* undo = nullptr;
+    std::filesystem::path undoPath;
 
     {
         std::lock_guard<std::mutex> lock(g_fdMutex);
@@ -347,6 +482,8 @@ int32_t CommitAndCloseFd(const char* who, int32_t fd, bool missingFdIsError) {
         commitPath = it->second.safeCommitPath;
         file = it->second.file;
         mode = it->second.mode;
+        undo = it->second.undo;
+        undoPath = it->second.undoPath;
         g_fileHandles.erase(it);
     }
 
@@ -359,6 +496,7 @@ int32_t CommitAndCloseFd(const char* who, int32_t fd, bool missingFdIsError) {
     if (file) {
         std::fclose(file);
     }
+    NandUndoFinish(undo, undoPath, flushed);
 
     if (!needsCommit) {
         if (!flushed) {

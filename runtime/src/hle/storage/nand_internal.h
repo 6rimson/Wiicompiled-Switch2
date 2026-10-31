@@ -30,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <vector>
+#include <utility>
 #include <filesystem>
 #include <string>
 
@@ -77,6 +78,13 @@ struct FileHandle {
     // sibling scratch file the guest is writing into, and this is the original file it
     // atomically replaces on NANDSafeClose.
     std::filesystem::path safeCommitPath;
+    // Non-empty only for plain NANDOpen write handles on an existing file, which write in place:
+    // the bytes each write overwrites are first appended to this undo journal, which is deleted
+    // once the file is closed and flushed (see NandUndo* in nand_async.cpp).
+    std::filesystem::path undoPath;
+    FILE* undo = nullptr;
+    uint64_t undoOriginalSize = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> undoSaved;  // [begin, end) ranges already journaled
 };
 
 extern std::map<int32_t, FileHandle> g_fileHandles;
@@ -194,6 +202,18 @@ std::filesystem::path SafeTempPathFor(const std::filesystem::path& hostPath);
 bool DiscardStaleSafeTemp(const std::filesystem::path& tempPath);
 bool IsHostPathOpen(const std::filesystem::path& hostPath);
 int32_t CommitAndCloseFd(const char* who, int32_t fd, bool missingFdIsError);
+
+// Undo journal for in-place save writes. It replaces a whole-file shadow copy per NANDOpen, which
+// rewrote all of rksys.dat (2.8 MB) for every save even though a save changes ~190 KB of it - a
+// visible freeze on slow storage and far worse over a network file server.
+inline constexpr char kNandUndoSuffix[] = ".nandundo";
+std::filesystem::path NandUndoPathFor(const std::filesystem::path& hostPath);
+// Puts back the original bytes if a previous run died between a write and its close.
+void NandUndoRecover(const std::filesystem::path& hostPath);
+// Recovers every journal under `hostDirectory` (called at NANDInit).
+void NandUndoRecoverTree(const std::filesystem::path& hostDirectory);
+// Records the bytes [offset, offset+length) of the original file before a write overwrites them.
+void NandUndoBeforeWrite(FileHandle& handle, uint64_t offset, uint64_t length);
 
 // Synchronous NAND library entry points (defined in nand_api.cpp); the async
 // wrappers in nand_async.cpp forward to them.

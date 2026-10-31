@@ -981,6 +981,11 @@ static int32_t HandleIsfsReadDir(uint32_t numIn, uint32_t numOut, uint32_t vecto
         if (name.empty() || name.size() > kMaxNandNameLength) {
             continue;
         }
+        if (name.size() > sizeof(kNandUndoSuffix) - 1 &&
+            name.compare(name.size() - (sizeof(kNandUndoSuffix) - 1), std::string::npos,
+                         kNandUndoSuffix) == 0) {
+            continue;  // undo journal of an in-place save (see NandUndo* in nand_async.cpp)
+        }
         names.push_back(std::move(name));
     }
     std::sort(names.begin(), names.end());

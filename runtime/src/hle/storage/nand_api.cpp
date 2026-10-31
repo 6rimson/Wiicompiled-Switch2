@@ -85,6 +85,8 @@ extern "C" int32_t NANDInit_HLE(void) {
 
     // NANDHomeDir is at 0x80346D20 (from ESP_GetDataDir output)
     WriteGuestNandPath(MKW_GADDR(80346D20), CurrentNandDataDir());
+    // Finish undoing any save a previous run was killed in the middle of.
+    NandUndoRecoverTree(TranslateNandPath(CurrentNandDataDir().c_str()));
 
     // Mark NAND as initialized (0x80386848 = 2)
     Memory::Write32(MKW_GADDR(80386848), 2);
@@ -132,46 +134,33 @@ extern "C" int32_t NANDOpen_HLE(uint32_t pathPtr, uint32_t fileInfoPtr, uint32_t
     if (const auto result = NandCheckSystemSaveRead("NANDOpen", hostPath, mode))
         return *result;
 
-    // Existing-file write opens go through a shadow copy seeded from the original, so a
-    // crash between NANDWrite and NANDClose cannot leave a torn file (the game patches
-    // sub-ranges, e.g. ghost saves at a non-zero offset). New files still create in place.
+    // A previous run that died mid-save left an undo journal: restore the original first.
+    NandUndoRecover(hostPath);
+
+    // Existing-file write opens write in place behind an undo journal, so a crash between
+    // NANDWrite and NANDClose cannot leave a torn file (the game patches sub-ranges, e.g. ghost
+    // saves at a non-zero offset). This replaced a whole-file shadow copy per open, which rewrote
+    // all of rksys.dat (2.8 MB) for a save that changes ~190 KB. New files still create in place.
     if ((mode == 2 || mode == 3) && PathExists(hostPath) && !IsDirectory(hostPath)) {
         if (IsHostPathOpen(hostPath)) {
-            // Another live handle already refers to this file. A shadow would hide the
-            // writes from that handle, so stay in place for this open.
+            // Another live handle already refers to this file; keep a single journal per file.
             LogNandWarning("NANDOpen", "WARNING: '%s' already has a live handle, writing in place",
                            HostPathText(hostPath).c_str());
-        } else {
-            const std::filesystem::path tempPath = SafeTempPathFor(hostPath);
-            if (DiscardStaleSafeTemp(tempPath)) {
-                std::error_code ec;
-                std::filesystem::copy_file(hostPath, tempPath,
-                                           std::filesystem::copy_options::overwrite_existing, ec);
-                if (ec) {
-                    LogNandWarning("NANDOpen", "WARNING: could not seed shadow '%s' (%s), writing in place",
-                                   HostPathText(tempPath).c_str(), ec.message().c_str());
-                    NandRemove(tempPath);
-                } else {
-                    FILE* shadow = NandFopen(tempPath, "r+b");
-                    if (!shadow) {
-                        LogNandWarning("NANDOpen", "WARNING: could not open shadow '%s', writing in place",
-                                       HostPathText(tempPath).c_str());
-                        NandRemove(tempPath);
-                    } else {
-                        const int32_t shadowFd = AllocateFd(tempPath, shadow, static_cast<int32_t>(mode));
-                        {
-                            std::lock_guard<std::mutex> lock(g_fdMutex);
-                            auto it = g_fileHandles.find(shadowFd);
-                            if (it != g_fileHandles.end()) {
-                                it->second.safeCommitPath = hostPath;
-                            }
-                        }
-                        Memory::Write32(fileInfoPtr, static_cast<uint32_t>(shadowFd));
-                        Memory::Write8(fileInfoPtr + 0x8a, NAND_OPEN_FLAG_OPEN);
-                        return NAND_RESULT_OK;
-                    }
+        } else if (FILE* file = NandFopen(hostPath, "r+b")) {
+            std::error_code ec;
+            const uint64_t originalSize = std::filesystem::file_size(hostPath, ec);
+            const int32_t fd = AllocateFd(hostPath, file, static_cast<int32_t>(mode));
+            if (!ec) {
+                std::lock_guard<std::mutex> lock(g_fdMutex);
+                auto it = g_fileHandles.find(fd);
+                if (it != g_fileHandles.end()) {
+                    it->second.undoPath = NandUndoPathFor(hostPath);
+                    it->second.undoOriginalSize = originalSize;
                 }
             }
+            Memory::Write32(fileInfoPtr, static_cast<uint32_t>(fd));
+            Memory::Write8(fileInfoPtr + 0x8a, NAND_OPEN_FLAG_OPEN);
+            return NAND_RESULT_OK;
         }
     }
 
@@ -277,6 +266,13 @@ extern "C" int32_t NANDWrite_HLE(uint32_t fileInfoPtr, uint32_t bufferPtr, uint3
         return NAND_RESULT_INVALID;
     }
 
+    if (!handle->undoPath.empty()) {
+        // In-place write: journal the bytes it overwrites. NANDClose flushes and fsyncs, so the
+        // per-write flush is only kept for unjournaled handles.
+        NandUndoBeforeWrite(*handle, static_cast<uint64_t>(std::ftell(handle->file)), length);
+        const size_t bytesWritten = std::fwrite(buffer, 1, length, handle->file);
+        return static_cast<int32_t>(bytesWritten);
+    }
     size_t bytesWritten = std::fwrite(buffer, 1, length, handle->file);
     std::fflush(handle->file);
     return static_cast<int32_t>(bytesWritten);
