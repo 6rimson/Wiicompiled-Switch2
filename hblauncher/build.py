@@ -350,10 +350,11 @@ def fsroot(root, disc, rr, nand, rr_save):
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "portable.txt").touch()
-    # The same runtime resources the desktop builds copy next to the executable.
+    # The runtime resources the desktop builds copy next to the executable, except the starter
+    # pipeline cache: on the console, building its 1,101 pipelines at once at start-up ran out of
+    # memory, so pipelines are built as the game first draws with them.
     assets = REPO / "runtime/assets"
     for source, name in ((assets / "dsp/dsp_coef.bin", "dsp_coef.bin"),
-                         (assets / "pipeline/initial_pipeline_cache.db", "initial_pipeline_cache.db"),
                          (assets / "certs/cacert.pem", "cacert.pem")):
         shutil.copy2(source, root / name)
     clone_tree(assets / "wii", root / "wii_bootstrap")
