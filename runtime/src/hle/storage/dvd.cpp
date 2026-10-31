@@ -418,8 +418,21 @@ static std::string NormalizePath(const std::string& path) {
     return DvdFstContract::NormalizeLookupPath(path);
 }
 
+// While the disc/overlay index is being built, every registration is also recorded so the finished
+// list can be saved and replayed on the next launch (see DvdIndexCache) instead of walking every
+// file again.
+struct RecordedRegistration {
+    std::string dvdPath;
+    std::string hostPath;  // UTF-8
+    uint32_t size = 0;
+};
+static std::vector<RecordedRegistration>* g_recordedRegistrations = nullptr;
+
 static void RegisterFileEntry(std::string dvdPath, const fs::path& hostPath, uint32_t size) {
     dvdPath = DvdFstContract::CanonicalizePath(dvdPath);
+    if (g_recordedRegistrations) {
+        g_recordedRegistrations->push_back({dvdPath, RuntimeConfigFile::PathToUtf8(hostPath), size});
+    }
 
     DVDFileEntry fileEntry;
     fileEntry.hostPath = hostPath;
@@ -787,6 +800,153 @@ static void CompleteDvdCancelState()
     Memory::Write32(MKW_GADDR(803866F0), 0); // executing command block
 }
 
+// Saved disc/overlay index. Building it walks the extracted disc plus the Retro Rewind pack - about
+// 7,500 entries, each a directory read and a stat - which is a few hundred ms on a local SSD but
+// seconds on an SD card and far longer over a network file server, on every launch. The
+// fingerprint below is cheap (one stat per root and per Riivolution mapping) and covers what a
+// normal update changes: the extracted disc, the overlay roots and their version.txt, every
+// Riivolution mapping, and the modification time and size of each mapped host path. Deleting
+// Cache/dvd_index_*.bin forces a rescan.
+namespace DvdIndexCache {
+
+constexpr uint32_t kMagic = 0x58444944;  // "DIDX"
+constexpr uint32_t kVersion = 1;
+
+static void AppendStat(std::string& key, const fs::path& path) {
+    std::error_code ec;
+    const fs::file_status status = fs::status(path, ec);
+    if (ec || !fs::exists(status)) {
+        key += "|-";
+        return;
+    }
+    const auto modified = fs::last_write_time(path, ec);
+    key += "|" + std::to_string(ec ? 0 : static_cast<long long>(modified.time_since_epoch().count()));
+    if (fs::is_regular_file(status)) {
+        key += ":" + std::to_string(static_cast<unsigned long long>(fs::file_size(path, ec)));
+    }
+    key += fs::is_directory(status) ? ":d" : ":f";
+}
+
+static std::string BuildKey(const fs::path& rootPath, const std::vector<RuntimeRiivolution::Overlay>& overlays) {
+    std::string key = "v" + std::to_string(kVersion) + (RuntimeProduct::IsRetroRewind() ? "|rr" : "|base");
+    key += "|game=" + std::to_string(CurrentDiscGameCode());
+    key += "|" + RuntimeConfigFile::PathToUtf8(rootPath);
+    AppendStat(key, rootPath / "files");
+    AppendStat(key, rootPath / "sys");
+    for (auto overlay = overlays.rbegin(); overlay != overlays.rend(); ++overlay) {
+        key += "|root=" + RuntimeConfigFile::PathToUtf8(overlay->root);
+        AppendStat(key, overlay->root);
+        AppendStat(key, overlay->root / "version.txt");
+        if (!overlay->patches) {
+            key += "|noxml";
+            continue;
+        }
+        for (const auto& mapping : overlay->patches->mappings) {
+            key += "|m" + std::to_string(static_cast<int>(mapping.kind)) + (mapping.recursive ? "r" : "-") +
+                   (mapping.create ? "c" : "-") + mapping.discPath + ">" +
+                   RuntimeConfigFile::PathToUtf8(mapping.hostPath);
+            AppendStat(key, mapping.hostPath);
+        }
+    }
+    return key;
+}
+
+static void WriteString(std::ostream& out, const std::string& value) {
+    const uint32_t length = static_cast<uint32_t>(value.size());
+    out.write(reinterpret_cast<const char*>(&length), sizeof(length));
+    out.write(value.data(), static_cast<std::streamsize>(value.size()));
+}
+
+static bool ReadString(std::istream& in, std::string& value) {
+    uint32_t length = 0;
+    if (!in.read(reinterpret_cast<char*>(&length), sizeof(length)) || length > (1u << 20)) {
+        return false;
+    }
+    value.resize(length);
+    return length == 0 || static_cast<bool>(in.read(value.data(), length));
+}
+
+template <typename T>
+static bool ReadValue(std::istream& in, T& value) {
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(&value), sizeof(value)));
+}
+
+// One file per product: the base game and Retro Rewind can share a data directory, and one
+// product's index must not evict the other's.
+static fs::path CachePath() {
+    return RuntimeConfigFile::ApplicationDataDirectory() / "Cache" /
+           (RuntimeProduct::IsRetroRewind() ? "dvd_index_rr.bin" : "dvd_index_base.bin");
+}
+
+// Replays a saved index. Returns false (registering nothing) when there is no usable cache.
+static bool Load(const std::string& key, size_t& vanillaEntryCount) {
+    std::ifstream in(CachePath(), std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    uint32_t magic = 0, version = 0;
+    uint64_t vanilla = 0, count = 0;
+    std::string savedKey;
+    bool ok = ReadValue(in, magic) && ReadValue(in, version) && magic == kMagic && version == kVersion &&
+              ReadString(in, savedKey) && savedKey == key && ReadValue(in, vanilla) && ReadValue(in, count) &&
+              vanilla <= count && count < (1u << 22);
+    std::vector<RecordedRegistration> entries;
+    if (ok) {
+        entries.resize(static_cast<size_t>(count));
+        for (auto& entry : entries) {
+            if (!ReadString(in, entry.dvdPath) || !ReadString(in, entry.hostPath) || !ReadValue(in, entry.size)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (!ok) {
+        return false;
+    }
+    for (auto& entry : entries) {
+        RegisterFileEntry(std::move(entry.dvdPath), RuntimeConfigFile::PathFromUtf8(entry.hostPath), entry.size);
+    }
+    vanillaEntryCount = static_cast<size_t>(vanilla);
+    return true;
+}
+
+static void Save(const std::string& key, size_t vanillaEntryCount, const std::vector<RecordedRegistration>& entries) {
+    const fs::path path = CachePath();
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    fs::path partial = path;
+    partial += ".part";
+    bool written = false;
+    {
+        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return;
+        }
+        const uint32_t magic = kMagic, version = kVersion;
+        const uint64_t vanilla = vanillaEntryCount, count = entries.size();
+        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        WriteString(out, key);
+        out.write(reinterpret_cast<const char*>(&vanilla), sizeof(vanilla));
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& entry : entries) {
+            WriteString(out, entry.dvdPath);
+            WriteString(out, entry.hostPath);
+            out.write(reinterpret_cast<const char*>(&entry.size), sizeof(entry.size));
+        }
+        out.flush();
+        written = static_cast<bool>(out);
+    }
+    if (written) {
+        fs::rename(partial, path, ec);
+    }
+    if (!written || ec) {
+        fs::remove(partial, ec);
+    }
+}
+
+}  // namespace DvdIndexCache
+
 // 0x8015EA1C -> DVDInit
 extern "C" void DVDInit_8015EA1C()
 {
@@ -823,15 +983,23 @@ extern "C" void DVDInit_8015EA1C()
     Memory::Write16(diskHeader + 0x04, 0x3031);     // '01' (Maker)
     Memory::Write8(diskHeader + 0x06, 0x01);        // Disk #1
     // 4. Scan Files
+    const long long indexStartMs = RuntimeStall::NowMs();
     const fs::path& rootPath = GetDvdRoot();
-    
-    // Map "<dvd_root>/files" -> "/"
-    ScanDirectory(rootPath / "files", "/");
-
-    // Map "<dvd_root>/sys" -> "/sys/" (e.g. main.dol, bi2.bin)
-    ScanDirectory(rootPath / "sys", "/sys/");
-
     const auto& overlays = RuntimeRiivolution::Overlays();
+    const std::string indexKey = DvdIndexCache::BuildKey(rootPath, overlays);
+    size_t cachedVanillaEntryCount = 0;
+    const bool indexFromCache = DvdIndexCache::Load(indexKey, cachedVanillaEntryCount);
+    std::vector<RecordedRegistration> recorded;
+    if (!indexFromCache) {
+        g_recordedRegistrations = &recorded;
+
+        // Map "<dvd_root>/files" -> "/"
+        ScanDirectory(rootPath / "files", "/");
+
+        // Map "<dvd_root>/sys" -> "/sys/" (e.g. main.dol, bi2.bin)
+        ScanDirectory(rootPath / "sys", "/sys/");
+    }
+
     if (overlays.empty() && RuntimeProduct::IsRetroRewind()) {
         RT_LOG(RT_TAG_DVD) << "WARNING: no Retro Rewind overlay root was found. "
                      "File replacements (menu archives, karts, drivers, courses) will not apply "
@@ -843,13 +1011,20 @@ extern "C" void DVDInit_8015EA1C()
     // RegisterFileEntry lets the last registration win, so apply the roots in
     // reverse discovery order: the explicitly configured root outranks the mod
     // manifest.
-    const size_t vanillaEntryCount = g_fileEntries.size();
-    for (auto overlay = overlays.rbegin(); overlay != overlays.rend(); ++overlay) {
-        ScanOverlayRoot(*overlay);
+    size_t vanillaEntryCount = g_fileEntries.size();
+    if (indexFromCache) {
+        vanillaEntryCount = cachedVanillaEntryCount;
+    } else {
+        for (auto overlay = overlays.rbegin(); overlay != overlays.rend(); ++overlay) {
+            ScanOverlayRoot(*overlay);
+        }
+        g_recordedRegistrations = nullptr;
+        DvdIndexCache::Save(indexKey, vanillaEntryCount, recorded);
     }
     RT_LOG(RT_TAG_DVD) << "disc index: " << vanillaEntryCount << " disc file(s), "
               << (g_fileEntries.size() - vanillaEntryCount) << " overlay registration(s) from "
-              << overlays.size() << " root(s)" << std::endl;
+              << overlays.size() << " root(s) in " << (RuntimeStall::NowMs() - indexStartMs) << " ms"
+              << (indexFromCache ? " (from the saved index)" : "") << std::endl;
 
     // Load FST mapping so real files keep their physical disc extents.
     LoadFstIndex();
