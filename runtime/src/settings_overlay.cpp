@@ -1,6 +1,7 @@
 #include "settings_overlay.h"
 #include "gx_worker.h"
 #include "audio_backend.h"
+#include "hle/rr_frame_gate.h"
 #include "aurora_events.h"
 #include "controller_button_names.h"
 #include "controller_mapping_wizard.h"
@@ -1886,7 +1887,7 @@ void ConsoleMenuInput(int rows) {
             if (pressed(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) change = -1;
             if (pressed(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) change = 1;
             const bool confirm = pressed(SDL_GAMEPAD_BUTTON_EAST);
-            const int firstButton = 5;
+            const int firstButton = 6;
             if (g_consoleMenuRow == 0 && change != 0) {
                 const int count = static_cast<int>(kConsoleScales.size());
                 SetResolutionScale(kConsoleScales[(ConsoleScaleIndex() + count + change) % count]);
@@ -1901,6 +1902,9 @@ void ConsoleMenuInput(int rows) {
             } else if (g_consoleMenuRow == 4 && (change != 0 || confirm)) {
                 GxWorker::SetRaceDeferring(!GxWorker::RaceDeferring());
                 RT_LOGF("perf", "race GX worker %s\n", GxWorker::RaceDeferring() ? "on" : "off");
+            } else if (g_consoleMenuRow == 5 && (change != 0 || confirm)) {
+                SetRetroRewindFrameSkip(!RetroRewindFrameSkip());
+                RT_LOGF("perf", "frame skip %s\n", RetroRewindFrameSkip() ? "on" : "off");
             } else if (g_consoleMenuRow >= firstButton && g_consoleMenuRow < rows - 2 && confirm) {
                 const auto& button = kControllerButtons[static_cast<size_t>(g_consoleMenuRow - firstButton)];
                 g_controllerPort = 0;
@@ -1940,7 +1944,7 @@ const char* ConsoleNativeButtonName(uint32_t native) {
 
 void DrawConsoleMenu() {
     const int buttons = static_cast<int>(kControllerButtons.size());
-    const int rows = 5 + buttons + 2;
+    const int rows = 6 + buttons + 2;
     const bool wasOpen = g_consoleMenuOpen;
     // MKW_CPU_BOOST=<mode> in hbxl-env sets the boost mode at launch.
     static const bool s_startupBoost = [] {
@@ -1988,6 +1992,7 @@ void DrawConsoleMenu() {
         row(2, "Volume: " + std::to_string(g_audioVolumePercent) + "%");
         row(3, std::string("CPU boost: ") + (g_consoleBoostMode != 0 ? "On" : "Off"));
         row(4, std::string("Race GX worker: ") + (GxWorker::RaceDeferring() ? "On" : "Off"));
+        row(5, std::string("Frame skip: ") + (RetroRewindFrameSkip() ? "On" : "Off"));
         ImGui::TextDisabled("  CPU speed: about %.0f MHz", static_cast<double>(g_consoleCpuMhz));
         ImGui::Separator();
         uint32_t count = 0;
@@ -1998,7 +2003,7 @@ void DrawConsoleMenu() {
             for (uint32_t m = 0; mappings != nullptr && m < count; ++m) {
                 if (mappings[m].padButton == button.padButton) native = mappings[m].nativeButton;
             }
-            row(5 + i, std::string(button.label) + ": " + ConsoleNativeButtonName(native));
+            row(6 + i, std::string(button.label) + ": " + ConsoleNativeButtonName(native));
         }
         ImGui::Separator();
         row(rows - 2, "Reset buttons to default");

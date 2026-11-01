@@ -1,3 +1,4 @@
+#include <chrono>
 #include "gx_internal.h"
 #include "gx_stream_common.h"
 #include "gx_cp_decode.h"
@@ -1297,6 +1298,18 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
 
 extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes) {
     if (nbytes == 0 || listAddr == 0) return;
+#if defined(HBX_SWITCH2)
+    // MKW_TEST_DL_SPIN_US=N burns N microseconds per display list, placing test load inside GX work.
+    static const long s_dlSpinUs = [] {
+        const char* value = std::getenv("MKW_TEST_DL_SPIN_US");
+        return value != nullptr ? std::atol(value) : 0L;
+    }();
+    if (s_dlSpinUs > 0 && !GxWorker::OnWorker()) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(s_dlSpinUs);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
+#endif
     // List bytes and the arrays it indexes are GPU-side reads, so they are read when the worker runs.
     if (GxWorker::ShouldDefer()) {
         EnsureAuroraFrameActive();

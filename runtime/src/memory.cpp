@@ -336,6 +336,12 @@ void RefreshFastPathTables() {
         if (hasExecutableSubPage && hasWritableSubPage) {
             MemoryInline::g_sparseWritablePageTables[page] = sparse.get();
             sparseStorage[page] = std::move(sparse);
+#if defined(HBX_SWITCH2)
+            // .data shares a page with the end of .text, so every global store here left the
+            // inline path. Translated code never rereads .text, so a store landing there changes
+            // nothing that catching it would have fixed.
+            MemoryInline::g_fullWritablePageBias[page] = bias;
+#endif
             if (lastExecutableSubPage + 1u < MemoryInline::kWritableSubPagesPerPage) {
                 MemoryInline::g_mixedPageDataStart[page] = (page << MemoryInline::kPageShift) +
                     ((lastExecutableSubPage + 1u) << MemoryInline::kWritableSubPageShift);

@@ -80,10 +80,21 @@ void SetWaitCallback(void (*callback)());
 // Blocks until every recorded command has executed.
 void Sync();
 
+// Totals since the last call, for the perf log.
+struct Stats {
+    uint64_t records = 0;
+    uint64_t ringBytes = 0;
+    uint64_t fifoWrites = 0;
+    uint64_t syncs = 0;
+    uint64_t replayUs = 0;
+};
+Stats TakeStats();
+
 // While off, GX entry points run on the game thread and the worker sits idle. Call between frames.
 // Replays read guest memory late, which breaks art that menus rewrite as they draw it.
 void SetDeferring(bool deferring);
 // The Minus menu's race switch: whether SetDeferring is used during races at all.
+inline bool Deferring() noexcept { return detail::g_deferring.load(std::memory_order_relaxed); }
 inline bool RaceDeferring() noexcept { return detail::g_raceDeferring.load(std::memory_order_relaxed); }
 inline void SetRaceDeferring(bool on) noexcept { detail::g_raceDeferring.store(on, std::memory_order_relaxed); }
 
@@ -94,10 +105,17 @@ void EndInline();
 
 class InlineScope {
 public:
-    InlineScope() { BeginInline(); }
-    ~InlineScope() { EndInline(); }
+    explicit InlineScope(bool skip = false) : m_skip(skip) {
+        if (!m_skip) BeginInline();
+    }
+    ~InlineScope() {
+        if (!m_skip) EndInline();
+    }
     InlineScope(const InlineScope&) = delete;
     InlineScope& operator=(const InlineScope&) = delete;
+
+private:
+    bool m_skip;
 };
 
 } // namespace GxWorker
@@ -122,3 +140,4 @@ public:
 
 // Runs the rest of the enclosing function on this thread once the worker has caught up.
 #define GX_SYNC_INLINE() GxWorker::InlineScope gxInlineScope_
+#define GX_SYNC_INLINE_UNLESS(skip) GxWorker::InlineScope gxInlineScope_{skip}

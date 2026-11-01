@@ -1,6 +1,7 @@
 #include "perf_stats.h"
 
 #include "guest_abi/guest_region.h"
+#include "gx_worker.h"
 #include "memory.h"
 #include "runtime_log.h"
 
@@ -31,6 +32,7 @@ extern std::atomic<uint64_t> aurora_hbx_gpu_done_count;
 extern std::atomic<uint64_t> aurora_hbx_drain_us;
 extern std::atomic<uint64_t> aurora_hbx_drain_count;
 extern "C" uint64_t hbxl_syscall_counts[512] __attribute__((weak));
+extern "C" int g_gxFrameCount;
 extern "C" volatile long hbxl_net_inflight_call __attribute__((weak));
 extern "C" volatile long hbxl_net_inflight_fd __attribute__((weak));
 extern "C" volatile int hbxl_net_resolving __attribute__((weak));
@@ -57,6 +59,7 @@ struct FrameWindow {
     std::array<double, kWindow> busyMs{};
     std::array<float, kWindow> frameMs{};
     std::array<float, kWindow> idleMs{};
+    std::array<uint8_t, kWindow> ticks{};
     std::array<std::array<float, static_cast<size_t>(WaitKind::Count)>, kWindow> waitMs{};
     size_t count = 0;
     Clock::time_point start{};
@@ -169,6 +172,19 @@ void OnFramePresented() noexcept {
         return;
     }
 #if defined(HBX_SWITCH2)
+    // MKW_TEST_FRAME_SPIN_US=N burns N microseconds of game-thread time per frame during races, so
+    // a fast test machine sits as close to the frame budget as the console does.
+    static const long s_spinUs = [] {
+        const char* value = std::getenv("MKW_TEST_FRAME_SPIN_US");
+        return value != nullptr ? std::atol(value) : 0L;
+    }();
+    if (s_spinUs > 0 && Memory::Contains(Memory::Read32(MKW_GADDR(809BD730)), 4)) {
+        const auto until = Clock::now() + std::chrono::microseconds(s_spinUs);
+        while (Clock::now() < until) {
+        }
+    }
+#endif
+#if defined(HBX_SWITCH2)
     if (g_lastFrameMs.exchange(NowMs(), std::memory_order_relaxed) == 0) {
         std::thread(FreezeWatchdog).detach();
     }
@@ -192,6 +208,16 @@ void OnFramePresented() noexcept {
     const auto busy = (now - g_window.last) - wait;
     g_window.frameMs[g_window.count] = std::chrono::duration<float, std::milli>(now - g_window.last).count();
     g_window.idleMs[g_window.count] = std::chrono::duration<float, std::milli>(idle).count();
+#if defined(HBX_SWITCH2)
+    {
+        static uint32_t s_lastTick = 0;
+        const uint32_t raceinfo = Memory::Read32(MKW_GADDR(809BD730));
+        const uint32_t tick = Memory::Contains(raceinfo + 0x20, 4) ? Memory::Read32(raceinfo + 0x20) : 0;
+        const uint32_t delta = tick - s_lastTick;
+        g_window.ticks[g_window.count] = static_cast<uint8_t>(delta < 9 ? delta : 9);
+        s_lastTick = tick;
+    }
+#endif
     for (size_t kind = 0; kind < waitKinds.size(); ++kind) {
         g_window.waitMs[g_window.count][kind] = std::chrono::duration<float, std::milli>(waitKinds[kind]).count();
     }
@@ -218,27 +244,36 @@ void OnFramePresented() noexcept {
                 endUs -= static_cast<long long>(g_window.frameMs[i] * 1000.0f);
             }
         }
-        if (s_traceAll || (windowMs > kWindow * 17.6 && s_frameReports < 60)) {
+        size_t ticksInWindow = 0;
+        for (const uint8_t ticks : g_window.ticks) ticksInWindow += ticks;
+        if (s_traceAll || (windowMs > kWindow * 17.6 && ticksInWindow > 0 && s_frameReports < 150)) {
             ++s_frameReports;
-            char line[kWindow * 24];
+            char line[kWindow * 28];
             size_t used = 0;
-            for (size_t i = 0; i < kWindow && used + 24 < sizeof(line); ++i) {
+            for (size_t i = 0; i < kWindow && used + 28 < sizeof(line); ++i) {
                 const auto& waits = g_window.waitMs[i];
                 used += static_cast<size_t>(std::snprintf(
-                    line + used, sizeof(line) - used, " %.0f/%.0f/%.0f/%.0f/%.0f/%.0f",
+                    line + used, sizeof(line) - used, " %.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%u",
                     static_cast<double>(g_window.frameMs[i]),
                     static_cast<double>(waits[static_cast<size_t>(WaitKind::Pacing)]),
                     static_cast<double>(waits[static_cast<size_t>(WaitKind::Audio)]),
                     static_cast<double>(waits[static_cast<size_t>(WaitKind::Gx)]),
                     static_cast<double>(waits[static_cast<size_t>(WaitKind::Other)]),
-                    static_cast<double>(g_window.idleMs[i])));
+                    static_cast<double>(g_window.idleMs[i]), static_cast<unsigned>(g_window.ticks[i])));
             }
-            RT_LOGF("perf", "frames ms total/pacing/audio/gx/other/idle, cpu %.0f MHz:%s\n",
+            RT_LOGF("perf", "frames ms total/pacing/audio/gx/other/idle/ticks, cpu %.0f MHz:%s\n",
                     static_cast<double>(g_cpuMhzNow.load(std::memory_order_relaxed)), line);
         }
     }
 #endif
 #if defined(HBX_SWITCH2)
+    if (GxWorker::Active()) {
+        const GxWorker::Stats gx = GxWorker::TakeStats();
+        RT_LOGF("perf", "gx worker %s /frame: %.0f records, %.0f KiB, %.0f value writes, %.1f syncs, %.1f ms replay\n",
+                GxWorker::RaceDeferring() ? "on" : "off", static_cast<double>(gx.records) / kWindow,
+                static_cast<double>(gx.ringBytes) / 1024.0 / kWindow, static_cast<double>(gx.fifoWrites) / kWindow,
+                static_cast<double>(gx.syncs) / kWindow, static_cast<double>(gx.replayUs) / 1000.0 / kWindow);
+    }
     {
         // Whether the game runs more logic than it draws: Raceinfo counts race ticks at +0x20.
         const uint32_t raceinfo = Memory::Read32(MKW_GADDR(809BD730));
@@ -246,8 +281,19 @@ void OnFramePresented() noexcept {
             static uint32_t s_lastTicks = 0;
             const uint32_t ticks = Memory::Read32(raceinfo + 0x20);
             const double seconds = std::chrono::duration<double>(now - g_window.start).count();
-            RT_LOGF("perf", "race ticks %u (+%d) in %.2f s, drawn %zu\n", ticks,
-                    static_cast<int>(ticks - s_lastTicks), seconds, kWindow);
+            static int s_lastCopies = 0;
+            RT_LOGF("perf", "race ticks %u (+%d) in %.2f s, drawn %zu, display copies +%d\n", ticks,
+                    static_cast<int>(ticks - s_lastTicks), seconds, kWindow, g_gxFrameCount - s_lastCopies);
+            s_lastCopies = g_gxFrameCount;
+            // Retro Rewind's main loop state: RKSystem +104..+108 and the display's frame interval.
+            const uint32_t system = MKW_GADDR(802A4080);
+            const uint32_t display = Memory::Read32(system + 76);
+            RT_LOGF("perf", "rr loop %u %u %u %u %u, display %08x interval %u, low %x %x %x %x %x\n",
+                    Memory::Read8(system + 104), Memory::Read8(system + 105), Memory::Read8(system + 106),
+                    Memory::Read8(system + 107), Memory::Read8(system + 108), display,
+                    Memory::Contains(display + 8, 1) ? Memory::Read8(display + 8) : 0u, Memory::Read32(0x80001628u),
+                    Memory::Read32(0x8000162Cu), Memory::Read32(0x80001630u), Memory::Read32(0x80001634u),
+                    Memory::Read32(0x80001638u));
             s_lastTicks = ticks;
         }
     }

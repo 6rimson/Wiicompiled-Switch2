@@ -71,6 +71,9 @@ std::atomic<bool> g_abandon{false};
 std::atomic<bool> g_exited{false};
 std::thread* g_thread = nullptr;
 std::vector<uint8_t> g_fifoBytes;
+size_t g_fifoSize = 0;
+Stats g_stats;  // game thread, except replayUs
+std::atomic<uint64_t> g_replayUs{0};
 
 constexpr size_t AlignUp(size_t value) { return (value + detail::kAlign - 1) & ~(detail::kAlign - 1); }
 
@@ -225,6 +228,7 @@ void WorkerMain() {
             }
             continue;
         }
+        const auto replayStart = std::chrono::steady_clock::now();
         while (tail != head) {
             if (g_abandon.load(std::memory_order_acquire)) {
                 return;
@@ -247,6 +251,10 @@ void WorkerMain() {
                 g_tailCv.notify_all();
             }
         }
+        g_replayUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - replayStart)
+                                 .count(),
+                             std::memory_order_relaxed);
     }
 }
 } // namespace
@@ -258,6 +266,8 @@ void* Reserve(size_t payloadSize, void (*run)(void*)) {
         RT_LOGF(RT_TAG_GX, "GX worker command of %zu bytes exceeds the ring\n", total);
         std::abort();
     }
+    ++g_stats.records;
+    g_stats.ringBytes += total;
     size_t offset = static_cast<size_t>(g_write % kCapacity);
     const size_t remaining = kCapacity - offset;
     if (total > remaining) {
@@ -287,37 +297,44 @@ void Commit() {
 
 void FlushFifo() {
     g_fifoPending = false;
-    if (g_fifoBytes.empty()) {
+    if (g_fifoSize == 0) {
         return;
     }
-    const uint32_t size = static_cast<uint32_t>(g_fifoBytes.size());
+    const uint32_t size = static_cast<uint32_t>(g_fifoSize);
     void* payload = Reserve(sizeof(size) + size, &ReplayFifo);
     std::memcpy(payload, &size, sizeof(size));
     std::memcpy(static_cast<uint8_t*>(payload) + sizeof(size), g_fifoBytes.data(), size);
-    g_fifoBytes.clear();
+    g_fifoSize = 0;
     Commit();
 }
 } // namespace detail
 
 void FifoWrite(uint32_t value, uint32_t sizeBytes) {
-    const size_t at = g_fifoBytes.size();
-    g_fifoBytes.resize(at + 1 + sizeof(value));
-    g_fifoBytes[at] = static_cast<uint8_t>(sizeBytes);
-    std::memcpy(g_fifoBytes.data() + at + 1, &value, sizeof(value));
+    // Called for every value of immediate-mode geometry, so this stays a plain store.
+    ++g_stats.fifoWrites;
+    const size_t at = g_fifoSize;
+    uint8_t* const out = g_fifoBytes.data() + at;
+    out[0] = static_cast<uint8_t>(sizeBytes);
+    std::memcpy(out + 1, &value, sizeof(value));
+    g_fifoSize = at + 1 + sizeof(value);
     detail::g_fifoPending = true;
-    if (g_fifoBytes.size() >= kFifoFlushBytes) {
+    if (g_fifoSize >= kFifoFlushBytes) {
         detail::FlushFifo();
     }
 }
 
 void FifoBurst(const uint8_t* data, uint32_t sizeBytes) {
-    const size_t at = g_fifoBytes.size();
-    g_fifoBytes.resize(at + 1 + sizeof(sizeBytes) + sizeBytes);
+    const size_t needed = g_fifoSize + 1 + sizeof(sizeBytes) + sizeBytes;
+    if (needed + 16 > g_fifoBytes.size()) {
+        g_fifoBytes.resize(needed + 16);
+    }
+    const size_t at = g_fifoSize;
     g_fifoBytes[at] = kFifoBurstTag;
     std::memcpy(g_fifoBytes.data() + at + 1, &sizeBytes, sizeof(sizeBytes));
     std::memcpy(g_fifoBytes.data() + at + 1 + sizeof(sizeBytes), data, sizeBytes);
+    g_fifoSize = needed;
     detail::g_fifoPending = true;
-    if (g_fifoBytes.size() >= kFifoFlushBytes) {
+    if (g_fifoSize >= kFifoFlushBytes) {
         detail::FlushFifo();
     }
 }
@@ -326,6 +343,7 @@ void Sync() {
     if (!Active() || detail::t_onWorker) {
         return;
     }
+    ++g_stats.syncs;
     // Guest callbacks serviced while waiting can record more work.
     do {
         if (detail::g_fifoPending) {
@@ -333,6 +351,13 @@ void Sync() {
         }
         WaitForTail(g_write, true);
     } while (detail::g_fifoPending || g_tail.load(std::memory_order_acquire) != g_write);
+}
+
+Stats TakeStats() {
+    Stats stats = g_stats;
+    g_stats = {};
+    stats.replayUs = g_replayUs.exchange(0, std::memory_order_relaxed);
+    return stats;
 }
 
 void SetDeferring(bool deferring) {
@@ -367,7 +392,8 @@ void Start() {
     if (g_ring == nullptr) {
         g_ring = static_cast<uint8_t*>(::operator new(kCapacity, std::align_val_t{64}));
     }
-    g_fifoBytes.reserve(kFifoFlushBytes + 4096);
+    g_fifoBytes.resize(kFifoFlushBytes + 4096);
+    g_fifoSize = 0;
     g_stop.store(false, std::memory_order_relaxed);
     g_abandon.store(false, std::memory_order_relaxed);
     g_exited.store(false, std::memory_order_relaxed);
@@ -378,6 +404,8 @@ void Start() {
 #endif
 #if defined(HBX_SWITCH2)
     detail::g_deferring.store(false, std::memory_order_relaxed);  // races turn it on
+    // MKW_RACE_WORKER=1 starts with the Minus menu's race switch on, for test runs.
+    detail::g_raceDeferring.store(std::getenv("MKW_RACE_WORKER") != nullptr, std::memory_order_relaxed);
 #endif
     g_thread = new std::thread(WorkerMain);
     detail::g_active.store(true, std::memory_order_release);

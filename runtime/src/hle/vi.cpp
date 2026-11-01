@@ -517,9 +517,10 @@ void PaceToRetraceBoundary(Clock::time_point deadline) {
 } // namespace
 
 #if defined(HBX_SWITCH2)
-namespace {
+void GX_HLE_SeedVertexApiCopy();
+
 // Race sections are the ones that build a race HUD page.
-bool InRaceSection() {
+bool VI_HLE_InRaceSection() {
     constexpr uint32_t kSectionPages = 8;
     constexpr uint32_t kFirstHudPage = 12;
     constexpr uint32_t kLastHudPage = 21;
@@ -535,7 +536,6 @@ bool InRaceSection() {
     }
     return false;
 }
-} // namespace
 #endif
 
 // Single owner of the Aurora frame presentation sequence: seals the active frame, optionally paces the
@@ -640,7 +640,11 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     PerfStats::OnFramePresented();
 #if defined(HBX_SWITCH2)
     if (GxWorker::Active()) {
-        GxWorker::SetDeferring(GxWorker::RaceDeferring() && InRaceSection());
+        const bool defer = GxWorker::RaceDeferring() && VI_HLE_InRaceSection();
+        if (defer && !GxWorker::Deferring()) {
+            GX_HLE_SeedVertexApiCopy();
+        }
+        GxWorker::SetDeferring(defer);
     }
 #endif
     g_auroraFrameActive.store(false, std::memory_order_release);

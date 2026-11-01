@@ -41,7 +41,41 @@ bool ApiVtxArray(uint32_t attr, uint32_t& base, uint32_t& stride) {
 // Vertex Descriptor
 // ============================================================================
 
+// While GX calls are deferred, the game thread answers GXGetVtxDesc and GXGetVtxAttrFmt from this
+// copy of what it has set, which is what the real SDK does. Syncing with the worker for each one
+// was most of the syncs in a race frame.
+namespace {
+GXAttrType s_apiVtxDesc[26]{};
+VtxAttrFmt s_apiVtxAttrFmt[8][26]{};
+
+void NoteApiVtxDesc(uint32_t a, uint32_t t) {
+    const uint32_t attr = CanonicalVtxAttr(a);
+    if (attr >= 26 || attr == GX_VA_NULL) return;
+    s_apiVtxDesc[attr] = static_cast<GXAttrType>(t);
+    if (a == GX_VA_NBT) s_apiVtxDesc[GX_VA_NBT] = GX_NONE;
+}
+
+void NoteApiVtxAttrFmt(uint32_t vf, uint32_t a, uint32_t c, uint32_t t, uint32_t fr) {
+    const uint32_t attr = CanonicalVtxAttr(a);
+    if (vf >= 8 || attr >= 26) return;
+    auto& fmt = s_apiVtxAttrFmt[vf][attr];
+    fmt.cnt = static_cast<GXCompCnt>(c);
+    fmt.type = static_cast<GXCompType>(t);
+    fmt.frac = static_cast<u8>(fr);
+    if (a == GX_VA_NBT) s_apiVtxAttrFmt[vf][GX_VA_NBT] = {};
+}
+} // namespace
+
+// Call with nothing recorded, just before deferring starts.
+void GX_HLE_SeedVertexApiCopy() {
+    std::memcpy(s_apiVtxDesc, g_hleGxState.vtxDesc, sizeof(s_apiVtxDesc));
+    std::memcpy(s_apiVtxAttrFmt, g_hleGxState.vtxAttrFmt, sizeof(s_apiVtxAttrFmt));
+}
+
 extern "C" void GX__ClearVtxDesc_8016dc34() {
+    if (GxWorker::ShouldDefer()) {
+        for (auto& type : s_apiVtxDesc) type = GX_NONE;
+    }
     GX_DEFER_CALL0(GX__ClearVtxDesc_8016dc34);
     bool changed = false;
     for(int i=0; i<26; ++i){
@@ -55,6 +89,7 @@ extern "C" void GX__ClearVtxDesc_8016dc34() {
 PPC_NATIVE_OVERRIDE_VOID(8016dc34, GX__ClearVtxDesc_8016dc34, (), ());
 
 extern "C" void GX__SetVtxDesc_8016d3a4(uint32_t a, uint32_t t) {
+    if (GxWorker::ShouldDefer()) NoteApiVtxDesc(a, t);
     GX_DEFER_CALL(GX__SetVtxDesc_8016d3a4, a, t);
     const uint32_t attr = CanonicalVtxAttr(a);
     if(attr>=26||attr==GX_VA_NULL) return;
@@ -78,6 +113,9 @@ extern "C" void GX__SetVtxDescv_8016d608(uint32_t la) {
         list.push_back({a, Memory::Read32(p+4)});
         p+=8;
     }
+    if (GxWorker::ShouldDefer()) {
+        for (const auto& [a, t] : list) NoteApiVtxDesc(a, t);
+    }
     GxWorker::Run([list = std::move(list)] {
         for (const auto& [a, t] : list) GX__SetVtxDesc_8016d3a4(a, t);
     });
@@ -86,11 +124,12 @@ PPC_NATIVE_OVERRIDE_VOID(8016d608, GX__SetVtxDescv_8016d608, (uint32_t la), (la)
 
 // Display lists can change the vertex layout, so answer from the state the worker has applied.
 extern "C" void GX__GetVtxDesc_8016d9f0(uint32_t a, uint32_t tp) {
-    GX_SYNC_INLINE();
+    const bool useApiCopy = GxWorker::ShouldDefer();
+    GX_SYNC_INLINE_UNLESS(useApiCopy);
     GXAttrType type = GX_NONE;
     const uint32_t attr = CanonicalVtxAttr(a);
     if (attr < GX_VA_MAX_ATTR && attr != GX_VA_NULL) {
-        type = g_hleGxState.vtxDesc[attr];
+        type = useApiCopy ? s_apiVtxDesc[attr] : g_hleGxState.vtxDesc[attr];
     }
     if (tp) {
         Memory::Write32(tp, static_cast<uint32_t>(type));
@@ -122,6 +161,7 @@ PPC_NATIVE_OVERRIDE_VOID(8016dba4, GX__GetVtxDescv_8016dba4, (uint32_t la), (la)
 // ============================================================================
 
 extern "C" void GX__SetVtxAttrFmt_8016dc68(uint32_t vf, uint32_t a, uint32_t c, uint32_t t, uint32_t fr) {
+    if (GxWorker::ShouldDefer()) NoteApiVtxAttrFmt(vf, a, c, t, fr);
     GX_DEFER_CALL(GX__SetVtxAttrFmt_8016dc68, vf, a, c, t, fr);
     const uint32_t attr = CanonicalVtxAttr(a);
     if(vf<8&&attr<26){
@@ -153,6 +193,9 @@ extern "C" void GX__SetVtxAttrFmtv_8016de08(uint32_t vf, uint32_t la) {
         list.push_back({a, Memory::Read32(p+4), Memory::Read32(p+8), Memory::Read8(p+12)});
         p+=16;
     }
+    if (GxWorker::ShouldDefer()) {
+        for (const auto& [a, c, t, fr] : list) NoteApiVtxAttrFmt(vf, a, c, t, fr);
+    }
     GxWorker::Run([vf, list = std::move(list)] {
         for (const auto& [a, c, t, fr] : list) GX__SetVtxAttrFmt_8016dc68(vf, a, c, t, fr);
     });
@@ -160,11 +203,12 @@ extern "C" void GX__SetVtxAttrFmtv_8016de08(uint32_t vf, uint32_t la) {
 PPC_NATIVE_OVERRIDE_VOID(8016de08, GX__SetVtxAttrFmtv_8016de08, (uint32_t vf, uint32_t la), (vf, la));
 
 extern "C" void GX__GetVtxAttrFmt_8016e04c(uint32_t vf, uint32_t a, uint32_t cp, uint32_t tp, uint32_t fp) {
-    GX_SYNC_INLINE();
+    const bool useApiCopy = GxWorker::ShouldDefer();
+    GX_SYNC_INLINE_UNLESS(useApiCopy);
     VtxAttrFmt fmt{};
     const uint32_t attr = CanonicalVtxAttr(a);
     if (vf < 8 && attr < GX_VA_MAX_ATTR && attr != GX_VA_NULL) {
-        fmt = g_hleGxState.vtxAttrFmt[vf][attr];
+        fmt = useApiCopy ? s_apiVtxAttrFmt[vf][attr] : g_hleGxState.vtxAttrFmt[vf][attr];
     }
     if (cp) {
         Memory::Write32(cp, static_cast<uint32_t>(fmt.cnt));
@@ -318,6 +362,18 @@ extern "C" void GX__Begin_8016f0f0(uint32_t t, uint32_t vf, uint32_t nv) {
         WriteDisplayListData((u16)nv, 2);
         return;
     }
+#if defined(HBX_SWITCH2)
+    // MKW_TEST_GX_SPIN_US=N burns N microseconds per GXBegin, so test time lands inside GX work.
+    static const long s_gxSpinUs = [] {
+        const char* value = std::getenv("MKW_TEST_GX_SPIN_US");
+        return value != nullptr ? std::atol(value) : 0L;
+    }();
+    if (s_gxSpinUs > 0) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(s_gxSpinUs);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
+#endif
     ServiceDeferredTimingDuringGxWork();
     GX_DEFER_CALL(GxBeginImpl, t, vf, nv);
     GxBeginImpl(t, vf, nv);
