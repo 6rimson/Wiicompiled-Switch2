@@ -10,6 +10,7 @@
 #include "fiber_manager.h"
 #include "runtime_log.h"
 #include "os_internal.h"
+#include "perf_stats.h"
 #include "guest_function_imports.h"
 
 namespace {
@@ -222,6 +223,7 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
         // Set current context to idle thread context
         OS__SetCurrentContext_801a1e70(kIdleThreadContextAddr);
         
+        PerfStats::IdleScope idleScope;
         while (true) {
             // Enable interrupts and idle until something becomes runnable.
             OS__EnableInterrupts_801a65c0();

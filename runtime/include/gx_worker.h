@@ -16,6 +16,8 @@ namespace detail {
 inline constexpr size_t kAlign = 16;
 
 extern std::atomic<bool> g_active;
+extern std::atomic<bool> g_deferring;
+extern std::atomic<bool> g_raceDeferring;
 extern constinit thread_local bool t_onWorker;
 extern constinit thread_local int t_inlineDepth;
 extern bool g_fifoPending;
@@ -35,7 +37,8 @@ inline bool Active() noexcept { return detail::g_active.load(std::memory_order_r
 inline bool OnWorker() noexcept { return detail::t_onWorker; }
 // True when a GX entry point on this thread must be recorded instead of executed.
 inline bool ShouldDefer() noexcept {
-    return Active() && !detail::t_onWorker && detail::t_inlineDepth == 0;
+    return Active() && detail::g_deferring.load(std::memory_order_relaxed) && !detail::t_onWorker &&
+           detail::t_inlineDepth == 0;
 }
 
 template <typename F>
@@ -76,6 +79,13 @@ void SetWaitCallback(void (*callback)());
 
 // Blocks until every recorded command has executed.
 void Sync();
+
+// While off, GX entry points run on the game thread and the worker sits idle. Call between frames.
+// Replays read guest memory late, which breaks art that menus rewrite as they draw it.
+void SetDeferring(bool deferring);
+// The Minus menu's race switch: whether SetDeferring is used during races at all.
+inline bool RaceDeferring() noexcept { return detail::g_raceDeferring.load(std::memory_order_relaxed); }
+inline void SetRaceDeferring(bool on) noexcept { detail::g_raceDeferring.store(on, std::memory_order_relaxed); }
 
 // GX entry points run inline on the game thread while inside (after a Sync), for work whose
 // results the guest needs immediately.

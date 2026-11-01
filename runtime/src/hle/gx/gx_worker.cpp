@@ -28,6 +28,8 @@ void GxWorkerReplayFifoBurst(const uint8_t* data, uint32_t sizeBytes);
 namespace GxWorker {
 namespace detail {
 std::atomic<bool> g_active{false};
+std::atomic<bool> g_deferring{true};
+std::atomic<bool> g_raceDeferring{false};
 constinit thread_local bool t_onWorker = false;
 constinit thread_local int t_inlineDepth = 0;
 bool g_fifoPending = false;
@@ -75,6 +77,8 @@ constexpr size_t AlignUp(size_t value) { return (value + detail::kAlign - 1) & ~
 inline void CpuRelax() {
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ volatile("yield");
 #endif
 }
 
@@ -112,14 +116,14 @@ void WaitForTail(uint64_t minTail, bool service) {
     }
     Publish();
     {
-        PerfStats::WaitScope wait;
+        PerfStats::WaitScope wait(PerfStats::WaitKind::Gx);
         for (int spin = 0; spin < 256 && g_tail.load(std::memory_order_acquire) < minTail; ++spin) {
             CpuRelax();
         }
     }
     while (g_tail.load(std::memory_order_acquire) < minTail) {
         {
-            PerfStats::WaitScope wait;
+            PerfStats::WaitScope wait(PerfStats::WaitKind::Gx);
             std::unique_lock lock{g_tailMutex};
             g_producerWaiting.store(true, std::memory_order_seq_cst);
             if (g_tail.load(std::memory_order_seq_cst) < minTail) {
@@ -331,6 +335,16 @@ void Sync() {
     } while (detail::g_fifoPending || g_tail.load(std::memory_order_acquire) != g_write);
 }
 
+void SetDeferring(bool deferring) {
+    if (detail::g_deferring.load(std::memory_order_relaxed) == deferring) {
+        return;
+    }
+    if (!deferring) {
+        Sync();
+    }
+    detail::g_deferring.store(deferring, std::memory_order_relaxed);
+}
+
 void SetWaitCallback(void (*callback)()) { g_waitCallback = callback; }
 
 void BeginInline() {
@@ -359,8 +373,11 @@ void Start() {
     g_exited.store(false, std::memory_order_relaxed);
 #if defined(HBX_SWITCH2)
     if (hbxl_pin_next_thread != nullptr) {
-        hbxl_pin_next_thread(1);
+        hbxl_pin_next_thread(5);  // core 1 is the game thread's
     }
+#endif
+#if defined(HBX_SWITCH2)
+    detail::g_deferring.store(false, std::memory_order_relaxed);  // races turn it on
 #endif
     g_thread = new std::thread(WorkerMain);
     detail::g_active.store(true, std::memory_order_release);

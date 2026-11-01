@@ -1,0 +1,16 @@
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -1387,6 +1387,13 @@
+   g_graphicsConfig.normalBuffer = false;
+   g_queue = {};
+   g_surface = {};
++#if defined(HBX_SWITCH2)
++  // The app returns to the launcher inside one process: leaked GPU memory stays allocated and
++  // the next launch runs out. Destroy frees it even while caches still hold references.
++  if (g_device) {
++    g_device.Destroy();
++  }
++#endif
+   g_device = {};
+   g_adapter = {};
+   g_instance = {};

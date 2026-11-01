@@ -26,6 +26,8 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1776,18 +1778,23 @@ void OeCallOnStack(void* arg) {
     }
 }
 
-void ConsoleApplyCpuSettings(bool setOverclock, bool setBoost, bool readConfiguration = true) {
+void* ConsoleSdkStackTop() {
     if (hbxl_sdk_proc == nullptr || hbxl_sdk_memalign == nullptr || hbxl_call_on_stack == nullptr) {
-        return;
+        return nullptr;
     }
     static void* stack = hbxl_sdk_memalign(4096, kOeStackBytes);
-    if (stack == nullptr) {
+    return stack != nullptr ? static_cast<char*>(stack) + kOeStackBytes : nullptr;
+}
+
+void ConsoleApplyCpuSettings(bool setOverclock, bool setBoost, bool readConfiguration = true) {
+    void* stackTop = ConsoleSdkStackTop();
+    if (stackTop == nullptr) {
         return;
     }
     OeCall call{g_consoleOverclock, g_consoleBoostMode, setOverclock, setBoost, readConfiguration};
     RT_LOGF("perf", "requesting cpu overclock %d boost mode %d\n", g_consoleOverclock ? 1 : 0, g_consoleBoostMode);
     std::fflush(stderr);
-    hbxl_call_on_stack(OeCallOnStack, &call, static_cast<char*>(stack) + kOeStackBytes);
+    hbxl_call_on_stack(OeCallOnStack, &call, stackTop);
     RT_LOGF("perf", "cpu overclock reported %d\n", call.reported ? 1 : 0);
     if (readConfiguration) {
         RT_LOGF("perf", "performance mode %d, configurations 0x%x 0x%x\n", call.performanceMode, call.configuration[0],
@@ -1797,6 +1804,38 @@ void ConsoleApplyCpuSettings(bool setOverclock, bool setBoost, bool readConfigur
 }
 
 int g_consoleMenuRow = 0;
+bool g_consoleExitArmed = false;
+// Plus reaches SmileBASIC too, which stops its program, and with it the launcher's link to the PC.
+bool g_consoleLinkLost = false;
+extern "C" void aurora_hbx_release_gpu();
+bool g_consoleReturnRequested = false;
+
+// Runs between frames. The launcher lives in this process, so graphics has to shut down for real:
+// what it keeps allocated would still be allocated for the next launch.
+[[noreturn]] void ConsoleReturnToLauncher() noexcept {
+    RT_LOGF("perf", "returning to the launcher\n");
+    std::fflush(stderr);
+    // A thread still alive at exit keeps all the app's memory mapped, so this one must finish.
+    std::atomic<bool> finished{false};
+    std::thread timeout([&finished] {
+        for (int waited = 0; waited < 100 && !finished.load(std::memory_order_acquire); ++waited) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (!finished.load(std::memory_order_acquire)) {
+            RT_LOGF("perf", "graphics shutdown timed out, exiting anyway\n");
+            std::_Exit(EXIT_SUCCESS);
+        }
+    });
+    ReleaseControllers();
+    GxWorker::Stop();
+    // Each launch left open would use up one of the console's few audio outputs.
+    AudioBackend::Instance().Shutdown();
+    aurora_hbx_release_gpu();
+    RT_LOGF("perf", "graphics shut down\n");
+    finished.store(true, std::memory_order_release);
+    timeout.join();
+    std::_Exit(EXIT_SUCCESS);
+}
 std::array<bool, SDL_GAMEPAD_BUTTON_COUNT> g_consoleButtons{};
 
 SDL_Gamepad* ConsolePad() {
@@ -1829,14 +1868,21 @@ void ConsoleMenuInput(int rows) {
         now[i] = SDL_GetGamepadButton(pad, static_cast<SDL_GamepadButton>(i));
     }
     const auto pressed = [&](SDL_GamepadButton button) { return now[button] && !g_consoleButtons[button]; };
+    if (pressed(SDL_GAMEPAD_BUTTON_START) && !g_consoleLinkLost) {
+        g_consoleLinkLost = true;
+        RT_LOGF("perf", "Plus pressed: the launcher link will stop\n");
+    }
     if (!g_rebind.active) {
-        if (pressed(SDL_GAMEPAD_BUTTON_BACK)) {
+        // L + R + right stick click: Minus is the game's pause, and Plus must stay unused.
+        if (now[SDL_GAMEPAD_BUTTON_LEFT_SHOULDER] && now[SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER] &&
+            pressed(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
             g_consoleMenuOpen = !g_consoleMenuOpen;
         } else if (g_consoleMenuOpen) {
             int change = 0;
             if (pressed(SDL_GAMEPAD_BUTTON_SOUTH)) g_consoleMenuOpen = false;
             if (pressed(SDL_GAMEPAD_BUTTON_DPAD_UP)) g_consoleMenuRow = (g_consoleMenuRow + rows - 1) % rows;
             if (pressed(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) g_consoleMenuRow = (g_consoleMenuRow + 1) % rows;
+            if (g_consoleMenuRow != rows - 1) g_consoleExitArmed = false;
             if (pressed(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) change = -1;
             if (pressed(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) change = 1;
             const bool confirm = pressed(SDL_GAMEPAD_BUTTON_EAST);
@@ -1850,18 +1896,23 @@ void ConsoleMenuInput(int rows) {
             } else if (g_consoleMenuRow == 2 && change != 0) {
                 ConsoleChangeVolume(change * 5);
             } else if (g_consoleMenuRow == 3 && (change != 0 || confirm)) {
-                g_consoleOverclock = !g_consoleOverclock;
-                ConsoleApplyCpuSettings(true, false);
-            } else if (g_consoleMenuRow == 4 && (change != 0 || confirm)) {
-                g_consoleBoostMode = (g_consoleBoostMode + (change < 0 ? 2 : 1)) % 3;
+                g_consoleBoostMode = g_consoleBoostMode == 0 ? 1 : 0;
                 ConsoleApplyCpuSettings(false, true);
-            } else if (g_consoleMenuRow >= firstButton && g_consoleMenuRow < rows - 1 && confirm) {
+            } else if (g_consoleMenuRow == 4 && (change != 0 || confirm)) {
+                GxWorker::SetRaceDeferring(!GxWorker::RaceDeferring());
+                RT_LOGF("perf", "race GX worker %s\n", GxWorker::RaceDeferring() ? "on" : "off");
+            } else if (g_consoleMenuRow >= firstButton && g_consoleMenuRow < rows - 2 && confirm) {
                 const auto& button = kControllerButtons[static_cast<size_t>(g_consoleMenuRow - firstButton)];
                 g_controllerPort = 0;
                 BeginRebind(RebindKind::Controller, button.padButton, button.label);
-            } else if (g_consoleMenuRow == rows - 1 && confirm) {
+            } else if (g_consoleMenuRow == rows - 2 && confirm) {
                 PADRestoreDefaultMapping(0);
                 PADSerializeMappings();
+            } else if (g_consoleMenuRow == rows - 1 && confirm) {
+                if (g_consoleExitArmed && !g_consoleLinkLost) {
+                    g_consoleReturnRequested = true;
+                }
+                g_consoleExitArmed = true;
             }
         }
     }
@@ -1889,7 +1940,7 @@ const char* ConsoleNativeButtonName(uint32_t native) {
 
 void DrawConsoleMenu() {
     const int buttons = static_cast<int>(kControllerButtons.size());
-    const int rows = 5 + buttons + 1;
+    const int rows = 5 + buttons + 2;
     const bool wasOpen = g_consoleMenuOpen;
     // MKW_CPU_BOOST=<mode> in hbxl-env sets the boost mode at launch.
     static const bool s_startupBoost = [] {
@@ -1905,6 +1956,12 @@ void DrawConsoleMenu() {
     if (g_consoleMeasureIn > 0 && --g_consoleMeasureIn == 0) {
         g_consoleCpuMhz = PerfStats::MeasureCpuMhz();
         RT_LOGF("perf", "cpu measures about %.0f MHz\n", static_cast<double>(g_consoleCpuMhz));
+    }
+    if (g_consoleLinkLost) {
+        const ImGuiViewport* banner = ImGui::GetMainViewport();
+        ImGui::GetForegroundDrawList()->AddText(ImVec2(banner->Pos.x + 12.0f, banner->Pos.y + 12.0f),
+                                                IM_COL32(255, 220, 80, 255),
+                                                "Plus stopped the launcher link. Pause is Minus. Quit with HOME.");
     }
     if (!g_consoleMenuOpen) {
         return;
@@ -1929,9 +1986,8 @@ void DrawConsoleMenu() {
         row(0, std::string("Resolution: ") + scale);
         row(1, std::string("Show FPS: ") + (g_showFps ? "On" : "Off"));
         row(2, "Volume: " + std::to_string(g_audioVolumePercent) + "%");
-        row(3, std::string("CPU overclock: ") + (g_consoleOverclock ? "On" : "Off"));
-        row(4, g_consoleBoostMode == 0 ? std::string("CPU boost: Off")
-                                       : "CPU boost: Mode " + std::to_string(g_consoleBoostMode));
+        row(3, std::string("CPU boost: ") + (g_consoleBoostMode != 0 ? "On" : "Off"));
+        row(4, std::string("Race GX worker: ") + (GxWorker::RaceDeferring() ? "On" : "Off"));
         ImGui::TextDisabled("  CPU speed: about %.0f MHz", static_cast<double>(g_consoleCpuMhz));
         ImGui::Separator();
         uint32_t count = 0;
@@ -1945,7 +2001,10 @@ void DrawConsoleMenu() {
             row(5 + i, std::string(button.label) + ": " + ConsoleNativeButtonName(native));
         }
         ImGui::Separator();
-        row(rows - 1, "Reset buttons to default");
+        row(rows - 2, "Reset buttons to default");
+        row(rows - 1, g_consoleLinkLost   ? "Launcher link lost: quit with HOME"
+                      : g_consoleExitArmed ? "Press A again to quit"
+                                           : "Return to launcher");
         ImGui::Separator();
         ImGui::TextDisabled("D-pad: move, change. A: rebind. B or Minus: close.");
         DrawRebindPrompt();
@@ -1989,5 +2048,15 @@ void NotifyStrapInputAccepted() noexcept {
     }
 }
 
-void AdvancePresentedFrame() noexcept { ++g_presentedFrame; }
+void AdvancePresentedFrame() noexcept {
+    ++g_presentedFrame;
+#if defined(HBX_SWITCH2)
+    // MKW_AUTOEXIT_FRAMES=N takes the Return to launcher path after N frames, for test runs.
+    static const char* const s_autoExit = std::getenv("MKW_AUTOEXIT_FRAMES");
+    if (g_consoleReturnRequested ||
+        (s_autoExit != nullptr && g_presentedFrame >= std::strtoull(s_autoExit, nullptr, 10))) {
+        ConsoleReturnToLauncher();
+    }
+#endif
+}
 } // namespace settings_overlay

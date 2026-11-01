@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -46,6 +48,9 @@ private:
     float m_masterVolume = 1.0f;
     bool m_muted = false;
     bool m_silenced = false;
+    // After a failed open: retry at this pace, because every failure is a logged network write.
+    std::chrono::steady_clock::time_point m_nextOpenAttempt{};
+    bool m_reportedOpenFailure = false;
     bool m_reportedDroppedBlock = false;
     std::vector<int16_t> m_convertBuffer;
 };

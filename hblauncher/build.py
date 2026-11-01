@@ -240,7 +240,7 @@ def apply_aurora_patch():
                   "aurora-hbx-dawn-toggles.diff", "aurora-hbx-diagnostics.diff",
                   "aurora-hbx-texture-debug.diff", "aurora-hbx-frame-timing.diff",
                   "aurora-hbx-lighting-safe.diff", "aurora-hbx-bind-diag.diff",
-                  "aurora-hbx-texture-selftest.diff", "aurora-hbx-frame-check.diff", "aurora-hbx-device-lock.diff", "aurora-hbx-upload-probe.diff", "aurora-hbx-heap-block.diff", "aurora-hbx-console-input.diff", "aurora-hbx-fifo-spin.diff", "aurora-hbx-drain-spin.diff"):
+                  "aurora-hbx-texture-selftest.diff", "aurora-hbx-frame-check.diff", "aurora-hbx-device-lock.diff", "aurora-hbx-upload-probe.diff", "aurora-hbx-heap-block.diff", "aurora-hbx-console-input.diff", "aurora-hbx-fifo-spin.diff", "aurora-hbx-drain-spin.diff", "aurora-hbx-device-destroy.diff", "aurora-hbx-release-gpu.diff"):
         apply_patch(aurora, PATCHES / patch)
 
 
@@ -337,6 +337,10 @@ def install():
     if destination.exists():
         raise SystemExit(f"Install destination already exists: {destination}")
     shutil.copytree(package, destination)
+    # The launcher's icon is made from the user's own game files, so it lives in the private root.
+    icon = HERE / "fsroot" / "icon.png"
+    if icon.exists():
+        shutil.copy2(icon, destination / "icon.png")
     print(f"Installed: {destination}")
 
 

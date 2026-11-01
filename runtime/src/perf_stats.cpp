@@ -49,10 +49,15 @@ constexpr size_t kWindow = 240;
 #endif
 
 thread_local Clock::duration t_wait{};
+thread_local std::array<Clock::duration, static_cast<size_t>(WaitKind::Count)> t_waitKind{};
+thread_local Clock::duration t_idle{};
 
 struct FrameWindow {
     Clock::time_point last{};
     std::array<double, kWindow> busyMs{};
+    std::array<float, kWindow> frameMs{};
+    std::array<float, kWindow> idleMs{};
+    std::array<std::array<float, static_cast<size_t>(WaitKind::Count)>, kWindow> waitMs{};
     size_t count = 0;
     Clock::time_point start{};
     Clock::duration waited{};
@@ -62,6 +67,7 @@ FrameWindow g_window;
 
 #if defined(HBX_SWITCH2)
 std::atomic<int64_t> g_lastFrameMs{0};
+std::atomic<float> g_cpuMhzNow{0.0f};
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
@@ -77,6 +83,18 @@ void FreezeWatchdog() {
     int reports = 0;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        {
+            // A short version of MeasureCpuMhz, to catch the clock changing during play.
+            constexpr uint64_t kOps = 400000;
+            const auto start = Clock::now();
+            uint64_t value = 1;
+            for (uint64_t i = 0; i < kOps; ++i) {
+                value = value * 3 + 1;
+                __asm__ volatile("" : "+r"(value));
+            }
+            const double ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count() / kOps;
+            g_cpuMhzNow.store(static_cast<float>(2000.0 / ns), std::memory_order_relaxed);
+        }
         int topCall[3] = {};
         uint64_t topDelta[3] = {};
         if (hbxl_syscall_counts != nullptr) {
@@ -134,7 +152,11 @@ bool Enabled() noexcept {
     return enabled;
 }
 
-void AddWait(Clock::duration wait) noexcept { t_wait += wait; }
+void AddWait(Clock::duration wait, WaitKind kind) noexcept {
+    t_wait += wait;
+    t_waitKind[static_cast<size_t>(kind)] += wait;
+}
+void AddIdle(Clock::duration idle) noexcept { t_idle += idle; }
 
 namespace {
 std::array<Clock::duration, static_cast<size_t>(Phase::Count)> g_phases{};
@@ -154,6 +176,10 @@ void OnFramePresented() noexcept {
     const auto now = Clock::now();
     const Clock::duration wait = t_wait;
     t_wait = {};
+    const Clock::duration idle = t_idle;
+    t_idle = {};
+    const auto waitKinds = t_waitKind;
+    t_waitKind = {};
     if (g_window.last == Clock::time_point{}) {
         g_window.last = now;
         return;
@@ -164,11 +190,68 @@ void OnFramePresented() noexcept {
     }
     g_window.waited += wait;
     const auto busy = (now - g_window.last) - wait;
+    g_window.frameMs[g_window.count] = std::chrono::duration<float, std::milli>(now - g_window.last).count();
+    g_window.idleMs[g_window.count] = std::chrono::duration<float, std::milli>(idle).count();
+    for (size_t kind = 0; kind < waitKinds.size(); ++kind) {
+        g_window.waitMs[g_window.count][kind] = std::chrono::duration<float, std::milli>(waitKinds[kind]).count();
+    }
     g_window.last = now;
     g_window.busyMs[g_window.count++] = std::chrono::duration<double, std::milli>(busy).count();
     if (g_window.count < kWindow) {
         return;
     }
+#if defined(HBX_SWITCH2)
+    {
+        // Each frame's total and idle ms, for windows that missed 60, so a run of slow frames shows
+        // as a pattern rather than an average.
+        static int s_frameReports = 0;
+        const auto windowMs = std::chrono::duration<double, std::milli>(now - g_window.start).count();
+        // MKW_FRAME_TRACE=1 reports every window, for test runs, plus each frame's busy time and
+        // end time in microseconds so a CPU sample can be matched to its frame.
+        static const bool s_traceAll = std::getenv("MKW_FRAME_TRACE") != nullptr;
+        if (s_traceAll) {
+            long long endUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  g_window.last.time_since_epoch())
+                                  .count();
+            for (size_t i = kWindow; i-- > 0;) {
+                RT_LOGF("perf", "frameend %lld %.0f\n", endUs, g_window.busyMs[i] * 1000.0);
+                endUs -= static_cast<long long>(g_window.frameMs[i] * 1000.0f);
+            }
+        }
+        if (s_traceAll || (windowMs > kWindow * 17.6 && s_frameReports < 60)) {
+            ++s_frameReports;
+            char line[kWindow * 24];
+            size_t used = 0;
+            for (size_t i = 0; i < kWindow && used + 24 < sizeof(line); ++i) {
+                const auto& waits = g_window.waitMs[i];
+                used += static_cast<size_t>(std::snprintf(
+                    line + used, sizeof(line) - used, " %.0f/%.0f/%.0f/%.0f/%.0f/%.0f",
+                    static_cast<double>(g_window.frameMs[i]),
+                    static_cast<double>(waits[static_cast<size_t>(WaitKind::Pacing)]),
+                    static_cast<double>(waits[static_cast<size_t>(WaitKind::Audio)]),
+                    static_cast<double>(waits[static_cast<size_t>(WaitKind::Gx)]),
+                    static_cast<double>(waits[static_cast<size_t>(WaitKind::Other)]),
+                    static_cast<double>(g_window.idleMs[i])));
+            }
+            RT_LOGF("perf", "frames ms total/pacing/audio/gx/other/idle, cpu %.0f MHz:%s\n",
+                    static_cast<double>(g_cpuMhzNow.load(std::memory_order_relaxed)), line);
+        }
+    }
+#endif
+#if defined(HBX_SWITCH2)
+    {
+        // Whether the game runs more logic than it draws: Raceinfo counts race ticks at +0x20.
+        const uint32_t raceinfo = Memory::Read32(MKW_GADDR(809BD730));
+        if (Memory::Contains(raceinfo + 0x20, 4)) {
+            static uint32_t s_lastTicks = 0;
+            const uint32_t ticks = Memory::Read32(raceinfo + 0x20);
+            const double seconds = std::chrono::duration<double>(now - g_window.start).count();
+            RT_LOGF("perf", "race ticks %u (+%d) in %.2f s, drawn %zu\n", ticks,
+                    static_cast<int>(ticks - s_lastTicks), seconds, kWindow);
+            s_lastTicks = ticks;
+        }
+    }
+#endif
     std::array<double, kWindow> sorted = g_window.busyMs;
     std::sort(sorted.begin(), sorted.end());
     double sum = 0;

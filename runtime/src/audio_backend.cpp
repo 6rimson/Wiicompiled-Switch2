@@ -47,6 +47,11 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
         return true;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (now < m_nextOpenAttempt) {
+        return false;
+    }
+
     if (m_stream) {
         SDL_DestroyAudioStream(m_stream);
         m_stream = nullptr;
@@ -64,7 +69,11 @@ bool AudioBackend::EnsureInitializedLocked(uint32_t sampleRate, uint32_t channel
 
     SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!stream) {
-        RT_LOG(RT_TAG_AUDIO) << "SDL_OpenAudioDeviceStream failed: " << SDL_GetError() << std::endl;
+        if (!m_reportedOpenFailure) {
+            m_reportedOpenFailure = true;
+            RT_LOG(RT_TAG_AUDIO) << "SDL_OpenAudioDeviceStream failed: " << SDL_GetError() << std::endl;
+        }
+        m_nextOpenAttempt = now + std::chrono::seconds(5);
         return false;
     }
 

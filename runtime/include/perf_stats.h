@@ -17,7 +17,11 @@ void LogCoreCalibration(const uint8_t* guestRam, size_t size);
 // Rough CPU clock from a two-cycle integer loop; takes about 40 ms.
 float MeasureCpuMhz();
 #endif
-void AddWait(std::chrono::steady_clock::duration wait) noexcept;
+enum class WaitKind { Pacing, Audio, Gx, Other, Count };
+void AddWait(std::chrono::steady_clock::duration wait, WaitKind kind) noexcept;
+// Time the guest scheduler has nothing to run, reported per frame so a slow frame can be told from
+// one that only waited.
+void AddIdle(std::chrono::steady_clock::duration idle) noexcept;
 void OnFramePresented() noexcept;
 
 // Time the game thread spends in one presentation step, reported separately from guest code.
@@ -41,18 +45,35 @@ private:
     std::chrono::steady_clock::time_point m_start;
 };
 
+class IdleScope {
+public:
+    IdleScope() noexcept : m_start(Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~IdleScope() {
+        if (m_start != std::chrono::steady_clock::time_point{}) {
+            AddIdle(std::chrono::steady_clock::now() - m_start);
+        }
+    }
+    IdleScope(const IdleScope&) = delete;
+    IdleScope& operator=(const IdleScope&) = delete;
+
+private:
+    std::chrono::steady_clock::time_point m_start;
+};
+
 class WaitScope {
 public:
-    WaitScope() noexcept : m_start(Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    explicit WaitScope(WaitKind kind = WaitKind::Other) noexcept
+        : m_kind(kind), m_start(Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
     ~WaitScope() {
         if (m_start != std::chrono::steady_clock::time_point{}) {
-            AddWait(std::chrono::steady_clock::now() - m_start);
+            AddWait(std::chrono::steady_clock::now() - m_start, m_kind);
         }
     }
     WaitScope(const WaitScope&) = delete;
     WaitScope& operator=(const WaitScope&) = delete;
 
 private:
+    WaitKind m_kind;
     std::chrono::steady_clock::time_point m_start;
 };
 

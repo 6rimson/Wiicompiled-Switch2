@@ -1,4 +1,5 @@
 #include "hle_stubs.h"
+#include "gx_worker.h"
 #include "memory.h"
 #include "abi_bridge.h"
 #include "guest_interrupt_context.h"
@@ -163,7 +164,7 @@ constexpr std::chrono::microseconds kFinalSpinWindow{500};
 
 void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false,
                          std::chrono::microseconds spinWindow = 750us) {
-    PerfStats::WaitScope wait;
+    PerfStats::WaitScope wait(PerfStats::WaitKind::Pacing);
     const auto now = Clock::now();
     if (now >= deadline) {
         return;
@@ -515,6 +516,28 @@ void PaceToRetraceBoundary(Clock::time_point deadline) {
 
 } // namespace
 
+#if defined(HBX_SWITCH2)
+namespace {
+// Race sections are the ones that build a race HUD page.
+bool InRaceSection() {
+    constexpr uint32_t kSectionPages = 8;
+    constexpr uint32_t kFirstHudPage = 12;
+    constexpr uint32_t kLastHudPage = 21;
+    const uint32_t manager = Memory::Read32(MKW_GADDR(809C1E38));
+    const uint32_t section = Memory::Contains(manager, 4) ? Memory::Read32(manager) : 0;
+    if (!Memory::Contains(section, kSectionPages + 256 * 4)) {
+        return false;
+    }
+    for (uint32_t id = kFirstHudPage; id <= kLastHudPage; ++id) {
+        if (Memory::Read32(section + kSectionPages + id * 4) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+#endif
+
 // Single owner of the Aurora frame presentation sequence: seals the active frame, optionally paces the
 // producer to the VI retrace boundary, and pre-warms the next frame. Paced from GXCopyDisp; unpaced for
 // the retrace-context black/boot present path in AdvanceRetrace.
@@ -615,6 +638,11 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     }
     settings_overlay::AdvancePresentedFrame();
     PerfStats::OnFramePresented();
+#if defined(HBX_SWITCH2)
+    if (GxWorker::Active()) {
+        GxWorker::SetDeferring(GxWorker::RaceDeferring() && InRaceSection());
+    }
+#endif
     g_auroraFrameActive.store(false, std::memory_order_release);
     g_auroraFrameHadWork.store(false, std::memory_order_release);
     if (presentedXfb) {

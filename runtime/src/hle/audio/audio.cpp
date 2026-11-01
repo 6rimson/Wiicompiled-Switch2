@@ -6,6 +6,7 @@
 #include "ax_dsp.h"
 #include "music_attenuation.h"
 #include "runtime_log.h"
+#include "perf_stats.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -524,6 +525,7 @@ int64_t ConsumeAudioPollDeltaMicros()
 void Audio_HLE_Poll(CpuContext* ctx)
 {
     MusicAttenuation::TickGuest();
+    PerfStats::WaitScope timed(PerfStats::WaitKind::Audio);
     Audio_HLE_Tick(ctx, static_cast<uint32_t>(ConsumeAudioPollDeltaMicros()));
 }
 
@@ -539,6 +541,7 @@ void Audio_HLE_PollDeferred()
 
     OS_HLE_BeginDeferredGuestCallbacks();
     try {
+        PerfStats::WaitScope timed(PerfStats::WaitKind::Audio);
         Audio_HLE_Tick(cpu, static_cast<uint32_t>(ConsumeAudioPollDeltaMicros()));
     } catch (...) {
         OS_HLE_EndDeferredGuestCallbacks();

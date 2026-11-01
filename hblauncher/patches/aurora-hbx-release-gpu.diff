@@ -1,0 +1,21 @@
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -823,6 +823,18 @@
+ }
+ 
+ void aurora_shutdown() { aurora::shutdown(); }
++
++#if defined(HBX_SWITCH2)
++// For returning to the launcher, which shares this process: frees everything on the GPU and leaves
++// the window, input and audio services alone, since the launcher still uses the console's.
++extern "C" void aurora_hbx_release_gpu() {
++  aurora::gx::fifo::shutdown();
++  aurora::gfx::render_worker::synchronize();
++  aurora::imgui::shutdown();
++  aurora::gfx::shutdown();
++  aurora::webgpu::shutdown();
++}
++#endif
+ 
+ const AuroraEvent* aurora_update() { return aurora::update(); }
+ 

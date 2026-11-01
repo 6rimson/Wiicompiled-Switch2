@@ -127,7 +127,7 @@ public:
 
     void JoinMix() {
         if (m_mixThread.joinable()) {
-            PerfStats::WaitScope wait;
+            PerfStats::WaitScope wait(PerfStats::WaitKind::Audio);
             std::unique_lock<std::mutex> lock(m_mixMutex);
             m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
         }

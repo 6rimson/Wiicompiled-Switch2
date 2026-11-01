@@ -346,10 +346,12 @@ static void ApplyAuroraVtxStateForDlBegin(GXVtxFmt fmt) {
 }
 
 
+// Raw bytes, only ever memcpy'd: this sits on the stack of every display list call, and member
+// default initializers made just declaring one a hot loop.
 struct HleGxVertexStateSnapshot {
     GXAttrType vtxDesc[26];
-    VtxAttrFmt vtxAttrFmt[8][26];
-    HleGxState::VtxArray vtxArray[26];
+    uint8_t vtxAttrFmt[8][sizeof(VtxAttrFmt) * 26];
+    uint8_t vtxArray[sizeof(HleGxState::VtxArray) * 26];
     GXVtxFmt currentVtxFmt;
     uint64_t vtxLayoutHash;
     bool vtxLayoutHashDirty;
