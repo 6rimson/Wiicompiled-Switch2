@@ -1,0 +1,13 @@
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -1322,8 +1322,10 @@
+ 
+   const size_t loadedCount = load_pipeline_cache();
+   rebuild_pipeline_cache();
+-  if (!g_pipelineCacheBroken && loadedCount > 0) {
++  // Pruning stops the game for about 1.4 s over the file server and the cache grows slowly, so it
++  // only runs on request.
++  if (!g_pipelineCacheBroken && loadedCount > 0 && std::getenv("AURORA_GPU_CACHE_PRUNE") != nullptr) {
+     g_gpuCachePrunePending = true;
+   }
+ 

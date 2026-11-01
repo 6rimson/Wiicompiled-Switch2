@@ -1992,7 +1992,7 @@ void DrawConsoleMenu() {
         row(2, "Volume: " + std::to_string(g_audioVolumePercent) + "%");
         row(3, std::string("CPU boost: ") + (g_consoleBoostMode != 0 ? "On" : "Off"));
         row(4, std::string("Race GX worker: ") + (GxWorker::RaceDeferring() ? "On" : "Off"));
-        row(5, std::string("Frame skip: ") + (RetroRewindFrameSkip() ? "On" : "Off"));
+        row(5, std::string("Frame skip (offline): ") + (RetroRewindFrameSkip() ? "On" : "Off"));
         ImGui::TextDisabled("  CPU speed: about %.0f MHz", static_cast<double>(g_consoleCpuMhz));
         ImGui::Separator();
         uint32_t count = 0;
