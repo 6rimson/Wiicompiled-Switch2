@@ -404,8 +404,10 @@ void Start() {
 #endif
 #if defined(HBX_SWITCH2)
     detail::g_deferring.store(false, std::memory_order_relaxed);  // races turn it on
-    // MKW_RACE_WORKER=1 starts with the Minus menu's race switch on, for test runs.
-    detail::g_raceDeferring.store(std::getenv("MKW_RACE_WORKER") != nullptr, std::memory_order_relaxed);
+    // The menu's race switch starts on; MKW_RACE_WORKER=0 starts with it off.
+    const char* raceWorker = std::getenv("MKW_RACE_WORKER");
+    detail::g_raceDeferring.store(raceWorker == nullptr || std::strcmp(raceWorker, "0") != 0,
+                                  std::memory_order_relaxed);
 #endif
     g_thread = new std::thread(WorkerMain);
     detail::g_active.store(true, std::memory_order_release);

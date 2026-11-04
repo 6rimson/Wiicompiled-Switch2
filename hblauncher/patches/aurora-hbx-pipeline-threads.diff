@@ -23,7 +23,7 @@
 +// HBLauncher (Switch 2): pipeline creation failed with VK_ERROR_UNKNOWN on worker threads whose
 +// stacks live in the runtime's Vulkan-backed memory, which system services cannot access. Workers
 +// get SDK-heap stacks, and their number and stack placement can be set from the environment:
-+//   AURORA_PIPELINE_THREADS  worker count, 0 = build on the frame thread (default 1)
++//   AURORA_PIPELINE_THREADS  worker count, 0 = build on the frame thread (default 2)
 +//   AURORA_PIPELINE_STACK    "sdk" (default) or "default" (the runtime's own thread stacks)
 +struct HbxPipelineThread {
 +  pthread_t thread;
@@ -40,7 +40,7 @@
 +static unsigned int start_hbx_pipeline_threads() {
 +  const char* countEnv = std::getenv("AURORA_PIPELINE_THREADS");
 +  const char* stackEnv = std::getenv("AURORA_PIPELINE_STACK");
-+  const unsigned int count = countEnv != nullptr ? std::clamp(std::atoi(countEnv), 0, 4) : 1;
++  const unsigned int count = countEnv != nullptr ? std::clamp(std::atoi(countEnv), 0, 4) : 2;
 +  const bool sdkStack = stackEnv == nullptr || std::strcmp(stackEnv, "default") != 0;
 +  unsigned int sdkStacks = 0;
 +  for (unsigned int i = 0; i < count; ++i) {

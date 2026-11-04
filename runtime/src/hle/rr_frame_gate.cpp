@@ -15,7 +15,8 @@ extern "C" void rr_kamek_81806904(CpuContext* ctx) __attribute__((weak));  // on
 bool VI_HLE_InRaceSection();
 
 namespace {
-std::atomic<bool> g_frameSkip{std::getenv("MKW_NO_FRAME_SKIP") == nullptr};
+// Off by default: races draw every game tick. MKW_FRAME_SKIP=1 starts with the menu's switch on.
+std::atomic<bool> g_frameSkip{std::getenv("MKW_FRAME_SKIP") != nullptr};
 constexpr uint32_t kCr0Mask = 0xF0000000u;
 constexpr uint32_t kCr0Greater = 0x40000000u;
 } // namespace

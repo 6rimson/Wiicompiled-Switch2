@@ -385,12 +385,17 @@ def fsroot(root, disc, rr, nand, rr_save):
     config = root / "UserData/Config.toml"
     if not config.exists():
         config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text('[video]\nwidescreen = true\nresolution_multiplier = 1.0\ngraphics_api = "auto"\n\n'
+        config.write_text('[video]\nwidescreen = true\nresolution_multiplier = 1.0\ngraphics_api = "auto"\n'
+                          'gx_worker = true\n\n'
                           '[paths]\ndvd_root = "/disc/DATA"\nretro_rewind_root = "/RetroRewind/RetroRewind6"\n')
     env = root / "hbxl-env"
     if not env.exists():
         env.write_text("# HBXL_TRACE=1 logs every syscall the runtime does not implement\n"
-                       "# AURORA_PIPELINE_THREADS=N pipeline workers (default 1; 0 = on the frame thread)\n"
+                       "# MKW_PERF_STATS=1 logs FPS and frame timing\n"
+                       "# MKW_CPU_BOOST=N boost mode at launch (default 1; 0 = off)\n"
+                       "# MKW_RACE_WORKER=0 starts with the race GX worker off\n"
+                       "# MKW_FRAME_SKIP=1 starts with offline frame skip on\n"
+                       "# AURORA_PIPELINE_THREADS=N pipeline workers (default 2; 0 = on the frame thread)\n"
                        "# AURORA_PIPELINE_STACK=default puts their stacks in the Vulkan pool (default: SDK heap)\n"
                        "# AURORA_DAWN_ENABLE=a,b / AURORA_DAWN_DISABLE=a,b add Dawn device toggles\n")
     print(f"File-server root: {root}")

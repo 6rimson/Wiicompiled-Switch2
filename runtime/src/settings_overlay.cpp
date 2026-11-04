@@ -1946,10 +1946,12 @@ void DrawConsoleMenu() {
     const int buttons = static_cast<int>(kControllerButtons.size());
     const int rows = 6 + buttons + 2;
     const bool wasOpen = g_consoleMenuOpen;
-    // MKW_CPU_BOOST=<mode> in hbxl-env sets the boost mode at launch.
+    // Boost mode 1 at launch, about 1534 MHz. MKW_CPU_BOOST=<mode> in hbxl-env changes it; 0 turns it off.
     static const bool s_startupBoost = [] {
-        if (const char* mode = std::getenv("MKW_CPU_BOOST"); mode != nullptr && std::atoi(mode) > 0) {
-            g_consoleBoostMode = std::atoi(mode);
+        const char* mode = std::getenv("MKW_CPU_BOOST");
+        const int boost = mode != nullptr ? std::atoi(mode) : 1;
+        if (boost > 0) {
+            g_consoleBoostMode = boost;
             ConsoleApplyCpuSettings(false, true, false);
             return true;
         }
