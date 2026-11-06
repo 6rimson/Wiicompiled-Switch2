@@ -1,7 +1,7 @@
 # WiiCompiled + Retro Rewind for Switch 2 (HBLauncher)
 
 An experimental port of [WiiCompiled](https://github.com/patchzyy/Wiicompiled) with Retro Rewind for
-the Nintendo Switch 2, run by ravensclawx's [HBLauncher](https://github.com/ravensclawx/HBLauncher).
+the Nintendo Switch 2, run by RavensClawX's [HBLauncher](https://github.com/ravensclawx/HBLauncher).
 The game is a static `aarch64-linux-musl` program that HBLauncher's Linux personality (ABI 3)
 loads into the SmileBASIC process that ns2jb opens.
 
@@ -425,7 +425,7 @@ figures above were measured at. `gx_worker = true` (the default) is needed for t
 ## Patches
 
 `patches/dawn-hbx-switch2.diff`, `patches/sdl3-hbx-switch2.diff` and
-`patches/aurora-hbx-switch2.diff` are ravensclawx's, from the Twilight Princess HBLauncher port,
+`patches/aurora-hbx-switch2.diff` are RavensClawX's, from the Twilight Princess HBLauncher port,
 unchanged. The rest are this port's. Several were added while chasing a problem and were never
 tested on their own, so "why" says what was seen at the time, not that the patch is proven needed.
 
@@ -477,16 +477,31 @@ on Dawn's Null backend, with `SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy`
 
 ## Credits
 
-- **WiiCompiled** by patchzyy and contributors: the recompilation this is built on.
-- **HBLauncher** and the **Twilight Princess** and **Animal Crossing** ports by ravensclawx: the
-  launcher, Linux runtime and the Dawn, SDL3 and aurora patches this port started from.
-- **ns2jb** by kurumuz, which opens the console session; this port adds range mapping to it.
-- **DriftDroid** by dorPXP: the Android and Switch 1 port of WiiCompiled. Its native THP video
-  decoder and lighting helper are used here, adapted, and its notes and fixes helped throughout.
-- **Retro Rewind** and **Retro WFC**, whose files and servers you use with your own copy.
-- **aurora**, **Dawn** and **SDL**.
+- **[WiiCompiled](https://github.com/patchzyy/Wiicompiled)** by patchzyy and contributors: the
+  recompilation this is built on.
+- **[HBLauncher](https://github.com/ravensclawx/HBLauncher)** and the
+  **[Twilight Princess](https://github.com/ravensclawx/TwilightPrincess-HBLauncher)** and
+  **[Animal Crossing](https://github.com/ravensclawx/AnimalCrossing-HBLauncher)** ports by
+  RavensClawX: the launcher, Linux runtime and the Dawn, SDL3 and aurora patches this port started
+  from.
+- **[ns2jb](https://gitlab.com/pepsipu/ns2jb)**, the Switch 2 exploit by Sammy Hajhamid (pepsipu),
+  used here through [kurumuz's fork](https://gitlab.com/kurumuz/ns2jb). It opens the console
+  session; this port adds the memory-loading commands HBLauncher needs to start apps.
+- **[DriftDroid](https://github.com/dorPXP/driftdroid)** by dorPXP: the Android and Switch 1 port of
+  WiiCompiled. Its native THP video decoder and lighting helper are used here, adapted, and its
+  notes and fixes helped throughout.
+- **[Retro Rewind](https://wiki.tockdom.com/wiki/Retro_Rewind)** by ZPL and team, and
+  **[Retro WFC](https://rwfc.net)**, the online service it plays on; you use their files and
+  servers with your own copy.
+- **[aurora](https://github.com/encounter/aurora)** by encounter: the GameCube and Wii graphics
+  layer that turns the game's drawing into modern GPU shaders.
+- **[Dawn](https://dawn.googlesource.com/dawn)** by Google: the WebGPU library aurora draws
+  through, which uses the console's Vulkan driver. It's built from
+  [encounter's fork](https://github.com/encounter/dawn), as aurora uses.
+- **[SDL](https://github.com/libsdl-org/SDL)**: audio and controller input, through HBLauncher
+  drivers from the Twilight Princess port.
 
 WiiCompiled is GPL-3.0 (see `../LICENSE`), and so is this port. The Twilight Princess patches are
 MIT (`patches/LICENSE.tp-integration`). See [THIRD_PARTY.md](THIRD_PARTY.md).
-"Nintendo Switch" and "Mario Kart" are trademarks of Nintendo; this project is not affiliated with
+"Nintendo Switch 2" and "Mario Kart Wii" are trademarks of Nintendo; this project is not affiliated with
 or endorsed by Nintendo.
