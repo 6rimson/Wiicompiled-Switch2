@@ -88,12 +88,33 @@ over the file server), and building the starter pipeline cache at start-up ran o
 Changing the resolution to 1.5× during a race broke the graphics; changing it in the menus didn't.
 The upload probe found no bad texture copies in either case.
 
+## Plain Mario Kart Wii (2026-11-05)
+
+`--product wiicompiled` from the fresh folders: translate, build, pack, install and fsroot succeed;
+the package (code 110,363,672 B) passes HBLauncher's `loadPackage` and mock lifecycle. On the
+console, with a brand-new NAND and no save, it boots, sets up a save and runs an offline race on
+Mario Circuit, then returns to HBLauncher cleanly.
+
+Mario Circuit, offline, compared with Retro Rewind on the same console:
+
+| | Average FPS in the race | Samples below 50 FPS | Game-thread time per frame |
+|---|---|---|---|
+| Retro Rewind | 56.6 | 4 of 133 | 15–19 ms |
+| Plain Mario Kart Wii | 50.0 | 94 of 232 | 16–18 ms (17.8 ms in the countdown) |
+
+The CPU boost (about 1533 MHz), the race GX worker and both pipeline workers were active, and no
+pipelines were being built during the race. The difference is pacing: plain Mario Kart Wii waits
+for the next screen refresh after each frame, so a frame slightly over 16.7 ms takes 33 ms; the
+countdown ran at exactly 30 FPS and half game speed. Retro Rewind's own loop, where the port
+draws every tick, shows a late frame late instead.
+
 ## Not tested
 
 - Every track. Busy scenes on some custom tracks dip below 60 FPS.
 - Pipeline thread counts other than 2.
 - A build without `patches/aurora-hbx-lighting-safe.diff` or `patches/dawn-hbx-no-dedicated.diff`.
 - Building on native aarch64 Linux.
+- NTSC discs, and plain Mario Kart Wii tracks other than Mario Circuit.
 - Online play from the fresh folders (it would create a new Retro WFC profile).
 - `setup-session.py` on Linux, or with Zig on anything but an Apple Silicon Mac.
 - `build --variant desktop` through `build.py`. The desktop result above came from the same

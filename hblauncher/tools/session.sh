@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs one part of a console session with this Mac's current address, so a new DHCP lease needs
-# no edits. Usage: session.sh server | runner | launcher [hbl-start options]
+# no edits. Usage: session.sh server [build.py serve options] | runner | launcher [hbl-start options]
 # Prepare the HBLauncher and ns2jb checkouts with tools/setup-session.py first.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +16,9 @@ shift || true
 case "$part" in
 server)
   cd "$HERE/.."
-  python3 hblauncher/build.py serve 2>&1 | tee "${HBX_SERVER_LOG:-$HERE/fsroot/fs-run.log}"
+  root="$HERE/fsroot"
+  [[ " $* " == *" wiicompiled "* || "$*" == *"--product=wiicompiled"* ]] && root="$HERE/fsroot-wiicompiled"
+  python3 hblauncher/build.py serve "$@" 2>&1 | tee "${HBX_SERVER_LOG:-$root/fs-run.log}"
   ;;
 runner)
   cd "$NS2JB"

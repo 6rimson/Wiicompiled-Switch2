@@ -26,8 +26,9 @@ running it obsolete; if that happens, I'll point to them here and archive this r
 WiiCompiled fixes and the Switch 2 notes in this repository should still be useful to whoever
 ports it next.
 
-Only the Retro Rewind version is packaged; plain Mario Kart Wii isn't, and only the PAL disc is
-supported.
+The main build is Retro Rewind. Plain Mario Kart Wii (WiiCompiled without Retro Rewind) also
+builds and runs, but it's **experimental**: it's slower in races, for the reason under known issues.
+Only the PAL disc is supported.
 
 ## What works
 
@@ -39,6 +40,7 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
   Factory measured 59.4 FPS at 97.7% game speed. It isn't a steady 60 (see known issues).
 - Online play on Retro WFC works, including online races.
 - Returning to HBLauncher, then launching the game again.
+- Plain Mario Kart Wii (experimental) boots from a new NAND and runs offline races, more slowly.
 
 ## Known issues
 
@@ -60,6 +62,13 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
   memory a crashed game didn't free is still taken. Launching again in the same session can fail
   at start-up or close SmileBASIC with a system error. Close SmileBASIC, open it again, and start
   a new runner and 4/4 session.
+- **Plain Mario Kart Wii is slower in races.** Busy stretches, such as Mario Circuit's countdown,
+  lock to 30 FPS and the game slows down. Both games need about the same work per frame there
+  (16–18 ms against a 16.7 ms budget). Retro Rewind runs its own frame loop, where this port draws
+  every tick, so a frame that is slightly late just shows late: Mario Circuit averaged 57 FPS.
+  Plain Mario Kart Wii waits for the next screen refresh after each frame, as on a Wii, so a frame
+  1 ms late waits a whole extra refresh (33 ms): it averaged 50 FPS, with long stretches at 30.
+  Fixing it means changing how the runtime paces screen refreshes for plain Mario Kart Wii.
 - **The first visit to a place stutters** while shaders build; they're cached after that. The
   first boot can wait a few minutes for this.
 - Every Retro Rewind update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
@@ -227,6 +236,26 @@ Keep the server and runner running while you play. While the runner is alive, `l
 the open session without a new 4/4. HBLauncher writes its own log to
 `$HBL_ROOT/build/hbl-session.log`.
 
+### Plain Mario Kart Wii (experimental)
+
+`--product wiicompiled` builds the game without Retro Rewind as a separate app, **Mario Kart Wii**,
+with its own file-server folder (`hblauncher/fsroot-wiicompiled/`). It's offline only (Retro WFC
+is part of Retro Rewind) and slower in races; see known issues. Steps 1–3 are the same, without the
+Retro Rewind folder or payload:
+
+```sh
+hblauncher/docker/run.sh translate --product wiicompiled
+hblauncher/docker/run.sh build --product wiicompiled
+hblauncher/docker/run.sh pack --product wiicompiled
+python3 hblauncher/build.py install --product wiicompiled
+python3 hblauncher/build.py fsroot --product wiicompiled --nand /path/to/NAND
+hblauncher/tools/session.sh server --product wiicompiled
+```
+
+`translate --product wiicompiled` replaces the Retro Rewind translation in the Docker volume, so
+building Retro Rewind afterwards needs `translate --online` again (or use another `HBX_VOLUME`).
+The file server serves one game at a time; start it with the game you'll pick in HBLauncher.
+
 ## Options
 
 The port's menu (**L + R + right stick click**) has the main switches. `hblauncher/fsroot/hbxl-env`
@@ -256,8 +285,9 @@ figures above were measured at. `gx_worker = true` (the default) is needed for t
   drivers (TP's SDL3 patch; HBLauncher sets `SDL_VIDEO_DRIVER`/`SDL_AUDIO_DRIVER`).
 - **Files:** every file is read and written over TCP through HBLauncher's file server. The app's
   own folder is the file-server root.
-- **Speed:** in offline races the game draws every tick (Retro Rewind's frame skip is off) and
-  the race GX worker replays graphics on its own core. The CPU boost is on at launch.
+- **Speed:** in Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
+  is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
+  boost is on at launch.
 
 ## Patches
 

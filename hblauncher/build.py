@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build, package, install or serve WiiCompiled + Retro Rewind as an HBLauncher app (Switch 2).
+--product wiicompiled does the same for plain Mario Kart Wii, as a separate app and fsroot.
 
 Build actions (deps, runtime, translate, build, pack) run on aarch64 Linux - the provided
 container (hblauncher/docker/run.sh) or a native machine. fsroot, install and serve run on the PC
@@ -36,14 +37,31 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
-MANIFEST = json.loads((HERE / "app/manifest.json").read_text())
 PINS = json.loads((HERE / "dependencies.json").read_text())
-APP_ID = MANIFEST["id"]
-FS_PORT = MANIFEST["linux"]["fs_port"]
+# Each product is its own CMake target, HBLauncher app and file-server root. main() picks one.
+PRODUCTS = {
+    "retro-rewind": {"target": "RetroRewind", "app": HERE / "app", "root": HERE / "fsroot"},
+    "wiicompiled": {"target": "WiiCompiled", "app": HERE / "app-wiicompiled", "root": HERE / "fsroot-wiicompiled"},
+}
+
+
+def select_product(name):
+    global PRODUCT_NAME, PRODUCT, APP_DIR, MANIFEST, APP_ID, FS_PORT
+    PRODUCT_NAME = name
+    PRODUCT = PRODUCTS[name]["target"]
+    APP_DIR = PRODUCTS[name]["app"]
+    MANIFEST = json.loads((APP_DIR / "manifest.json").read_text())
+    APP_ID = MANIFEST["id"]
+    FS_PORT = MANIFEST["linux"]["fs_port"]
+
+
+def retro_rewind():
+    return PRODUCT_NAME == "retro-rewind"
+
+
 DEPS = Path(os.environ.get("HBX_DEPS", HERE / "deps"))
 BUILD = Path(os.environ.get("HBX_BUILD", HERE / "build"))
 PATCHES = HERE / "patches"
-PRODUCT = "RetroRewind"
 FS_HOST = os.environ.get("HBX_FS_HOST", "10.42.0.1")
 TRANSLATOR = REPO / "translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll"
 RR_PACK = REPO / "PulsarPacks/completed/RetroRewind/RetroRewind6"
@@ -196,7 +214,12 @@ def translate(online):
     """docs/building-macos.md steps 2-3. The translator writes host-format assembly and absolute
     paths, so translate on the machine that builds."""
     require_linux_aarch64()
-    for path in (REPO / "Assets/main.dol", REPO / "Assets/StaticR.rel", RR_PACK / "Binaries/Code.pul"):
+    if online and not retro_rewind():
+        raise SystemExit("--online is for Retro Rewind (Retro WFC); plain WiiCompiled builds offline")
+    inputs = [REPO / "Assets/main.dol", REPO / "Assets/StaticR.rel"]
+    if retro_rewind():
+        inputs.append(RR_PACK / "Binaries/Code.pul")
+    for path in inputs:
         if not path.exists():
             raise SystemExit(f"Missing {path}; see hblauncher/README.md (inputs)")
     jobs = str(os.cpu_count() or 4)
@@ -209,6 +232,14 @@ def translate(online):
                "--no-function-files", "--prune-stale", "--threads", jobs)
     translator("emit-base-manifest", *project, "--out", "build/base", "--functions-dir", "generated/functions",
                "--translation-output-metadata", "generated/base_translation_output.json", "--region", "P")
+    (REPO / "generated/build_shards").mkdir(parents=True, exist_ok=True)
+    shards = ["emit-build-shards", *project, "--base-metadata", "generated/base_translation_output.json",
+              "--base-functions-dir", "generated/functions", "--native-source-dir", "runtime/src",
+              "--out", "generated/build_shards"]
+    if not retro_rewind():
+        translator("generate-data-init", *project)
+        translator(*shards)
+        return
     wfc = ["--skip-retro-wfc"]
     if online:
         if not WFC_PAYLOAD.exists():
@@ -223,11 +254,7 @@ def translate(online):
                "--region", "P", "--out", "build/mods/retro_rewind_full_cpp", "--prefer-cached-inputs",
                "--emit-cpp", "--threads", jobs, *wfc)
     translator("generate-data-init", *project)
-    (REPO / "generated/build_shards").mkdir(parents=True, exist_ok=True)
-    translator("emit-build-shards", *project, "--base-metadata", "generated/base_translation_output.json",
-               "--base-functions-dir", "generated/functions", "--native-source-dir", "runtime/src",
-               "--out", "generated/build_shards",
-               "--resolved-profile", "build/mods/retro_rewind_full_cpp/resolved_dispatch_profile.json",
+    translator(*shards, "--resolved-profile", "build/mods/retro_rewind_full_cpp/resolved_dispatch_profile.json",
                "--retro-cpp-dir", "build/mods/retro_rewind_full_cpp/cpp")
 
 
@@ -318,13 +345,13 @@ def pack(elf):
     elf = (elf or BUILD / "console" / PRODUCT).resolve()
     if not elf.is_file():
         raise SystemExit(f"Build the console variant first; missing {elf}")
-    run(["python3", sdk / "sdk/tools/hbxl-build.py", HERE / "app", "--pack", elf])
+    run(["python3", sdk / "sdk/tools/hbxl-build.py", APP_DIR, "--pack", elf])
     # Distribute only the manifest and the images, never build caches, discs or saves.
     dest = HERE / "dist" / APP_ID
     (dest / "build").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(HERE / "app/manifest.json", dest / "manifest.json")
+    shutil.copy2(APP_DIR / "manifest.json", dest / "manifest.json")
     for name in ("code.bin", "data.bin", "report.json"):
-        shutil.copy2(HERE / "app/build" / name, dest / "build" / name)
+        shutil.copy2(APP_DIR / "build" / name, dest / "build" / name)
     write_fs_host_record(dest, FS_HOST)
     print(f"Package: {dest}")
 
@@ -338,7 +365,7 @@ def install():
         raise SystemExit(f"Install destination already exists: {destination}")
     shutil.copytree(package, destination)
     # The launcher's icon is made from the user's own game files, so it lives in the private root.
-    icon = HERE / "fsroot" / "icon.png"
+    icon = PRODUCTS[PRODUCT_NAME]["root"] / "icon.png"
     if icon.exists():
         shutil.copy2(icon, destination / "icon.png")
     print(f"Installed: {destination}")
@@ -372,9 +399,12 @@ def fsroot(root, disc, rr, nand, rr_save):
     if not (disc / "sys/fst.bin").exists():
         raise SystemExit(f"{disc} is not an extracted disc (needs files/ and sys/fst.bin)")
     clone_tree(disc, root / "disc/DATA")
-    if not (rr / "Binaries/Code.pul").exists():
-        raise SystemExit(f"{rr} is not a RetroRewind6 folder")
-    clone_tree(rr, root / "RetroRewind/RetroRewind6")
+    if retro_rewind():
+        if not (rr / "Binaries/Code.pul").exists():
+            raise SystemExit(f"{rr} is not a RetroRewind6 folder")
+        clone_tree(rr, root / "RetroRewind/RetroRewind6")
+    elif rr_save:
+        raise SystemExit("--rr-save is a Retro Rewind save; plain WiiCompiled keeps its save in the NAND")
     if nand:
         clone_tree(nand, root / "UserData/NAND")
     if rr_save:
@@ -385,9 +415,11 @@ def fsroot(root, disc, rr, nand, rr_save):
     config = root / "UserData/Config.toml"
     if not config.exists():
         config.parent.mkdir(parents=True, exist_ok=True)
+        paths = '[paths]\ndvd_root = "/disc/DATA"\n'
+        if retro_rewind():
+            paths += 'retro_rewind_root = "/RetroRewind/RetroRewind6"\n'
         config.write_text('[video]\nwidescreen = true\nresolution_multiplier = 1.0\ngraphics_api = "auto"\n'
-                          'gx_worker = true\n\n'
-                          '[paths]\ndvd_root = "/disc/DATA"\nretro_rewind_root = "/RetroRewind/RetroRewind6"\n')
+                          'gx_worker = true\n\n' + paths)
     env = root / "hbxl-env"
     if not env.exists():
         env.write_text("# HBXL_TRACE=1 logs every syscall the runtime does not implement\n"
@@ -475,16 +507,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action", choices=["toolchain", "deps", "runtime", "translate", "build", "pack", "install",
                                            "fsroot", "serve", "address"])
+    parser.add_argument("--product", choices=sorted(PRODUCTS), default="retro-rewind",
+                        help="which game to build, pack, install, lay out or serve")
     parser.add_argument("--online", action="store_true", help="translate: include the Retro-WFC payload")
     parser.add_argument("--variant", choices=["console", "desktop"], default="console")
     parser.add_argument("--jobs", type=int, default=min(6, os.cpu_count() or 1))
     parser.add_argument("--elf", type=Path, help="pack: an already linked console ELF")
-    parser.add_argument("--root", type=Path, default=HERE / "fsroot", help="fsroot/serve: the file-server root")
+    parser.add_argument("--root", type=Path, help="fsroot/serve: the file-server root (default: the product's)")
     parser.add_argument("--disc", type=Path, default=REPO / "Assets/DATA", help="fsroot: extracted RMCP01 disc")
     parser.add_argument("--rr", type=Path, default=RR_PACK, help="fsroot: your RetroRewind6 folder")
     parser.add_argument("--nand", type=Path, help="fsroot: a NAND folder to start from (copied)")
     parser.add_argument("--rr-save", type=Path, help="fsroot: a Retro Rewind rksys.dat to start from (copied)")
     args, extra = parser.parse_known_args()
+    select_product(args.product)
+    args.root = args.root or PRODUCTS[args.product]["root"]
     if extra and args.action != "build":
         parser.error("Extra CMake arguments require build")
     if args.action == "toolchain":

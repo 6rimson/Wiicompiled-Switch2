@@ -85,4 +85,6 @@ output.txt
 /hblauncher/build/
 /hblauncher/dist/
 /hblauncher/fsroot/
+/hblauncher/fsroot-wiicompiled/
 /hblauncher/app/build/
+/hblauncher/app-wiicompiled/build/
