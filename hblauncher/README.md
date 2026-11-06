@@ -104,16 +104,19 @@ below from this folder.
 - **Zig 0.15.2, exactly (required).** ns2jb runs a small helper program on the console; this port's
   ns2jb patch changes that helper, so it has to be rebuilt, and Zig is the compiler ns2jb uses for
   it. The setup in step 2 stops without it. From [ziglang.org/download](https://ziglang.org/download/),
-  get **0.15.2 → macOS aarch64** (`zig-aarch64-macos-0.15.2.tar.xz`), then:
+  get **0.15.2 → macOS aarch64** (`zig-aarch64-macos-0.15.2.tar.xz`), then unpack it, clear the
+  mark that makes macOS block downloaded programs (`xattr`), and check it:
 
   ```sh
   cd ~/Switch2
   tar -xf ~/Downloads/zig-aarch64-macos-0.15.2.tar.xz
   mv zig-aarch64-macos-0.15.2 zig
-  xattr -dr com.apple.quarantine zig   # stops macOS from blocking a downloaded program
-  zig/zig version                      # should print 0.15.2
+  xattr -dr com.apple.quarantine zig
+  zig/zig version
   cd WiiCompiled-Switch2
   ```
+
+  **You should see** `0.15.2`.
 
 - **Your own Mario Kart Wii PAL disc (`RMCP01`)** and the latest Retro Rewind.
 - **Optional:** Clang from the Xcode Command Line Tools, for ns2jb's tests in step 2.
@@ -152,7 +155,16 @@ helper it started with.
 
 Next, **build HBLauncher's launcher (required).** The launcher is the menu HBLauncher shows on the
 console. HBLauncher's repository has only its source code, so it has to be built once. This
-command does it in Docker, using HBLauncher's own build script (`tools/build-all.sh`):
+command does it in Docker, using HBLauncher's own build script (`tools/build-all.sh`).
+
+Docker Desktop has to be running first. Open it (or run `open -a Docker`) and wait until this
+prints a version number instead of `Cannot connect to the Docker daemon`:
+
+```sh
+docker info --format '{{.ServerVersion}}'
+```
+
+Then build the launcher:
 
 ```sh
 HBL_ROOT=~/Switch2/HBLauncher hblauncher/docker/run.sh launcher
@@ -175,22 +187,27 @@ Clang:
 ```sh
 cd ~/Switch2/ns2jb
 clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined tests/hbl-range-native.c -o /tmp/hbl-range-native
-/tmp/hbl-range-native                                    # 50 mapping scenarios
+/tmp/hbl-range-native
 node --test tests/hbl-wire.test.cjs $(git ls-files '*.test.cjs')
 cd ~/Switch2/HBLauncher && node --test tests/host/range-safety.test.cjs
 cd ~/Switch2/WiiCompiled-Switch2
 ```
+
+The first test program runs 50 mapping scenarios and should end with `50 scenarios passed`; the
+`node --test` runs should report no failures.
 
 HBLauncher's own tests check its PC side: its app format, its package loading, and a full
 launch-and-return cycle against a simulated console. They need the launcher you just built and the
 Vulkan headers, which the Docker image has, so they run in Docker:
 
 ```sh
-docker run --rm -v ~/Switch2/HBLauncher:/hbl -w /hbl wiicompiled-hbx-build:<tag> node tests/host/lifecycle.test.cjs
+IMAGE=$(docker images wiicompiled-hbx-build --format '{{.Repository}}:{{.Tag}}' | grep -v ':latest' | head -1)
+docker run --rm -v ~/Switch2/HBLauncher:/hbl -w /hbl "$IMAGE" node tests/host/lifecycle.test.cjs
 ```
 
-Replace `<tag>` with the tag `docker images wiicompiled-hbx-build` shows. Run it before installing
-the game in step 5, since the test expects only HBLauncher's own apps.
+The first line finds the Docker image the launcher build made. It should end with
+`12/12 host tests passed`. Run it before installing the game in step 5, since the test expects only
+HBLauncher's own apps.
 
 ### 3. Put your files in place
 
@@ -212,18 +229,24 @@ chmod +x ~/Switch2/nodtool
 xattr -d com.apple.quarantine ~/Switch2/nodtool 2>/dev/null
 mkdir -p /tmp/mkw-extract Assets/DATA
 ~/Switch2/nodtool extract /path/to/RMCP01.iso /tmp/mkw-extract
-cp /tmp/mkw-extract/*/sys/main.dol Assets/main.dol
-cp /tmp/mkw-extract/*/files/rel/StaticR.rel Assets/StaticR.rel
-cp -R /tmp/mkw-extract/*/files Assets/DATA/files
-cp -R /tmp/mkw-extract/*/sys Assets/DATA/sys
-rm -rf /tmp/mkw-extract
+cp /tmp/mkw-extract/sys/main.dol Assets/main.dol
+cp /tmp/mkw-extract/files/rel/StaticR.rel Assets/StaticR.rel
+cp -R /tmp/mkw-extract/files Assets/DATA/files
+cp -R /tmp/mkw-extract/sys Assets/DATA/sys
 shasum -a 256 Assets/main.dol Assets/StaticR.rel
 ```
 
-**You should see** these two hashes, which mean a clean PAL disc:
+nodtool puts the disc's `sys/` and `files/` folders straight into `/tmp/mkw-extract`. **You should
+see** these two hashes, which mean a clean PAL disc:
 
 - `Assets/main.dol`: `80d18895b39c63bd80f457398bfcbb91b7d16ac116a41a88967e954080155b05`
 - `Assets/StaticR.rel`: `16d9d146112541fefea701ecb5bc1a496f9d50e4a752fbb5b6778e7c6399f67d`
+
+Only when both match, delete the temporary copy:
+
+```sh
+rm -rf /tmp/mkw-extract
+```
 
 **Retro Rewind.** Get the latest [Retro Rewind](https://wiki.tockdom.com/wiki/Retro_Rewind) release
 (for example with [Wheel Wizard](https://github.com/TeamWheelWizard/WheelWizard)), and copy its
@@ -245,19 +268,31 @@ Plain Mario Kart Wii needs only the disc.
 
 ### 4. Build
 
-Make sure Docker Desktop is running. Each step runs in a Docker container, and build state stays
-in the Docker volume `wiicompiled-hbx` (set `HBX_VOLUME` to use another):
+Make sure Docker Desktop is running (see step 2). Each step runs in a Docker container, and build
+state stays in the Docker volume `wiicompiled-hbx` (set `HBX_VOLUME` to use another). Run these one
+at a time, waiting for each to finish:
 
 ```sh
 cd ~/Switch2/WiiCompiled-Switch2
 export HBL_ROOT=~/Switch2/HBLauncher
-hblauncher/docker/run.sh toolchain            # patched musl toolchain (about 7 min, once)
-hblauncher/docker/run.sh deps                 # Dawn + SDL3 at their pins, patched; SDK copy
-hblauncher/docker/run.sh runtime              # libhbxl.a
-hblauncher/docker/run.sh translate --online   # base game + Retro Rewind (leave out --online for offline only)
-hblauncher/docker/run.sh build                # console link (up to 30 min)
-hblauncher/docker/run.sh pack                 # -> hblauncher/dist/wiicompiled-rr
+hblauncher/docker/run.sh toolchain
+hblauncher/docker/run.sh deps
+hblauncher/docker/run.sh runtime
+hblauncher/docker/run.sh translate --online
+hblauncher/docker/run.sh build
+hblauncher/docker/run.sh pack
 ```
+
+What each does:
+
+- `toolchain`: builds the patched musl compiler toolchain, once (a few minutes).
+- `deps`: fetches Dawn and SDL3 at their pinned versions and patches them, and copies HBLauncher's
+  SDK.
+- `runtime`: builds HBLauncher's Linux runtime library (`libhbxl.a`).
+- `translate --online`: translates the base game and Retro Rewind. Leave out `--online` for
+  offline only (then the payload isn't needed).
+- `build`: compiles and links the game for the console (up to 30 minutes).
+- `pack`: makes the HBLauncher package in `hblauncher/dist/wiicompiled-rr`.
 
 **You should see** `pack` end with `Package: …/hblauncher/dist/wiicompiled-rr`. Running a failed step
 again is safe. In a new terminal, run the `export` line again before continuing.
@@ -311,6 +346,7 @@ console data, is ignored by Git, and should never be shared:
 | `RetroRewind/RetroRewind6/` | your Retro Rewind folder |
 | `RetroRewind/riivolution/save/RetroWFC/RMCP/rksys.dat` | Retro Rewind's save, from `--rr-save` |
 | `dsp_coef.bin`, `wii_bootstrap/`, `cacert.pem` | runtime resources from `runtime/assets` (not the starter pipeline cache: building it all at start-up runs out of memory on the console) |
+| `etc/resolv.conf` | the DNS servers the game uses to find Retro WFC (`1.1.1.1`, `8.8.8.8`); edit it to use others |
 | `hbxl-env` | options read at launch (see below) |
 | `icon.png` | optional launcher icon; add your own |
 

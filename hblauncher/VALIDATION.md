@@ -87,6 +87,15 @@ over the file server), and building the starter pipeline cache at start-up ran o
 Changing the resolution to 1.5× during a race broke the graphics; changing it in the menus didn't.
 The upload probe found no bad texture copies in either case.
 
+## The README followed from scratch
+
+The README was then followed step by step on the same Mac, in new folders (`~/Switch2`) with a new
+Docker volume, through to online play on Retro WFC. It works. Four problems found on the way are
+fixed: the launcher build needs Docker Desktop running, which the guide only said at step 4;
+nodtool puts `sys/` and `files/` straight into the extraction folder, not one folder deeper; notes
+after commands in the code blocks broke them when pasted into the Mac's terminal; and `fsroot` didn't
+create `etc/resolv.conf`, so the game had no DNS servers and couldn't reach Retro WFC.
+
 ## Plain Mario Kart Wii
 
 `--product wiicompiled` from the fresh folders: translate, build, pack, install and fsroot succeed;

@@ -396,6 +396,12 @@ def fsroot(root, disc, rr, nand, rr_save):
                          (assets / "certs/cacert.pem", "cacert.pem")):
         shutil.copy2(source, root / name)
     clone_tree(assets / "wii", root / "wii_bootstrap")
+    # musl reads its DNS servers from <root>/etc/resolv.conf; without one every lookup fails and
+    # Retro WFC can't be reached.
+    resolv = root / "etc/resolv.conf"
+    if not resolv.exists():
+        resolv.parent.mkdir(parents=True, exist_ok=True)
+        resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
     if not (disc / "sys/fst.bin").exists():
         raise SystemExit(f"{disc} is not an extracted disc (needs files/ and sys/fst.bin)")
     clone_tree(disc, root / "disc/DATA")
