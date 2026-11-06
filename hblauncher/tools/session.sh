@@ -33,6 +33,9 @@ launcher)
   export HBL_BULK_SHA256="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["ns2jb"]["payload"]["sha256"])' "$HERE/dependencies.json")"
   export HBL_ARCHIVE_SDK="$PWD/reference/hblauncher-cpu-sdk/homebrew-launcher"
   export HBL_HID_SYMBOLS="$PWD/reference/hblauncher-cpu-sdk/sdk/native/hid-functions.json"
+  # HBLauncher stops after 64 launcher turns by default, about 15 minutes in its menu. Ask for
+  # 10,000 (about 40 hours) unless --entries is given.
+  [[ " $* " == *" --entries "* ]] || set -- --entries 10000 "$@"
   exec ./hbl-start "$@"
   ;;
 *)

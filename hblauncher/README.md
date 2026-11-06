@@ -363,7 +363,9 @@ Each session goes like this; open three terminal windows in `~/Switch2/WiiCompil
    a shader screen (L + R + right stick opens the settings there), then the game starts.
 
 Keep the server and runner running while you play. While the runner is alive, `launcher` reuses
-the open session without a new 4/4. Pause is on **Minus**; never press **Plus** (see known
+the open session without a new 4/4. HBLauncher on its own stops after about 15 minutes in its menu
+(64 launcher turns); `session.sh launcher` asks for 10,000 turns, about 40 hours, instead. Add
+`--entries N` to choose another limit. Pause is on **Minus**; never press **Plus** (see known
 issues). HBLauncher writes its own log to `~/Switch2/HBLauncher/build/hbl-session.log`.
 
 ### Plain Mario Kart Wii (experimental)
