@@ -371,7 +371,8 @@ issues). HBLauncher writes its own log to `~/Switch2/HBLauncher/build/hbl-sessio
 ### Plain Mario Kart Wii (experimental)
 
 `--product wiicompiled` builds the game without Retro Rewind as a separate app, **Mario Kart Wii**,
-with its own file-server folder (`hblauncher/fsroot-wiicompiled/`). It's offline only (Retro WFC
+with its own file-server folder (`hblauncher/fsroot-wiicompiled/`). Its HBLauncher app is defined in
+`hblauncher/app-wiicompiled/`, next to Retro Rewind's in `hblauncher/app/`. It's offline only (Retro WFC
 is part of Retro Rewind) and slower in races; see known issues. Steps 1–3 are the same, without the
 Retro Rewind folder or payload:
 
