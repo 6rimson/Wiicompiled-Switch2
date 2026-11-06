@@ -1414,7 +1414,7 @@ void DrawStartupScreen() {
             nextY = ImGui::GetCursorPosY() + 4.0f;
         }
 #if defined(HBX_SWITCH2)
-        constexpr const char* kHint = "Press Minus to open settings";
+        constexpr const char* kHint = "Press L + R + right stick to open settings";
 #else
         constexpr const char* kHint = "Press F10 to open settings";
 #endif
@@ -1728,8 +1728,8 @@ void ReleaseControllers() noexcept {
 }
 
 #if defined(HBX_SWITCH2)
-// The desktop menus need a mouse and F10. On the console, Minus opens this list instead: D-pad up
-// and down move, left and right change a value, A rebinds or confirms, B or Minus closes.
+// The desktop menus need a mouse and F10. On the console, L + R + right stick click opens this list
+// instead: D-pad up and down move, left and right change a value, A rebinds or confirms, B closes.
 constexpr std::array<float, 4> kConsoleScales = {1.0f, 1.5f, 2.0f, 3.0f};
 
 // nn::oe, in the running SDK. These reach system services, which can't read Vulkan-backed memory,
@@ -2013,7 +2013,7 @@ void DrawConsoleMenu() {
                       : g_consoleExitArmed ? "Press A again to quit"
                                            : "Return to launcher");
         ImGui::Separator();
-        ImGui::TextDisabled("D-pad: move, change. A: rebind. B or Minus: close.");
+        ImGui::TextDisabled("D-pad: move, change. A: rebind. B: close.");
         DrawRebindPrompt();
     }
     ImGui::End();
