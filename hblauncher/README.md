@@ -1,14 +1,15 @@
 # WiiCompiled + Retro Rewind for Switch 2 (HBLauncher)
 
-An experimental port of [WiiCompiled](https://github.com/patchzyy/Wiicompiled) with Retro Rewind to
+An experimental port of [WiiCompiled](https://github.com/patchzyy/Wiicompiled) with Retro Rewind for
 the Nintendo Switch 2, run by ravensclawx's [HBLauncher](https://github.com/ravensclawx/HBLauncher).
 The game is a static `aarch64-linux-musl` program that HBLauncher's Linux personality (ABI 3)
 loads into the SmileBASIC process that ns2jb opens.
 
 > [!IMPORTANT]
-> **This is a proof of concept, shared as is.** I made it for fun and may not be able to help with
-> problems, but anyone is welcome to fork it and carry it further; if someone does, I'll link their
-> fork here.
+> **This is an experimental project, shared as is.** I'd like to keep improving its
+> performance and fixing its issues, but nothing is guaranteed. Newer, more polished homebrew menus
+> and tools will likely make this way of running the game outdated. Anyone is welcome to fork it and
+> carry it further; if someone does, I'll link their fork here.
 
 > [!NOTE]
 > **Made with AI assistance.** Most of this port's code was written with Claude Code. I tested
@@ -20,7 +21,7 @@ A built package contains translated game code, so please don't share one either.
 
 ## Status
 
-This is an experimental proof of concept for the homebrew tools available in November 2026
+This is an experimental project built on the homebrew tools available in November 2026
 (HBLauncher `18b4748`, ns2jb `81d5bb1`). Newer homebrew launchers will likely make this way of
 running it obsolete; if that happens, I'll point to them here and archive this repository. The
 WiiCompiled fixes and the Switch 2 notes in this repository should still be useful to whoever
@@ -44,75 +45,95 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 
 ## Known issues
 
-- **A PC has to stay on.** Every file is read from and written to your PC over the network
-  through HBLauncher's file server. There's no SD card support and no play away from home, and
-  ns2jb needs both the PC and the console on Ethernet.
-- **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the
-  SmileBASIC program that keeps the session alive. The game keeps running for about two minutes,
-  then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick
-  click**.
-- **Offline isn't a steady 60 FPS.** Full 12-kart races run in the mid 50s in the pack and near 60
-  in first place, and busy parts of some detailed custom tracks drop into the low 50s. Offline the
-  game draws every frame, so in those moments it also runs slightly slower than normal speed.
-- **Change the resolution outside races.** Changing it during a race breaks the graphics until
-  you restart the game; changing it in the game's menus works.
-- **Online can look choppy.** Online keeps Retro Rewind's frame skip so the game always runs at
-  full speed, which means busy moments can drop to about 30 FPS.
-- **After a crash, restart SmileBASIC.** The game shares SmileBASIC's process with HBLauncher, so
-  memory a crashed game didn't free is still taken. Launching again in the same session can fail
-  at start-up or close SmileBASIC with a system error. Close SmileBASIC, open it again, and start
-  a new runner and 4/4 session.
-- **Plain Mario Kart Wii is slower in races.** Busy stretches, such as Mario Circuit's countdown,
-  lock to 30 FPS and the game slows down. Both games need about the same work per frame there
-  (16–18 ms against a 16.7 ms budget). Retro Rewind runs its own frame loop, where this port draws
-  every tick, so a frame that is slightly late just shows late: Mario Circuit averaged 57 FPS.
-  Plain Mario Kart Wii waits for the next screen refresh after each frame, as on a Wii, so a frame
-  1 ms late waits a whole extra refresh (33 ms): it averaged 50 FPS, with long stretches at 30.
-  Fixing it means changing how the runtime paces screen refreshes for plain Mario Kart Wii.
-- **The first visit to a place stutters** while shaders build; they're cached after that. The
-  first boot can wait a few minutes for this.
-- Every Retro Rewind update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
-- Only built on an Apple Silicon Mac with Docker. The scripts should also work on aarch64 Linux,
-  but I haven't tried.
-- It may stop working after an HBLauncher, ns2jb, firmware or Retro Rewind update. It was tested
-  with HBLauncher `18b4748` and ns2jb `81d5bb1`, patched as in step 2.
+- **A PC has to stay on.** Every file is read from and written to your PC over the network through HBLauncher's file server. There's no SD card support and no play away from home, and ns2jb needs both the PC and the console on Ethernet.
+- **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the SmileBASIC program that keeps the session alive. The game keeps running for about two minutes, then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick click**.
+- **Offline isn't a steady 60 FPS.** Full 12-kart races run in the mid 50s in the pack and near 60 in first place, and busy parts of some detailed custom tracks drop into the low 50s. Offline the game draws every frame, so in those moments it also runs slightly slower than normal speed.
+- **Change the resolution outside races.** Changing it during a race breaks the graphics until you restart the game; changing it in the game's menus works.
+- **Online can look choppy.** Online keeps Retro Rewind's frame skip so the game always runs at full speed, which means busy moments can drop to about 30 FPS.
+- **After a crash, restart SmileBASIC.** The game shares SmileBASIC's process with HBLauncher, so memory a crashed game didn't free is still taken. Launching again in the same session can fail at start-up or close SmileBASIC with a system error. Close SmileBASIC, open it again, and start a new runner and 4/4 session.
+- **Plain Mario Kart Wii is slower in races.** Busy stretches, such as Mario Circuit's countdown, lock to 30 FPS and the game slows down. Both games need about the same work per frame there (16–18 ms against a 16.7 ms budget). Retro Rewind runs its own frame loop, where this port draws every tick, so a frame that is slightly late just shows late: Mario Circuit averaged 57 FPS. Plain Mario Kart Wii waits for the next screen refresh after each frame, as on a Wii, so a frame 1 ms late waits a whole extra refresh (33 ms): it averaged 50 FPS, with long stretches at 30. Fixing it means changing how the runtime paces screen refreshes for plain Mario Kart Wii.
+- **The first visit to a place stutters** while shaders build; they're cached after that. The first boot can wait a few minutes for this.
+- **Retro Rewind updates need a rebuild.** Every update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
+- **Only built on an Apple Silicon Mac.** The scripts should also work on aarch64 Linux, but I haven't tried.
+- **Updates elsewhere can break it.** It may stop working after an HBLauncher, ns2jb, firmware or Retro Rewind update. It was tested with HBLauncher `18b4748` and ns2jb `81d5bb1`, patched as in step 2.
 
 ## Setup
 
-The first build takes a long time, mostly unattended; the console link alone is about 30 minutes.
-This path is for an Apple Silicon Mac with Docker Desktop.
+This guide is for people comfortable typing commands in a terminal. If you've never done that, this
+port will be hard going; an easier homebrew launcher may come along later. Expect an hour or two for
+the first build and setup: most of it is the build running on its own, and getting the console
+session working can take a few tries. Everything here is for an Apple Silicon Mac with Docker
+Desktop.
+
+The examples keep everything in one folder, `~/Switch2`:
+
+| Path | What it is |
+|---|---|
+| `~/Switch2/WiiCompiled-Switch2` | this repository |
+| `~/Switch2/HBLauncher` | HBLauncher, created in step 2 |
+| `~/Switch2/ns2jb` | ns2jb, created in step 2 |
+| `~/Switch2/zig` | Zig 0.15.2, from step 1 |
+| `~/Switch2/nodtool` | nodtool, the disc extractor (a single program file), from step 3 |
+
+You can use other locations; just use the same ones in every step.
+
+### 0. Get this repository
+
+```sh
+mkdir -p ~/Switch2 && cd ~/Switch2
+git clone --recursive --branch switch2-hblauncher https://github.com/6rimson/WiiCompiled-Switch2.git
+cd WiiCompiled-Switch2
+```
+
+`--recursive` also fetches aurora, the graphics library WiiCompiled includes. Run every command
+below from this folder.
 
 ### 1. What you need
 
-- A Mac or Linux PC on Ethernet: ns2jb doesn't support Windows. Check
-  [ns2jb's README](https://gitlab.com/kurumuz/ns2jb) for the system software and SmileBASIC
-  versions it supports, and do its one-time SmileBASIC setup (saving `bootstrap.bas` as `NS2`).
-- [HBLauncher](https://github.com/ravensclawx/HBLauncher) at `18b4748` and
-  [ns2jb](https://gitlab.com/kurumuz/ns2jb) at `81d5bb1`, exactly. Step 2 clones and patches them.
-  Newer versions haven't been tested with these patches.
-- On the Mac: [Docker Desktop](https://www.docker.com/products/docker-desktop/), Git, Python 3,
-  [Node.js](https://nodejs.org/) 22 or newer, and [Zig 0.15.2](https://ziglang.org/download/),
-  exactly, to rebuild ns2jb's helper. Clang from the Xcode Command Line Tools runs the optional
-  ns2jb tests. Everything else (Clang 22, .NET 8, the musl toolchain, HBLauncher's build tools)
-  comes in the Docker image, which `docker/run.sh` builds the first time.
-- Your own Mario Kart Wii PAL disc (`RMCP01`) and the latest Retro Rewind.
-- This repository with its aurora submodule:
+- **A Mac or Linux PC on Ethernet**, on the same network as the console; ns2jb doesn't support
+  Windows, and the console must be on Ethernet too. Check
+  [ns2jb's README](https://gitlab.com/kurumuz/ns2jb) for the system software and SmileBASIC versions
+  it supports, and do its one-time SmileBASIC setup: typing `bootstrap.bas` into SmileBASIC and
+  saving it as `NS2` (a USB keyboard helps).
+- **On the Mac:** [Docker Desktop](https://www.docker.com/products/docker-desktop/), Git, **Python 3**
+  and [Node.js](https://nodejs.org/) 22 or newer. Git and Python 3 come with Apple's Command Line
+  Tools (`xcode-select --install`). Check them with `git --version`, `python3 --version` and
+  `node --version`. Everything else (Clang 22, .NET 8, the musl toolchain, HBLauncher's build
+  tools) comes in a Docker image that `docker/run.sh` builds the first time. The build was tested with Docker Desktop's memory set to 8 GB (Settings →
+  Resources); less may fail partway.
+- **Zig 0.15.2, exactly (required).** ns2jb runs a small helper program on the console; this port's
+  ns2jb patch changes that helper, so it has to be rebuilt, and Zig is the compiler ns2jb uses for
+  it. The setup in step 2 stops without it. From [ziglang.org/download](https://ziglang.org/download/),
+  get **0.15.2 → macOS aarch64** (`zig-aarch64-macos-0.15.2.tar.xz`), then:
 
   ```sh
-  git clone --recursive --branch switch2-hblauncher https://github.com/6rimson/WiiCompiled-Switch2.git
+  cd ~/Switch2
+  tar -xf ~/Downloads/zig-aarch64-macos-0.15.2.tar.xz
+  mv zig-aarch64-macos-0.15.2 zig
+  xattr -dr com.apple.quarantine zig   # stops macOS from blocking a downloaded program
+  zig/zig version                      # should print 0.15.2
   cd WiiCompiled-Switch2
   ```
 
-  Run every command below from this folder.
+- **Your own Mario Kart Wii PAL disc (`RMCP01`)** and the latest Retro Rewind.
+- **Optional:** Clang from the Xcode Command Line Tools, for ns2jb's tests in step 2.
+
+HBLauncher (`18b4748`) and ns2jb (`81d5bb1`) are cloned at those exact versions in step 2. Newer
+versions haven't been tested with this port's patches.
 
 ### 2. Prepare HBLauncher and ns2jb
 
-Upstream HBLauncher asks ns2jb to map memory ranges (commands `0x524f001a`–`0x524f001c`) that ns2jb
-`81d5bb1` doesn't implement, so a launch fails with `Unknown process probe`. This port patches
-both sides, and one script prepares them:
+These patches let HBLauncher load executable code and writable app data into the running
+SmileBASIC process. They provide the missing loader compatibility; the game-specific runtime fixes
+are documented separately below.
+
+HBLauncher at our pinned commit `18b4748` asks ns2jb to map memory ranges (commands
+`0x524f001a`–`0x524f001c`) that ns2jb `81d5bb1` doesn't implement, so a launch fails with
+`Unknown process probe`. This port patches both sides, and one script prepares them:
 
 ```sh
-hblauncher/tools/setup-session.py --hblauncher ~/hbl/HBLauncher --ns2jb ~/hbl/ns2jb --zig /path/to/zig
+cd ~/Switch2/WiiCompiled-Switch2
+hblauncher/tools/setup-session.py --hblauncher ~/Switch2/HBLauncher --ns2jb ~/Switch2/ns2jb --zig ~/Switch2/zig/zig
 ```
 
 It clones any folder that doesn't exist yet and checks out the pinned commit, then:
@@ -123,83 +144,161 @@ It clones any folder that doesn't exist yet and checks out the pinned commit, th
 - applies `patches/ns2jb-range-mapping.diff` to ns2jb, rebuilds its native helper with Zig,
   checks it against the pinned SHA-256, and updates ns2jb's `SHA256SUMS`.
 
-Running it again changes nothing. A folder at another commit, or with local edits that overlap
-a patch, stops the script with an explanation; it never resets or discards anything. `--check`
-only reports. After the helper changes, start a fresh SmileBASIC session and runner: an old run
-folder keeps the helper it started with.
+**You should see** it end with `Ready.` and two lines to put in `session.env` (step 6). Running it
+again changes nothing. A folder at another commit, or with local edits that overlap a patch, stops
+the script with an explanation; it never resets or discards anything. `--check` only reports.
+After the helper changes, start a fresh SmileBASIC session and runner: an old run folder keeps the
+helper it started with.
 
-Then build HBLauncher's launcher, demo apps and hardware probe in Docker (HBLauncher's own
-`tools/build-all.sh`; about two minutes). It writes only build output inside the HBLauncher folder:
+Next, **build HBLauncher's launcher (required).** The launcher is the menu HBLauncher shows on the
+console. HBLauncher's repository has only its source code, so it has to be built once. This
+command does it in Docker, using HBLauncher's own build script (`tools/build-all.sh`):
 
 ```sh
-HBL_ROOT=~/hbl/HBLauncher hblauncher/docker/run.sh launcher
+HBL_ROOT=~/Switch2/HBLauncher hblauncher/docker/run.sh launcher
 ```
 
-The launcher built this way is byte-identical to the one used on the console
-(`launcher/build/code.bin` SHA-256 `222ec59b…`). A different hash doesn't mean it's broken
-(a newer compiler can change it), but it is then a launcher nobody has tested with this port.
+`HBL_ROOT=…` tells the script which HBLauncher folder to build. It takes about two minutes, plus a
+few more the first time while the Docker image builds, and it only adds build output inside
+`~/Switch2/HBLauncher`. **You should see** it end with `build complete`. The launcher built this way
+is byte-identical to the one used on the console (`launcher/build/code.bin` SHA-256 `222ec59b…`). A
+different hash doesn't mean it's broken (a newer compiler can change it), but it is then a launcher
+nobody has tested with this port.
 
-Optional: the tests below check the patched PC-side code on your Mac, without a console. A session
-doesn't need them; they're for confirming a setup or checking a change. To run the ones that
-come with the patches:
+#### Optional: check the patches
+
+**Skip this if you just want to play.** These tests run on your Mac, without a console, and check
+that the patched PC-side code behaves as expected. They're useful if something seems wrong, or if
+you change the patches. The tests that come with this port's ns2jb and HBLauncher patches need
+Clang:
 
 ```sh
-cd /path/to/ns2jb
+cd ~/Switch2/ns2jb
 clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined tests/hbl-range-native.c -o /tmp/hbl-range-native
 /tmp/hbl-range-native                                    # 50 mapping scenarios
 node --test tests/hbl-wire.test.cjs $(git ls-files '*.test.cjs')
-cd /path/to/HBLauncher && node --test tests/host/range-safety.test.cjs
+cd ~/Switch2/HBLauncher && node --test tests/host/range-safety.test.cjs
+cd ~/Switch2/WiiCompiled-Switch2
 ```
 
-HBLauncher's own host tests (ABI, packages, launcher lifecycle) need its built launcher and the
-Vulkan headers, which the Docker image has:
+HBLauncher's own tests check its PC side: its app format, its package loading, and a full
+launch-and-return cycle against a simulated console. They need the launcher you just built and the
+Vulkan headers, which the Docker image has, so they run in Docker:
 
 ```sh
-docker run --rm -v ~/hbl/HBLauncher:/hbl -w /hbl wiicompiled-hbx-build:<tag> node tests/host/lifecycle.test.cjs
+docker run --rm -v ~/Switch2/HBLauncher:/hbl -w /hbl wiicompiled-hbx-build:<tag> node tests/host/lifecycle.test.cjs
 ```
 
-`docker images wiicompiled-hbx-build` shows the tag. Run it before installing the game, since
-the test expects only HBLauncher's own apps.
+Replace `<tag>` with the tag `docker images wiicompiled-hbx-build` shows. Run it before installing
+the game in step 5, since the test expects only HBLauncher's own apps.
 
 ### 3. Put your files in place
 
-Use the same paths as a desktop WiiCompiled build; [`docs/building-macos.md`](../docs/building-macos.md)
-shows how to extract the disc and get Retro Rewind and the online payload:
+These are the same files a desktop WiiCompiled build uses, in the same places. The commands come
+from WiiCompiled's [macOS guide](../docs/building-macos.md), which has more detail. They use paths
+inside this repository (`Assets/`, `PulsarPacks/`, `build/`), so run them from
+`~/Switch2/WiiCompiled-Switch2`; in a new terminal, start with:
 
-- `Assets/main.dol`, `Assets/StaticR.rel` and `Assets/DATA` (`files/` + `sys/`) from your disc;
-- `PulsarPacks/completed/RetroRewind/RetroRewind6`: your Retro Rewind folder;
-- for online play, `build/retro-wfc/binary/payload.RMCPD00.bin` (the Retro-WFC payload).
+```sh
+cd ~/Switch2/WiiCompiled-Switch2
+```
+
+**Your disc.** Extract it with [nodtool](https://github.com/encounter/nod/releases) (any of `.iso`,
+`.wbfs`, `.rvz` and similar works):
+
+```sh
+curl -fsSL "https://github.com/encounter/nod/releases/download/v2.0.0-alpha.10/nodtool-macos-arm64" -o ~/Switch2/nodtool
+chmod +x ~/Switch2/nodtool
+xattr -d com.apple.quarantine ~/Switch2/nodtool 2>/dev/null
+mkdir -p /tmp/mkw-extract Assets/DATA
+~/Switch2/nodtool extract /path/to/RMCP01.iso /tmp/mkw-extract
+cp /tmp/mkw-extract/*/sys/main.dol Assets/main.dol
+cp /tmp/mkw-extract/*/files/rel/StaticR.rel Assets/StaticR.rel
+cp -R /tmp/mkw-extract/*/files Assets/DATA/files
+cp -R /tmp/mkw-extract/*/sys Assets/DATA/sys
+rm -rf /tmp/mkw-extract
+shasum -a 256 Assets/main.dol Assets/StaticR.rel
+```
+
+**You should see** these two hashes, which mean a clean PAL disc:
+
+- `Assets/main.dol`: `80d18895b39c63bd80f457398bfcbb91b7d16ac116a41a88967e954080155b05`
+- `Assets/StaticR.rel`: `16d9d146112541fefea701ecb5bc1a496f9d50e4a752fbb5b6778e7c6399f67d`
+
+**Retro Rewind.** Get the latest [Retro Rewind](https://wiki.tockdom.com/wiki/Retro_Rewind) release
+(for example with [Wheel Wizard](https://github.com/TeamWheelWizard/WheelWizard)), and copy its
+`RetroRewind6` folder, the one that contains `Binaries/Code.pul`:
+
+```sh
+mkdir -p PulsarPacks/completed/RetroRewind
+cp -R /path/to/RetroRewind6 PulsarPacks/completed/RetroRewind/
+```
+
+**Online play (optional).** Download the Retro-WFC payload; the build checks its signature:
+
+```sh
+mkdir -p build/retro-wfc/binary
+curl -fsSL --retry 3 "https://rwfc.net/api/wfc/payload?g=RMCPD00" -o build/retro-wfc/binary/payload.RMCPD00.bin
+```
+
+Plain Mario Kart Wii needs only the disc.
 
 ### 4. Build
 
-Each step runs in a Docker container. Build state stays in the Docker volume `wiicompiled-hbx`
-(set `HBX_VOLUME` to use another):
+Make sure Docker Desktop is running. Each step runs in a Docker container, and build state stays
+in the Docker volume `wiicompiled-hbx` (set `HBX_VOLUME` to use another):
 
 ```sh
-export HBL_ROOT=/path/to/HBLauncher
+cd ~/Switch2/WiiCompiled-Switch2
+export HBL_ROOT=~/Switch2/HBLauncher
 hblauncher/docker/run.sh toolchain            # patched musl toolchain (about 7 min, once)
 hblauncher/docker/run.sh deps                 # Dawn + SDL3 at their pins, patched; SDK copy
 hblauncher/docker/run.sh runtime              # libhbxl.a
 hblauncher/docker/run.sh translate --online   # base game + Retro Rewind (leave out --online for offline only)
-hblauncher/docker/run.sh build                # console link (about 30 min)
+hblauncher/docker/run.sh build                # console link (up to 30 min)
 hblauncher/docker/run.sh pack                 # -> hblauncher/dist/wiicompiled-rr
 ```
 
-The console needs your PC's address. On macOS, `serve` finds it and writes it into the installed
-app, so nothing else is needed. On Linux, set `HBX_FS_HOST=<the PC's IPv4>` for `build`, or leave
-it unset if you use HBLauncher's wired link at `10.42.0.1`.
+**You should see** `pack` end with `Package: …/hblauncher/dist/wiicompiled-rr`. Running a failed step
+again is safe. In a new terminal, run the `export` line again before continuing.
+
+That builds Retro Rewind. To build plain Mario Kart Wii (experimental) instead, use the same steps
+with `--product wiicompiled` and without `--online`; see
+[Plain Mario Kart Wii](#plain-mario-kart-wii-experimental) below.
+
+You don't need to set your Mac's network address anywhere. The game reads its files from your Mac,
+so it needs that address, but each time you start the file server (step 6) it looks up your Mac's
+current address and writes it into the installed game. That keeps working even when your router
+gives the Mac a new address.
 
 ### 5. Install
 
+In the same terminal as step 4 (it needs `HBL_ROOT`):
+
 ```sh
+cd ~/Switch2/WiiCompiled-Switch2
 python3 hblauncher/build.py install
 python3 hblauncher/build.py fsroot --nand /path/to/NAND --rr-save /path/to/rksys.dat
 node hblauncher/tools/check-package.cjs "$HBL_ROOT/apps/wiicompiled-rr"
 ```
 
-`--nand` and `--rr-save` are optional: a NAND folder from a desktop
-WiiCompiled build brings your Miis, region and online profile, and `rksys.dat` brings your
-Retro Rewind save.
+**You should see** the last command print `loadPackage: ok` and `mock lifecycle: ok`.
+
+`--nand` and `--rr-save` are optional. Without them the game starts like a new Wii: a new console
+identity, no Miis and no save.
+
+**Bringing your saves:**
+
+- `--nand` copies a Wii NAND folder: Miis, region and flag (SYSCONF), the console identity in
+  `title/00000001/00000002/data/setting.txt` (Retro WFC links your online profile to it) and
+  WFC login data. Plain Mario Kart Wii keeps its save in the NAND too, at
+  `title/00010004/524d4350/data/rksys.dat`. Tested with the `UserData/NAND` folder of a desktop
+  WiiCompiled build; a Dolphin NAND should have the same layout but hasn't been tried.
+- `--rr-save` copies Retro Rewind's own save, `rksys.dat`, from
+  `riivolution/save/RetroWFC/RMCP/` next to your Retro Rewind folder (on a desktop build, an SD card
+  or in Dolphin).
+- Both are copies: the console writes to the copies in `hblauncher/fsroot/`, never to the
+  originals. Copy them back yourself if you want progress made on the Switch 2 elsewhere.
 
 `fsroot` creates `hblauncher/fsroot/`, the folder the console sees. It holds your saves and
 console data, is ignored by Git, and should never be shared:
@@ -217,24 +316,55 @@ console data, is ignored by Git, and should never be shared:
 
 ### 6. Play
 
-Create `hblauncher/fsroot/session.env` with the two checkouts from step 2:
+Create `hblauncher/fsroot/session.env` with the two lines `setup-session.py` printed, for example:
 
 ```sh
-HBL_ROOT=/path/to/HBLauncher
-HBL_NS2JB=/path/to/ns2jb
+HBL_ROOT=$HOME/Switch2/HBLauncher
+HBL_NS2JB=$HOME/Switch2/ns2jb
 ```
 
-Then run each part in its own terminal, in this order:
+Each session goes like this; open three terminal windows in `~/Switch2/WiiCompiled-Switch2`:
 
-```sh
-hblauncher/tools/session.sh server     # file server; its log goes to hblauncher/fsroot/fs-run.log
-hblauncher/tools/session.sh runner     # ns2jb's runner: start SmileBASIC and bring the session to 4/4
-hblauncher/tools/session.sh launcher   # HBLauncher; pick Retro Rewind
-```
+1. **On the console:** restart it, open SmileBASIC and go to Direct mode.
+2. **Terminal 1, the file server:**
+
+   ```sh
+   hblauncher/tools/session.sh server
+   ```
+
+   The first time, macOS may ask whether Python may accept incoming network connections: choose
+   **Allow**, or the console can't reach your files. Its log goes to `hblauncher/fsroot/fs-run.log`.
+3. **Terminal 2, ns2jb's runner:**
+
+   ```sh
+   hblauncher/tools/session.sh runner
+   ```
+
+   Allow Node's incoming connections too if macOS asks. The runner prints a `V=START(...)` line.
+4. **In SmileBASIC,** enter these one at a time, confirming the load when asked:
+
+   ```basic
+   LOAD "TXT:NS2"
+   RUN
+   REMOVE NSR,&H60000000,&H3FFFFFFF
+   ```
+
+   An **Out of memory** message after `REMOVE` is expected. Then type the `V=START(...)` line from
+   the runner exactly. Wait until the runner reports **4/4 verified**. This is the exploit stage
+   and doesn't always succeed; if it fails, restart the console and try again. ns2jb's README has
+   the details.
+5. **Terminal 3, HBLauncher:**
+
+   ```sh
+   hblauncher/tools/session.sh launcher
+   ```
+
+   HBLauncher appears on the console; pick **Retro Rewind**. The first boot waits a few minutes on
+   a shader screen (L + R + right stick opens the settings there), then the game starts.
 
 Keep the server and runner running while you play. While the runner is alive, `launcher` reuses
-the open session without a new 4/4. HBLauncher writes its own log to
-`$HBL_ROOT/build/hbl-session.log`.
+the open session without a new 4/4. Pause is on **Minus**; never press **Plus** (see known
+issues). HBLauncher writes its own log to `~/Switch2/HBLauncher/build/hbl-session.log`.
 
 ### Plain Mario Kart Wii (experimental)
 
@@ -263,8 +393,8 @@ sets their starting values, one `NAME=value` per line:
 
 | Option | Default | What it does |
 |---|---|---|
-| `MKW_CPU_BOOST=N` | `1` | CPU boost mode at launch (about 1534 MHz instead of 1107). `0` turns it off. |
-| `MKW_RACE_WORKER=0` | on | Starts with the race GX worker off. The worker records graphics commands on the game thread and replays them on another core during offline races. |
+| `MKW_CPU_BOOST=N` | `1` | The console's CPU boost mode at launch: it raises the measured CPU clock from about 1107 MHz to about 1534 MHz, and every FPS figure in this README was measured with it on. `0` turns it off. |
+| `MKW_RACE_WORKER=0` | on | Starts with the race GX worker off. The worker records graphics commands on the game thread and replays them on another core during offline races. It may improve race performance, but its effect hasn't been fully verified. |
 | `MKW_FRAME_SKIP=1` | off | Starts with Retro Rewind's frame skip on in offline races. Online and outside races it's always on. |
 | `MKW_PERF_STATS=1` | off | Logs FPS and frame timing. |
 | `AURORA_PIPELINE_THREADS=N` | `2` | Threads that build shaders (0–4; `0` builds on the frame thread). Only 2 has been measured. |
@@ -287,7 +417,7 @@ figures above were measured at. `gx_worker = true` (the default) is needed for t
   own folder is the file-server root.
 - **Speed:** in Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
   is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
-  boost is on at launch.
+  boost mode is on at launch (about 1534 MHz instead of 1107).
 
 ## Patches
 
@@ -334,7 +464,9 @@ The runtime patches are applied by `build.py deps` and `build.py runtime`.
 ## Other build options
 
 On native aarch64 Linux, run `python3 hblauncher/build.py <action>` directly, with
-`HBXL_TOOLCHAIN` pointing at the toolchain.
+`HBXL_TOOLCHAIN` pointing at the toolchain. Linux has no automatic address lookup, so before
+`build`, set `HBX_FS_HOST=<the PC's IPv4 address>` (or leave it unset if you use HBLauncher's wired
+link at `10.42.0.1`).
 
 `build --variant desktop` links stand-ins for HBLauncher's runtime instead
 (`desktop/hbx_desktop_stubs.c`). The same code then runs headless on desktop aarch64 Linux,

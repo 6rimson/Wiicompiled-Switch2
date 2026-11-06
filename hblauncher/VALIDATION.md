@@ -1,9 +1,8 @@
 # Validation
 
-What has been tested, on what, and when. The commit history was reordered into build order for
-release, so commit dates follow that order; the dates here are when each test actually ran.
+What has been tested, and on what.
 
-## First build (2026-10-29)
+## First build
 
 The first build, before anything ran on a Switch 2, against HBLauncher `18b4748` (ABI 3). Later
 builds differ in the details (more runtime patches, a smaller code image); the fresh-folder build
@@ -24,7 +23,7 @@ below is the current one.
 
 ## On a Switch 2
 
-Tested from 2026-10-30 to 2026-11-05 on one console, with HBLauncher `18b4748`, ns2jb `81d5bb1`,
+Tested on one console, with HBLauncher `18b4748`, ns2jb `81d5bb1`,
 Retro Rewind 6.13.4 and the file server on an Apple Silicon Mac on the same home network.
 
 | What | Result |
@@ -38,7 +37,7 @@ Retro Rewind 6.13.4 and the file server on an Apple Silicon Mac on the same home
 
 ## HBLauncher and ns2jb setup
 
-Checked on 2026-11-03 on an Apple Silicon Mac (Docker Engine 29.8), from fresh clones of
+Checked on an Apple Silicon Mac (Docker Engine 29.8), from fresh clones of
 HBLauncher `18b4748` and ns2jb `81d5bb1` from GitHub and GitLab, with `tools/setup-session.py`,
 Zig 0.15.2 and `docker/run.sh launcher`:
 
@@ -64,7 +63,7 @@ passed on the same console before the game ran.
 
 ## The README from fresh folders
 
-Checked on 2026-11-03 on the same Mac: a fresh clone of this branch with its aurora submodule and
+Checked on the same Mac: a fresh clone of this branch with its aurora submodule and
 this release's changes, the HBLauncher and ns2jb prepared above, and a new Docker volume. The
 disc and Retro Rewind files were copies of an existing extraction, not extracted again.
 
@@ -80,7 +79,7 @@ The fresh packages aren't byte-identical to the one played on the console before
 `a954d816…`), which was built from the same game source in an older Docker image and volume. The
 cause wasn't tracked down.
 
-On the console (2026-11-03 to 2026-11-05), the fresh setup with a brand-new NAND and no save: Retro Rewind boots,
+On the console, the fresh setup with a brand-new NAND and no save: Retro Rewind boots,
 creates its own NAND and settings, reaches the menus and runs offline races at about 60 FPS
 (mid 50s in a full 12-kart pack), and returns to HBLauncher cleanly. This run found and fixed two
 problems a new player would hit: the new NAND's `setting.txt` couldn't be created (no hard links
@@ -88,7 +87,7 @@ over the file server), and building the starter pipeline cache at start-up ran o
 Changing the resolution to 1.5× during a race broke the graphics; changing it in the menus didn't.
 The upload probe found no bad texture copies in either case.
 
-## Plain Mario Kart Wii (2026-11-05)
+## Plain Mario Kart Wii
 
 `--product wiicompiled` from the fresh folders: translate, build, pack, install and fsroot succeed;
 the package (code 110,363,672 B) passes HBLauncher's `loadPackage` and mock lifecycle. On the
