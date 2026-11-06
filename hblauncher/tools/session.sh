@@ -16,7 +16,7 @@ shift || true
 case "$part" in
 server)
   cd "$HERE/.."
-  python3 hblauncher/build.py serve 2>&1 | tee ~/Desktop/fs-run.log
+  python3 hblauncher/build.py serve 2>&1 | tee "${HBX_SERVER_LOG:-$HERE/fsroot/fs-run.log}"
   ;;
 runner)
   cd "$NS2JB"

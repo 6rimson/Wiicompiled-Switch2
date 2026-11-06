@@ -22,6 +22,9 @@
 *.gcm
 *.wad
 Code.pul
+rksys.dat
+SYSCONF
+setting.txt
 
 # Build output
 /build/
