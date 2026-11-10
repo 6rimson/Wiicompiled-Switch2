@@ -14,7 +14,21 @@
 #include <iomanip>
 #include <sstream>
 
+bool OS_HLE_InterruptsEnabled() noexcept;
+extern "C" int32_t OS__RestoreInterrupts_801a65d4(int32_t level);
+
 namespace Fiber {
+
+namespace {
+// MKW_IRQ_FOLLOW_THREAD=0 turns the fix in SwitchToThread off, for comparing runs.
+bool InterruptFlagFollowsThread() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MKW_IRQ_FOLLOW_THREAD");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+} // namespace
 
 std::mutex GuestFiberManager::s_mutex;
 std::unordered_map<uint32_t, GuestFiber> GuestFiberManager::s_fibers;
@@ -410,8 +424,21 @@ void GuestFiberManager::SwitchToThread(uint32_t guestThreadAddr, CpuContext* cpu
         MkwApplyHostNiMode(cpu->fpscr);
     }
 
+    // On a console the interrupt-enable state lives in each thread's MSR, but the HLE keeps one
+    // flag for all threads. A thread switched away from without asking (the sound thread woken
+    // by an audio block, say) came back with whatever the other thread left, usually "disabled",
+    // and then ran whole frames that way, holding back retraces, alarms and audio blocks.
+    // Carry the flag across the switch like the rest of the thread's state.
+    // From DriftDroid by dorPXP (GPLv3), commit ef99dbe.
+    const bool followThread = InterruptFlagFollowsThread();
+    const bool interruptsEnabledAtSwitch = followThread && OS_HLE_InterruptsEnabled();
+
     // Switch to the target fiber (the target fiber will load its own context)
     HostContext::Switch(fiberHandle);
+
+    if (followThread) {
+        OS__RestoreInterrupts_801a65d4(interruptsEnabledAtSwitch ? 1 : 0);
+    }
 
     // When we return here, the fiber that issued SwitchToThread has resumed.
     // That does not automatically mean the previous guest thread became runnable
