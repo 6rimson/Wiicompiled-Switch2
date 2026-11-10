@@ -34,6 +34,9 @@ Retro Rewind 6.13.4 and the file server on an Apple Silicon Mac on the same home
 | Offline races, defaults (CPU boost, race GX worker, frame skip off) at 1.5× | near 60 FPS in lighter stretches; full 12-kart races in the mid 50s in the pack and near 60 in first place; low 50s in busy parts of some custom tracks |
 | Retro WFC online, including races (frame skip on) | works |
 | Return to HBLauncher and launch again | works |
+| Thread-switch interrupt fix, same race with `MKW_IRQ_FOLLOW_THREAD=0` and without (150cc, 12 CPUs, SW2 Peach Circuit) | 56.8 → 58.0 FPS on average; seconds under 55 FPS 24% → 7% |
+| PGO build against the build before it (150cc, 12 CPUs, Wii U Mario Stadium) | 55.6 → 59.8 FPS on average; seconds at 60 FPS 19% → 97%; game work per frame 17.1 → 12.4 ms. The race without PGO came late in a long session, the PGO race after a fresh start |
+| PGO build, more offline races in one session, including a relaunch from HBLauncher | 60 FPS once racing; a dip to 40–55 FPS for about a second before the countdown, as without PGO |
 
 ## HBLauncher and ns2jb setup
 

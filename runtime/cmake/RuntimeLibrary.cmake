@@ -36,8 +36,41 @@ if(MKW_PLATFORM_WINDOWS)
         "LINKER:--whole-archive" "<LINK_ITEM>" "LINKER:--no-whole-archive")
 endif()
 
+# Profile-guided optimization of the game code and the runtime. Aurora, Dawn and SDL are left out:
+# a desktop training run never reaches their console paths, and PGO would build those as cold.
+# MKW_PGO=generate builds a recording binary (it writes LLVM_PROFILE_FILE when it exits);
+# MKW_PGO=use builds with MKW_PGO_PROFILE, the recordings merged by llvm-profdata.
+set(MKW_PGO "" CACHE STRING "Profile-guided optimization: empty, generate or use")
+set(MKW_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata for MKW_PGO=use")
+if(MKW_PGO STREQUAL "use" AND NOT EXISTS "${MKW_PGO_PROFILE}")
+    message(FATAL_ERROR "MKW_PGO=use needs MKW_PGO_PROFILE set to a merged .profdata file")
+elseif(NOT MKW_PGO STREQUAL "" AND NOT MKW_PGO STREQUAL "generate" AND NOT MKW_PGO STREQUAL "use")
+    message(FATAL_ERROR "MKW_PGO must be empty, generate or use, not ${MKW_PGO}")
+endif()
+
+function(mkw_apply_pgo target)
+    if(MKW_PGO STREQUAL "generate")
+        target_compile_options(${target} PRIVATE -fprofile-generate)
+    elseif(MKW_PGO STREQUAL "use")
+        target_compile_options(${target} PRIVATE "-fprofile-use=${MKW_PGO_PROFILE}"
+            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+    endif()
+endfunction()
+
+# The executable link pulls in the profile runtime.
+function(mkw_apply_pgo_link target)
+    if(MKW_PGO STREQUAL "generate")
+        target_link_options(${target} PRIVATE -fprofile-generate)
+    endif()
+endfunction()
+
 function(mkw_apply_common_compile_options target)
     target_compile_options(${target} PRIVATE -O3 -ffast-math -w -pipe)
+    mkw_apply_pgo(${target})
+    if(MKW_PGO STREQUAL "generate")
+        # Turns on src/pgo_profile_dump.cpp, which writes the profile when the run is stopped.
+        target_compile_definitions(${target} PRIVATE MKW_PGO_GENERATE=1)
+    endif()
 endfunction()
 
 function(mkw_apply_baseline_arch target)

@@ -38,6 +38,11 @@ endif()
 function(mkw_apply_translated_compile_options target)
     target_compile_options(${target} PRIVATE
         -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize -w -pipe)
+    # Retro Rewind's translated code compiles about five times slower instrumented (each of its 48
+    # shards took over 20 minutes), so it is left out of PGO and built as usual.
+    if(NOT target STREQUAL "mkw_retro_rewind_functions")
+        mkw_apply_pgo(${target})
+    endif()
     # Hot-cold splitting builds any function it judges cold for size, and the machine outliner then
     # breaks it up. Checked-memory builds have too many false "cold" verdicts for that to be safe.
     if(NOT MKW_GUEST_FLAT_CHECKED_ONLY)
@@ -191,6 +196,7 @@ function(mkw_configure_product target)
         SDL_MAIN_HANDLED _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION TARGET_PC)
     target_compile_features(${target} PRIVATE cxx_std_20)
     mkw_apply_common_compile_options(${target})
+    mkw_apply_pgo_link(${target})
     target_link_libraries(${target} PRIVATE
         mkw_platform mkw_base_shared mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
 

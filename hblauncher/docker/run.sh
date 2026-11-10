@@ -14,8 +14,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 HBL_ROOT="$(cd "${HBL_ROOT:?Set HBL_ROOT to your HBLauncher checkout}" && pwd)"
-# Tagged by the Dockerfile's hash, so a changed Dockerfile builds a new image.
-IMAGE="wiicompiled-hbx-build:$(shasum -a 256 "$HERE/docker/Dockerfile" | cut -c1-12)"
+# Tagged by the Dockerfile's hash, so a changed Dockerfile builds a new image. HBX_IMAGE picks
+# another, already built image instead.
+IMAGE="${HBX_IMAGE:-wiicompiled-hbx-build:$(shasum -a 256 "$HERE/docker/Dockerfile" | cut -c1-12)}"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker build -t "$IMAGE" "$HERE/docker"
 TTY=(); [[ -t 0 ]] && TTY=(-it)
 if [[ "${1:-}" == launcher ]]; then

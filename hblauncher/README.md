@@ -37,8 +37,9 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 6.13.4:
 
 - Retro Rewind boots, and menus, offline races and saves work.
-- Offline races run near 60 FPS in lighter stretches (measured at 1.5× resolution); Toad's
-  Factory measured 59.4 FPS at 97.7% game speed. It isn't a steady 60 (see known issues).
+- Offline races at 60 FPS with [PGO](#faster-races-with-pgo-optional-recommended): Wii U Mario
+  Stadium with 12 CPUs stayed at 60 for 97% of the race (1.5× resolution), and the other tracks
+  tried held 60 too. Without PGO, busy stretches run in the mid 50s (see known issues).
 - Online play on Retro WFC works, including online races.
 - Returning to HBLauncher, then launching the game again.
 - Plain Mario Kart Wii (experimental) boots from a new NAND and runs offline races, more slowly.
@@ -47,12 +48,13 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 
 - **A PC has to stay on.** Every file is read from and written to your PC over the network through HBLauncher's file server. There's no SD card support and no play away from home, and ns2jb needs both the PC and the console on Ethernet.
 - **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the SmileBASIC program that keeps the session alive. The game keeps running for about two minutes, then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick click**.
-- **Offline isn't a steady 60 FPS.** Full 12-kart races run in the mid 50s in the pack and near 60 in first place, and busy parts of some detailed custom tracks drop into the low 50s. Offline the game draws every frame, so in those moments it also runs slightly slower than normal speed.
+- **Without PGO, offline isn't a steady 60 FPS.** Full 12-kart races run in the mid 50s in the pack and near 60 in first place, and busy parts of some detailed custom tracks drop into the low 50s. Offline the game draws every frame, so in those moments it also runs slightly slower than normal speed. The PGO build held 60 in the races tested, on one console.
 - **Change the resolution outside races.** Changing it during a race breaks the graphics until you restart the game; changing it in the game's menus works.
 - **Online can look choppy.** Online keeps Retro Rewind's frame skip so the game always runs at full speed, which means busy moments can drop to about 30 FPS.
 - **After a crash, restart SmileBASIC.** The game shares SmileBASIC's process with HBLauncher, so memory a crashed game didn't free is still taken. Launching again in the same session can fail at start-up or close SmileBASIC with a system error. Close SmileBASIC, open it again, and start a new runner and 4/4 session.
 - **Plain Mario Kart Wii is slower in races.** Busy stretches, such as Mario Circuit's countdown, lock to 30 FPS and the game slows down. Both games need about the same work per frame there (16–18 ms against a 16.7 ms budget). Retro Rewind runs its own frame loop, where this port draws every tick, so a frame that is slightly late just shows late: Mario Circuit averaged 57 FPS. Plain Mario Kart Wii waits for the next screen refresh after each frame, as on a Wii, so a frame 1 ms late waits a whole extra refresh (33 ms): it averaged 50 FPS, with long stretches at 30. Fixing it means changing how the runtime paces screen refreshes for plain Mario Kart Wii.
 - **The first visit to a place stutters** while shaders build; they're cached after that. The first boot can wait a few minutes for this.
+- **A short dip just before the countdown.** During a race's intro the game uploads the track's textures, and on a new track builds its shaders, which costs a second at about 45–55 FPS. It happens with and without PGO.
 - **Retro Rewind updates need a rebuild.** Every update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
 - **Only built on an Apple Silicon Mac.** The scripts should also work on aarch64 Linux, but I haven't tried.
 - **Updates elsewhere can break it.** It may stop working after an HBLauncher, ns2jb, firmware or Retro Rewind update. It was tested with HBLauncher `18b4748` and ns2jb `81d5bb1`, patched as in step 2.
@@ -350,6 +352,37 @@ console data, is ignored by Git, and should never be shared:
 | `hbxl-env` | options read at launch (see below) |
 | `icon.png` | optional launcher icon; add your own |
 
+### Faster races with PGO (optional, recommended)
+
+Profile-guided optimization (PGO) rebuilds the game around the code a real race runs. On one
+console it cut the game's work per race frame by about a quarter and kept the races tested at
+60 FPS (see [VALIDATION.md](VALIDATION.md)). It takes a 15-minute recording that plays itself,
+then one more build. In the same terminal as step 5:
+
+```sh
+cd ~/Switch2/WiiCompiled-Switch2
+hblauncher/tools/pgo.sh
+hblauncher/docker/run.sh build -DMKW_PGO=use -DMKW_PGO_PROFILE=/opt/work/pgo/retro-rewind.profdata
+hblauncher/docker/run.sh pack
+rm -rf "$HBL_ROOT/apps/wiicompiled-rr"
+python3 hblauncher/build.py install
+```
+
+What each does:
+
+- `pgo.sh`: builds the desktop version with recording turned on, plays it headless and offline in
+  Docker for 15 minutes (it presses A through the menus into a Grand Prix), and saves what ran as
+  `retro-rewind.profdata` in the Docker volume. It works on copies of your save and NAND inside
+  the container, so `hblauncher/fsroot/` doesn't change.
+- `build` and `pack`: build the console app again, using the recording.
+- `rm -rf` and `install`: replace the installed app. That folder holds only the built game; your
+  saves stay in `hblauncher/fsroot/`.
+
+Later `build` runs keep using the recording; add `-DMKW_PGO=` to build without it. After a new
+`translate` (a Retro Rewind update, say), run `pgo.sh` again first: an old recording no longer
+matches. Retro Rewind's own code isn't recorded, because instrumenting it made each of its files
+take over 20 minutes to compile; the base game and the runtime are.
+
 ### 6. Play
 
 Create `hblauncher/fsroot/session.env` with the two lines `setup-session.py` printed, for example:
@@ -436,6 +469,7 @@ sets their starting values, one `NAME=value` per line:
 | `MKW_RACE_WORKER=0` | on | Starts with the race GX worker off. The worker records graphics commands on the game thread and replays them on another core during offline races. It may improve race performance, but its effect hasn't been fully verified. |
 | `MKW_FRAME_SKIP=1` | off | Starts with Retro Rewind's frame skip on in offline races. Online and outside races it's always on. |
 | `MKW_PERF_STATS=1` | off | Logs FPS and frame timing. |
+| `MKW_IRQ_FOLLOW_THREAD=0` | on | Turns off the fix that keeps each game thread's interrupt state across thread switches. Only useful for comparing performance. |
 | `AURORA_PIPELINE_THREADS=N` | `2` | Threads that build shaders (0–4; `0` builds on the frame thread). Only 2 has been measured. |
 | `HBXL_TRACE=1` | off | Logs every system call the runtime doesn't implement. Very slow; debugging only. |
 
@@ -524,8 +558,11 @@ on Dawn's Null backend, with `SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy`
   used here through [kurumuz's fork](https://gitlab.com/kurumuz/ns2jb). It opens the console
   session; this port adds the memory-loading commands HBLauncher needs to start apps.
 - **[DriftDroid](https://github.com/dorPXP/driftdroid)** by dorPXP: the Android and Switch 1 port of
-  WiiCompiled. Its native THP video decoder and lighting helper are used here, adapted, and its
-  notes and fixes helped throughout.
+  WiiCompiled. Its native THP video decoder, lighting helper and thread-switch interrupt fix are
+  used here, adapted, and its notes and fixes helped throughout.
+- **[KartPadNX](https://github.com/KawaiiBunga/KartPadNX)** by KawaiiBunga, another Switch 1 port
+  of WiiCompiled. Building with PGO came from KartPadNX and DriftDroid, which both use it; the
+  setup here is this port's own, with [LLVM](https://llvm.org)'s profile tools.
 - **[Retro Rewind](https://wiki.tockdom.com/wiki/Retro_Rewind)** by ZPL and team, and
   **[Retro WFC](https://rwfc.net)**, the online service it plays on; you use their files and
   servers with your own copy.

@@ -33,4 +33,9 @@ RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
     && ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet && rm /tmp/dotnet-install.sh
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 
+# Clang's profile runtime, for PGO recording builds (tools/pgo.sh). A layer of its own, so the
+# layers above stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends libclang-rt-22-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/work
