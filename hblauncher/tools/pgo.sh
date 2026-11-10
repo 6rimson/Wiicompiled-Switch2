@@ -7,11 +7,10 @@
 # 2. Plays it headless and offline in Docker for <seconds> (default 900): MKW_AUTOPAD=1 presses A
 #    through the menus into a Grand Prix. Your save and NAND are copied into the throwaway
 #    container, so nothing in fsroot changes.
-# 3. Merges the recording into /opt/work/pgo/<product>.profdata in the build volume.
+# 3. Merges the recording into hblauncher/pgo/<product>.profdata.xz, the profile `build` uses.
 #
-# Then build the console app with it:
-#   hblauncher/docker/run.sh build -DMKW_PGO=use -DMKW_PGO_PROFILE=/opt/work/pgo/<product>.profdata
-# A new translation (a new Retro Rewind, say) needs a new recording.
+# The profile covers the base game and the runtime, so a new Retro Rewind doesn't need a new one;
+# re-record after larger changes to the runtime or the translator. Then build and pack again.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ -f "$HERE/fsroot/session.env" ]]; then
@@ -40,7 +39,9 @@ esac
 
 # The same image and volume as docker/run.sh.
 IMAGE="${HBX_IMAGE:-wiicompiled-hbx-build:$(shasum -a 256 "$HERE/docker/Dockerfile" | cut -c1-12)}"
-MOUNTS=(-v "${HBX_VOLUME:-wiicompiled-hbx}:/opt/work" -v "$ROOT:/host-fsroot:ro" -v "$ROOT/disc:/disc:ro")
+mkdir -p "$HERE/pgo"
+MOUNTS=(-v "${HBX_VOLUME:-wiicompiled-hbx}:/opt/work" -v "$ROOT:/host-fsroot:ro" -v "$ROOT/disc:/disc:ro"
+        -v "$HERE/pgo:/out")
 if [[ -d "$ROOT/RetroRewind/RetroRewind6" ]]; then
   MOUNTS+=(-v "$ROOT/RetroRewind/RetroRewind6:/RetroRewind/RetroRewind6:ro")
 fi
@@ -66,11 +67,8 @@ MKW_AUTOPAD=1 MKW_PERF_STATS=1 SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy
   LLVM_PROFILE_FILE=$RAW/%p.profraw timeout -s TERM "$PLAY" /app/$TARGET \
   > /opt/work/pgo/$PRODUCT-record.log 2>&1 || true
 ls $RAW/*.profraw >/dev/null 2>&1 || { echo "No recording was written; see /opt/work/pgo/$PRODUCT-record.log"; exit 1; }
-echo "races started: $(grep -a -c "New race started" /opt/work/pgo/$PRODUCT-record.log || true)"
-# Functions with internal linkage are named after their file, which sits in the desktop build
-# directory; rename them to the console one, or the console build would not find their counts.
-llvm-profdata-22 merge --text -o /tmp/merged.proftext $RAW/*.profraw
-sed "s#^/opt/work/build/desktop/#/opt/work/build/console/#" /tmp/merged.proftext > /tmp/console.proftext
-llvm-profdata-22 merge -o /opt/work/pgo/$PRODUCT.profdata /tmp/console.proftext
-echo "Profile: /opt/work/pgo/$PRODUCT.profdata"
+echo "seconds spent racing: $(grep -a -c "race ticks [1-9]" /opt/work/pgo/$PRODUCT-record.log || true)"
+llvm-profdata-22 merge -o /tmp/$PRODUCT.profdata $RAW/*.profraw
+xz -9 -c /tmp/$PRODUCT.profdata > /out/$PRODUCT.profdata.xz
+echo "Profile: hblauncher/pgo/$PRODUCT.profdata.xz"
 '

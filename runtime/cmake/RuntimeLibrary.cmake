@@ -48,11 +48,16 @@ elseif(NOT MKW_PGO STREQUAL "" AND NOT MKW_PGO STREQUAL "generate" AND NOT MKW_P
     message(FATAL_ERROR "MKW_PGO must be empty, generate or use, not ${MKW_PGO}")
 endif()
 
+# Functions with internal linkage are named "<file>;<name>" in a profile; by default <file> is the
+# full path, which holds the build directory. Naming them by the file name alone lets a profile
+# recorded in the desktop build match the console build, on any machine (as KartPadNX does).
 function(mkw_apply_pgo target)
     if(MKW_PGO STREQUAL "generate")
-        target_compile_options(${target} PRIVATE -fprofile-generate)
+        target_compile_options(${target} PRIVATE -fprofile-generate
+            "SHELL:-mllvm -static-func-full-module-prefix=false")
     elseif(MKW_PGO STREQUAL "use")
         target_compile_options(${target} PRIVATE "-fprofile-use=${MKW_PGO_PROFILE}"
+            "SHELL:-mllvm -static-func-full-module-prefix=false"
             -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
     endif()
 endfunction()

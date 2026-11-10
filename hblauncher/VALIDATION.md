@@ -13,7 +13,7 @@ below is the current one.
 | Patched musl toolchain (`build.py toolchain`) | arm64 Ubuntu 24.04 container on Apple Silicon | builds (GCC 15.1.0, musl 1.2.6 with HBLauncher's syscall hooks, BTI target libraries) |
 | `deps`: Dawn, SDL3 and HBLauncher SDK patches | same | all apply cleanly at their pins |
 | `runtime`: `libhbxl.a` with the HBLauncher runtime patches of the time | same | builds |
-| `translate --online`: base 29,637 + Retro Rewind 6.13.4 4,005 functions, Retro-WFC payload signature | same | ok |
+| `translate --online`: the base game and Retro Rewind, with the Retro-WFC payload signature | same | ok |
 | `build` (console variant): static aarch64-linux-musl, BTI, `hbxl.ld`, `libhbxl.a` | same | links; code 127,315,552 B at `0x40000000`, data region 3,109,200 B at `0x50000000` |
 | `pack` | same | `code.bin`, `data.bin`, `report.json` |
 | `tools/check-package.cjs`: HBLauncher's `loadPackage` (manifest, ABI, sizes, hashes) | macOS host, Node | ok |
@@ -24,19 +24,33 @@ below is the current one.
 ## On a Switch 2
 
 Tested on one console, with HBLauncher `18b4748`, ns2jb `81d5bb1`,
-Retro Rewind 6.13.4 and the file server on an Apple Silicon Mac on the same home network.
+Retro Rewind 6.13.5 and the file server on an Apple Silicon Mac on the same home network. Some
+races below ran on 6.13.4, the release before, as noted.
 
 | What | Result |
 |---|---|
 | Launch from HBLauncher, boot to Retro Rewind's menus | works |
 | Rendering, audio, controller input | works |
 | Saves, through the file server | works |
-| Offline races, defaults (CPU boost, race GX worker, frame skip off) at 1.5× | near 60 FPS in lighter stretches; full 12-kart races in the mid 50s in the pack and near 60 in first place; low 50s in busy parts of some custom tracks |
 | Retro WFC online, including races (frame skip on) | works |
 | Return to HBLauncher and launch again | works |
-| Thread-switch interrupt fix, same race with `MKW_IRQ_FOLLOW_THREAD=0` and without (150cc, 12 CPUs, SW2 Peach Circuit) | 56.8 → 58.0 FPS on average; seconds under 55 FPS 24% → 7% |
-| PGO build against the build before it (150cc, 12 CPUs, Wii U Mario Stadium) | 55.6 → 59.8 FPS on average; seconds at 60 FPS 19% → 97%; game work per frame 17.1 → 12.4 ms. The race without PGO came late in a long session, the PGO race after a fresh start |
-| PGO build, more offline races in one session, including a relaunch from HBLauncher | 60 FPS once racing; a dip to 40–55 FPS for about a second before the countdown, as without PGO |
+| Thread-switch interrupt fix, same race with `MKW_IRQ_FOLLOW_THREAD=0` and without (150cc, 12 CPUs, SW2 Peach Circuit, 6.13.4) | 56.8 → 58.0 FPS on average; seconds under 55 FPS 24% → 7%. The race without the fix ran at 1.5× resolution, the one with it at 2× |
+| PGO build, more offline races in one session at 1.5×, including a relaunch from HBLauncher (6.13.4) | 60 FPS once racing; a dip to 40–55 FPS for about a second before the countdown, as without PGO |
+| PGO build, three Retro WFC online races (frame skip on) | 59.8–60.0 FPS on average at 1.5×; 93%, 97% and 99% of seconds at 60 FPS |
+| `session.sh launcher` started again in a SmileBASIC session where the game had already run, then a game launch | closed SmileBASIC both times; relaunching from HBLauncher's menu worked all 3 times. `session.sh launcher` now refuses this |
+
+PGO, on Wii U Mario Stadium (150cc, 12 CPUs, one race each):
+
+| Build | Average FPS | Time at 60 FPS | Game work per frame |
+|---|---|---|---|
+| Before PGO, 2× | 55.6 | 19% | 17.1 ms |
+| PGO, 2× | 58.7 | 74% | 12.9 ms |
+| PGO, 1.5× | 59.8 | 97% | 12.4 ms |
+| PGO, 1.5×, again | 58.5 | 64% | 13.8 ms |
+
+PGO cut the work per frame by about a quarter. The resolution made little difference; the dips came
+where many karts were on screen (up to about 500 draws a frame, 16–19 ms), and at the start. The
+race before PGO and the first PGO race at 1.5× were on Retro Rewind 6.13.4, the others on 6.13.5.
 
 ## HBLauncher and ns2jb setup
 
@@ -83,8 +97,8 @@ The fresh packages aren't byte-identical to the one played on the console before
 cause wasn't tracked down.
 
 On the console, the fresh setup with a brand-new NAND and no save: Retro Rewind boots,
-creates its own NAND and settings, reaches the menus and runs offline races at about 60 FPS
-(mid 50s in a full 12-kart pack), and returns to HBLauncher cleanly. This run found and fixed two
+creates its own NAND and settings, reaches the menus and runs offline races at about 60 FPS,
+and returns to HBLauncher cleanly. This run found and fixed two
 problems a new player would hit: the new NAND's `setting.txt` couldn't be created (no hard links
 over the file server), and building the starter pipeline cache at start-up ran out of memory.
 Changing the resolution to 1.5× during a race broke the graphics; changing it in the menus didn't.
@@ -118,6 +132,16 @@ pipelines were being built during the race. The difference is pacing: plain Mari
 for the next screen refresh after each frame, so a frame slightly over 16.7 ms takes 33 ms; the
 countdown ran at exactly 30 FPS and half game speed. Retro Rewind's own loop, where the port
 draws every tick, shows a late frame late instead.
+
+With PGO (its own profile), on a new fsroot at 1.5×:
+
+| Mario Circuit | Average FPS | Notes |
+|---|---|---|
+| Before PGO (above) | 50.0 | long stretches at 30 FPS |
+| PGO, first race | — | stuttered while building about 400 shaders; 23 of its 25 slow seconds came while shaders were building |
+| PGO, second race | 59.1 | 84% of the time at 60 FPS, 6 slow seconds, 10.8 ms per frame; stopped after 107 seconds of racing |
+
+No stretch locked to 30 FPS.
 
 ## Not tested
 

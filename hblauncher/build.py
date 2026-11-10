@@ -62,6 +62,8 @@ def retro_rewind():
 DEPS = Path(os.environ.get("HBX_DEPS", HERE / "deps"))
 BUILD = Path(os.environ.get("HBX_BUILD", HERE / "build"))
 PATCHES = HERE / "patches"
+# Shipped PGO profiles, <product>.profdata.xz, recorded with tools/pgo.sh.
+PGO_DIR = HERE / "pgo"
 FS_HOST = os.environ.get("HBX_FS_HOST", "10.42.0.1")
 TRANSLATOR = REPO / "translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll"
 RR_PACK = REPO / "PulsarPacks/completed/RetroRewind/RetroRewind6"
@@ -301,8 +303,28 @@ def link_flags(variant, build):
         f"-Wl,--whole-archive {lib} -Wl,--no-whole-archive"])
 
 
+def pgo_args(variant, extra):
+    """Build the console app with the shipped PGO profile, unless the command line sets MKW_PGO."""
+    if any(arg.startswith("-DMKW_PGO") for arg in extra):
+        return []
+    shipped = PGO_DIR / f"{PRODUCT_NAME}.profdata.xz"
+    if variant != "console" or not shipped.exists():
+        return ["-DMKW_PGO="]
+    import lzma
+    data = lzma.decompress(shipped.read_bytes())
+    # The content hash is in the name: clang doesn't track the profile as a dependency, so a new
+    # profile has to change the compile command to rebuild what it covers.
+    profile = BUILD / "pgo" / f"{PRODUCT_NAME}-{hashlib.sha256(data).hexdigest()[:12]}.profdata"
+    if not profile.exists():
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_bytes(data)
+    print(f"PGO profile: {shipped.name}")
+    return ["-DMKW_PGO=use", f"-DMKW_PGO_PROFILE={profile}"]
+
+
 def build(variant, jobs, extra):
     require_linux_aarch64()
+    extra = [*pgo_args(variant, extra), *extra]
     required("HBXL_TOOLCHAIN", "bin/aarch64-linux-musl-gcc")
     if not (REPO / "generated/build_shards/shards.cmake").exists():
         raise SystemExit("Translate first: build.py translate [--online]")

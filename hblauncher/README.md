@@ -21,40 +21,31 @@ A built package contains translated game code, so please don't share one either.
 
 ## Status
 
-This is an experimental project built on the homebrew tools available in November 2026
-(HBLauncher `18b4748`, ns2jb `81d5bb1`). Newer homebrew launchers will likely make this way of
-running it obsolete; if that happens, I'll point to them here and archive this repository. The
-WiiCompiled fixes and the Switch 2 notes in this repository should still be useful to whoever
-ports it next.
-
-The main build is Retro Rewind. Plain Mario Kart Wii (WiiCompiled without Retro Rewind) also
-builds and runs, but it's **experimental**: it's slower in races, for the reason under known issues.
-Only the PAL disc is supported.
+Built on HBLauncher `18b4748` and ns2jb `81d5bb1` (November 2026). The main build is Retro Rewind;
+plain Mario Kart Wii also works but is experimental. PAL disc only.
 
 ## What works
 
 Tested on one Switch 2, with the defaults below, a PC on the same home network, and Retro Rewind
-6.13.4:
+6.13.5:
 
-- Retro Rewind boots, and menus, offline races and saves work.
-- Offline races at 60 FPS with [PGO](#faster-races-with-pgo-optional-recommended): Wii U Mario
-  Stadium with 12 CPUs stayed at 60 for 97% of the race (1.5× resolution), and the other tracks
-  tried held 60 too. Without PGO, busy stretches run in the mid 50s (see known issues).
-- Online play on Retro WFC works, including online races.
-- Returning to HBLauncher, then launching the game again.
-- Plain Mario Kart Wii (experimental) boots from a new NAND and runs offline races, more slowly.
+- Retro Rewind boots; menus, offline races, online races on Retro WFC and saves work.
+- Races run at or near 60 FPS, thanks to [PGO](#pgo). Busy moments with lots of karts on screen can
+  dip to the mid 50s, briefly lower in the busiest ones. The numbers are in
+  [VALIDATION.md](VALIDATION.md).
+- Returning to HBLauncher and launching again.
+- Plain Mario Kart Wii (experimental) boots and runs offline races near 60 FPS.
 
 ## Known issues
 
 - **A PC has to stay on.** Every file is read from and written to your PC over the network through HBLauncher's file server. There's no SD card support and no play away from home, and ns2jb needs both the PC and the console on Ethernet.
 - **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the SmileBASIC program that keeps the session alive. The game keeps running for about two minutes, then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick click**.
-- **Without PGO, offline isn't a steady 60 FPS.** Full 12-kart races run in the mid 50s in the pack and near 60 in first place, and busy parts of some detailed custom tracks drop into the low 50s. Offline the game draws every frame, so in those moments it also runs slightly slower than normal speed. The PGO build held 60 in the races tested, on one console.
+- **Not a locked 60 FPS.** Busy moments with lots of karts on screen dip to the mid 50s, briefly lower in the busiest ones, and there's a short dip right before the countdown. Offline, the game also runs slightly slower than normal speed in those moments.
 - **Change the resolution outside races.** Changing it during a race breaks the graphics until you restart the game; changing it in the game's menus works.
-- **Online can look choppy.** Online keeps Retro Rewind's frame skip so the game always runs at full speed, which means busy moments can drop to about 30 FPS.
-- **After a crash, restart SmileBASIC.** The game shares SmileBASIC's process with HBLauncher, so memory a crashed game didn't free is still taken. Launching again in the same session can fail at start-up or close SmileBASIC with a system error. Close SmileBASIC, open it again, and start a new runner and 4/4 session.
-- **Plain Mario Kart Wii is slower in races.** Busy stretches, such as Mario Circuit's countdown, lock to 30 FPS and the game slows down. Both games need about the same work per frame there (16–18 ms against a 16.7 ms budget). Retro Rewind runs its own frame loop, where this port draws every tick, so a frame that is slightly late just shows late: Mario Circuit averaged 57 FPS. Plain Mario Kart Wii waits for the next screen refresh after each frame, as on a Wii, so a frame 1 ms late waits a whole extra refresh (33 ms): it averaged 50 FPS, with long stretches at 30. Fixing it means changing how the runtime paces screen refreshes for plain Mario Kart Wii.
-- **The first visit to a place stutters** while shaders build; they're cached after that. The first boot can wait a few minutes for this.
-- **A short dip just before the countdown.** During a race's intro the game uploads the track's textures, and on a new track builds its shaders, which costs a second at about 45–55 FPS. It happens with and without PGO.
+- **Online can dip briefly.** Online keeps Retro Rewind's frame skip, so a slow moment skips frames instead of slowing the game down. With PGO it's rare.
+- **Restart SmileBASIC after a crash or a new install.** The game shares SmileBASIC's process with HBLauncher, so memory it didn't free stays taken, and the next launch can close SmileBASIC. Close SmileBASIC, open it again, and start a new runner and 4/4 session. To play again normally, relaunch from HBLauncher's menu; `session.sh launcher` refuses to start a second time in a session where the game already ran.
+- **Plain Mario Kart Wii can drop to 30 FPS.** Like a real Wii, it waits for the screen refresh, so a frame that's slightly late costs a whole extra frame. PGO keeps frames fast enough that this rarely happens.
+- **New places stutter the first time** while their shaders build; they're saved after that. A new install stutters a lot in its first races. Each launch also spends about half a minute rebuilding the saved shaders, so wait on the title screen before racing.
 - **Retro Rewind updates need a rebuild.** Every update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
 - **Only built on an Apple Silicon Mac.** The scripts should also work on aarch64 Linux, but I haven't tried.
 - **Updates elsewhere can break it.** It may stop working after an HBLauncher, ns2jb, firmware or Retro Rewind update. It was tested with HBLauncher `18b4748` and ns2jb `81d5bb1`, patched as in step 2.
@@ -128,13 +119,8 @@ versions haven't been tested with this port's patches.
 
 ### 2. Prepare HBLauncher and ns2jb
 
-These patches let HBLauncher load executable code and writable app data into the running
-SmileBASIC process. They provide the missing loader compatibility; the game-specific runtime fixes
-are documented separately below.
-
-HBLauncher at our pinned commit `18b4748` asks ns2jb to map memory ranges (commands
-`0x524f001a`–`0x524f001c`) that ns2jb `81d5bb1` doesn't implement, so a launch fails with
-`Unknown process probe`. This port patches both sides, and one script prepares them:
+HBLauncher and ns2jb both need a patch before they can load this game (without them a launch fails
+with `Unknown process probe`). One script prepares both:
 
 ```sh
 cd ~/Switch2/WiiCompiled-Switch2
@@ -293,7 +279,8 @@ What each does:
 - `runtime`: builds HBLauncher's Linux runtime library (`libhbxl.a`).
 - `translate --online`: translates the base game and Retro Rewind. Leave out `--online` for
   offline only (then the payload isn't needed).
-- `build`: compiles and links the game for the console (up to 30 minutes).
+- `build`: compiles and links the game for the console (up to 30 minutes), optimized with the
+  recorded profile in `hblauncher/pgo/` (see [PGO](#pgo)).
 - `pack`: makes the HBLauncher package in `hblauncher/dist/wiicompiled-rr`.
 
 **You should see** `pack` end with `Package: …/hblauncher/dist/wiicompiled-rr`. Running a failed step
@@ -303,10 +290,8 @@ That builds Retro Rewind. To build plain Mario Kart Wii (experimental) instead, 
 with `--product wiicompiled` and without `--online`; see
 [Plain Mario Kart Wii](#plain-mario-kart-wii-experimental) below.
 
-You don't need to set your Mac's network address anywhere. The game reads its files from your Mac,
-so it needs that address, but each time you start the file server (step 6) it looks up your Mac's
-current address and writes it into the installed game. That keeps working even when your router
-gives the Mac a new address.
+You don't need to set your Mac's address: the file server (step 6) writes it into the installed game
+each time it starts.
 
 ### 5. Install
 
@@ -351,37 +336,6 @@ console data, is ignored by Git, and should never be shared:
 | `etc/resolv.conf` | the DNS servers the game uses to find Retro WFC (`1.1.1.1`, `8.8.8.8`); edit it to use others |
 | `hbxl-env` | options read at launch (see below) |
 | `icon.png` | optional launcher icon; add your own |
-
-### Faster races with PGO (optional, recommended)
-
-Profile-guided optimization (PGO) rebuilds the game around the code a real race runs. On one
-console it cut the game's work per race frame by about a quarter and kept the races tested at
-60 FPS (see [VALIDATION.md](VALIDATION.md)). It takes a 15-minute recording that plays itself,
-then one more build. In the same terminal as step 5:
-
-```sh
-cd ~/Switch2/WiiCompiled-Switch2
-hblauncher/tools/pgo.sh
-hblauncher/docker/run.sh build -DMKW_PGO=use -DMKW_PGO_PROFILE=/opt/work/pgo/retro-rewind.profdata
-hblauncher/docker/run.sh pack
-rm -rf "$HBL_ROOT/apps/wiicompiled-rr"
-python3 hblauncher/build.py install
-```
-
-What each does:
-
-- `pgo.sh`: builds the desktop version with recording turned on, plays it headless and offline in
-  Docker for 15 minutes (it presses A through the menus into a Grand Prix), and saves what ran as
-  `retro-rewind.profdata` in the Docker volume. It works on copies of your save and NAND inside
-  the container, so `hblauncher/fsroot/` doesn't change.
-- `build` and `pack`: build the console app again, using the recording.
-- `rm -rf` and `install`: replace the installed app. That folder holds only the built game; your
-  saves stay in `hblauncher/fsroot/`.
-
-Later `build` runs keep using the recording; add `-DMKW_PGO=` to build without it. After a new
-`translate` (a Retro Rewind update, say), run `pgo.sh` again first: an old recording no longer
-matches. Retro Rewind's own code isn't recorded, because instrumenting it made each of its files
-take over 20 minutes to compile; the base game and the runtime are.
 
 ### 6. Play
 
@@ -431,8 +385,7 @@ Each session goes like this; open three terminal windows in `~/Switch2/WiiCompil
    HBLauncher appears on the console; pick **Retro Rewind**. The first boot waits a few minutes on
    a shader screen (L + R + right stick opens the settings there), then the game starts.
 
-Keep the server and runner running while you play. While the runner is alive, `launcher` reuses
-the open session without a new 4/4. HBLauncher on its own stops after about 15 minutes in its menu
+Keep the server and runner running while you play. To play again, relaunch from HBLauncher's menu. HBLauncher on its own stops after about 15 minutes in its menu
 (64 launcher turns); `session.sh launcher` asks for 10,000 turns, about 40 hours, instead. Add
 `--entries N` to choose another limit. Pause is on **Minus**; never press **Plus** (see known
 issues). HBLauncher writes its own log to `~/Switch2/HBLauncher/build/hbl-session.log`.
@@ -442,7 +395,7 @@ issues). HBLauncher writes its own log to `~/Switch2/HBLauncher/build/hbl-sessio
 `--product wiicompiled` builds the game without Retro Rewind as a separate app, **Mario Kart Wii**,
 with its own file-server folder (`hblauncher/fsroot-wiicompiled/`). Its HBLauncher app is defined in
 `hblauncher/app-wiicompiled/`, next to Retro Rewind's in `hblauncher/app/`. It's offline only (Retro WFC
-is part of Retro Rewind) and slower in races; see known issues. Steps 1–3 are the same, without the
+is part of Retro Rewind) and built with its own PGO profile. Steps 1–3 are the same, without the
 Retro Rewind folder or payload:
 
 ```sh
@@ -460,22 +413,26 @@ The file server serves one game at a time; start it with the game you'll pick in
 
 ## Options
 
-The port's menu (**L + R + right stick click**) has the main switches. `hblauncher/fsroot/hbxl-env`
-sets their starting values, one `NAME=value` per line:
+Press **L + R + right stick click** in the game for the port's menu (D-pad to move and change, A to
+rebind a button, B to close):
 
-| Option | Default | What it does |
+| Setting | Default | Notes |
 |---|---|---|
-| `MKW_CPU_BOOST=N` | `1` | The console's CPU boost mode at launch: it raises the measured CPU clock from about 1107 MHz to about 1534 MHz, and every FPS figure in this README was measured with it on. `0` turns it off. |
-| `MKW_RACE_WORKER=0` | on | Starts with the race GX worker off. The worker records graphics commands on the game thread and replays them on another core during offline races. It may improve race performance, but its effect hasn't been fully verified. |
-| `MKW_FRAME_SKIP=1` | off | Starts with Retro Rewind's frame skip on in offline races. Online and outside races it's always on. |
-| `MKW_PERF_STATS=1` | off | Logs FPS and frame timing. |
-| `MKW_IRQ_FOLLOW_THREAD=0` | on | Turns off the fix that keeps each game thread's interrupt state across thread switches. Only useful for comparing performance. |
-| `AURORA_PIPELINE_THREADS=N` | `2` | Threads that build shaders (0–4; `0` builds on the frame thread). Only 2 has been measured. |
-| `HBXL_TRACE=1` | off | Logs every system call the runtime doesn't implement. Very slow; debugging only. |
+| Resolution | 1.0× | 1.5× (about 720p) and 2× run about the same. Change it in menus, not during a race. Saved. |
+| Show FPS | off | Saved. |
+| Volume | 100% | Saved. |
+| CPU boost | on | Raises the CPU from about 1107 to 1534 MHz. Every FPS figure here was measured with it on. |
+| Race GX worker | on | Moves graphics work off the game's main thread in offline races. |
+| Frame skip (offline) | off | Retro Rewind's frame skip in offline races. Online, it's always on. |
+| Buttons | A, B, X, Y as labelled | Rebind any button. Saved. |
 
-`UserData/Config.toml` holds the game's settings. Resolution starts at
-`resolution_multiplier = 1.0` (854×480); you can raise it, and 1.5 (about 720p) is what the FPS
-figures above were measured at. `gx_worker = true` (the default) is needed for the race worker.
+CPU boost, Race GX worker and Frame skip reset at each launch. To change what they start as, add a
+line to `hblauncher/fsroot/hbxl-env`: `MKW_CPU_BOOST=0`, `MKW_RACE_WORKER=0` or `MKW_FRAME_SKIP=1`.
+
+**For testing and debugging**, also in `hbxl-env`: `MKW_PERF_STATS=1` logs FPS and frame timing,
+`MKW_IRQ_FOLLOW_THREAD=0` turns off the interrupt fix for comparisons, `AURORA_PIPELINE_THREADS=N`
+sets the shader build threads (default 2), and `HBXL_TRACE=1` logs unimplemented system calls (very
+slow).
 
 ## How it differs from a desktop build
 
@@ -488,51 +445,40 @@ figures above were measured at. `gx_worker = true` (the default) is needed for t
   drivers (TP's SDL3 patch; HBLauncher sets `SDL_VIDEO_DRIVER`/`SDL_AUDIO_DRIVER`).
 - **Files:** every file is read and written over TCP through HBLauncher's file server. The app's
   own folder is the file-server root.
-- **Speed:** in Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
+- **Speed:** built with PGO (see below). In Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
   is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
   boost mode is on at launch (about 1534 MHz instead of 1107).
 
 ## Patches
 
-`patches/dawn-hbx-switch2.diff`, `patches/sdl3-hbx-switch2.diff` and
-`patches/aurora-hbx-switch2.diff` are RavensClawX's, from the Twilight Princess HBLauncher port,
-unchanged. The rest are this port's. Several were added while chasing a problem and were never
-tested on their own, so "why" says what was seen at the time, not that the patch is proven needed.
+The patches this port applies to HBLauncher, ns2jb, aurora, Dawn and SDL, and why each was added,
+are listed in [PATCHES.md](PATCHES.md).
 
-| Patch | Applies to | Why |
-|---|---|---|
-| `patches/hblauncher-runtime-file-locks.diff` | `sdk/linux/vfs.c` (the Linux runtime linked into the app) | `fcntl` record locks returned `EINVAL`, so SQLite could not open aurora's shader and pipeline caches, and shaders were rebuilt every session. One process owns all files, so the locks are granted. `build.py deps` applies it to its own copy of the SDK. |
-| `patches/hblauncher-runtime-fs-host.diff` | `sdk/linux/vfs.c` | The runtime had the file server's address fixed at `10.42.0.1` (HBLauncher's wired link). The link can now set it (`--defsym=HBXL_FS_HOST`), so the console can reach a PC on the home network. `build.py` takes it from `HBX_FS_HOST`. |
-| `patches/hblauncher-runtime-getcwd.diff` | `sdk/linux/vfs.c` | `getcwd` checked the wrong argument for the buffer size, so it always failed with `ERANGE` and the game aborted at start-up. |
-| `patches/hblauncher-runtime-main-stack.diff` | `sdk/linux/runtime.c` | System services can't read or write the Vulkan-backed pool, and SDK calls keep their request buffers on the caller's stack. It makes sure the main thread's 8 MiB stack comes from the SDK heap, which `OpenDefaultAudioOut` and other services need, whatever the page allocator does. |
-| `patches/hblauncher-runtime-file-modes.diff` | `sdk/linux/vfs.c` | `fchmod`, `fchmodat`, `fchownat` and `fchown` returned `ENOSYS`, so `std::filesystem::copy_file` stopped after creating its write-only target. Retro Rewind's save clone then left a 0-byte `banner.bin`, and the game showed a save-memory error when a race started. They now succeed as no-ops, and the runtime no longer passes a file's creation mode to the file server. |
-| `patches/hblauncher-runtime-fast-clock.diff` | `sdk/linux/runtime.c` | Every `clock_gettime` was a kernel call (`svc 0x1e`), and races made up to 30,000 per frame. The runtime now uses a direct counter read when `nn::os::GetSystemTick` itself does one, and answers `clock_gettime` first. |
-| `patches/hblauncher-runtime-thread-pin.diff` | `sdk/linux/thread.c` | Adds `hbxl_pin_next_thread`, so the GX, render and audio workers get their own cores. |
-| `patches/hblauncher-runtime-sockets.diff` | `sdk/linux/net.c` (new), `runtime.c`, `hbxl.h`, `sdk/tools/hbxl-build.py` | Linux socket syscalls on `nnsocket*`, through SDK-heap buffers, with console DNS. Needed for Retro WFC. |
-| `patches/hblauncher-runtime-net-fixes.diff` | `sdk/linux/net.c`, `thread.c` | The DNS resolver runs on an SDK-heap stack, because the system service can't read Vulkan-backed memory; skips musl's unused resolver slots; keeps one core free so a thread can always be placed. |
-| `patches/hblauncher-runtime-net-nonblock.diff` | `sdk/linux/net.c` | The console's socket API uses Linux's `O_NONBLOCK` (0x800), not BSD's 4, with BSD values for the rest. Non-blocking sockets are also tracked here, so one stuck read can't stop the game. |
-| `patches/hblauncher-runtime-net-trace.diff` | `sdk/linux/net.c` | Records the socket call in progress, so the freeze watchdog can show a call that never returned. |
-| `patches/aurora-hbx-pipeline-threads.diff` | `aurora-main/lib/gfx/pipeline_cache.cpp` (console build only) | `vkCreateGraphicsPipelines` failed with `VK_ERROR_UNKNOWN` on aurora's pipeline workers, whose stacks were in the runtime's Vulkan-backed pool. aurora now starts two workers with SDK-heap stacks. `AURORA_PIPELINE_THREADS` (0–4; 0 builds on the frame thread) and `AURORA_PIPELINE_STACK=default` in `hbxl-env` change that without a rebuild. `build.py build` applies it after TP's aurora patch. |
-| `patches/aurora-hbx-pipeline-retry.diff` | `aurora-main/lib/gx/gx.cpp`, `lib/gfx/pipeline_cache.cpp` (console build only) | The console's driver sometimes refused a GX pipeline (`VK_ERROR_UNKNOWN`, a different one each run), and aurora treated that as fatal. The failure is now caught with a Dawn error scope and logged with the largest free SDK-heap block; that pipeline's draws are skipped, and it's retried up to 5 times with a growing delay. |
-| `patches/aurora-hbx-no-boot-prune.diff` | `aurora-main/lib/gfx/pipeline_cache.cpp` | Cache pruning stopped the game for about 1.4 s over the file server, and the cache grows slowly, so it only runs on request. |
-| `patches/aurora-hbx-dawn-toggles.diff` | `aurora-main/lib/webgpu/gpu.cpp` (console build only) | Adds Dawn device toggles from `hbxl-env` (`AURORA_DAWN_ENABLE=a,b`, `AURORA_DAWN_DISABLE=a,b`), so driver experiments need no rebuild. Added to try `vulkan_monolithic_pipeline_cache` against early pipeline failures; that toggle made no difference, and none is set by default. |
-| `patches/aurora-hbx-device-lock.diff` | `aurora-main/lib/webgpu/gpu.cpp` (console build only) | Requests Dawn's `ImplicitDeviceSynchronization`. Without it Dawn's device has no lock, and aurora calls it from several threads. |
-| `patches/aurora-hbx-heap-block.diff`, `patches/dawn-hbx-image-info.diff` | aurora `lib/webgpu/gpu.cpp`, `lib/gfx`; Dawn `TextureVk.cpp` | Sets Dawn's heap block to 512 MiB (`AURORA_HBX_HEAP_BLOCK_MIB`). GPU copies into textures came out empty, apparently in Dawn's later 8 MiB blocks, which left much of the game black; with one large block everything rendered. Why the later blocks failed is still unknown. Also reports probe results per block. |
-| `patches/dawn-hbx-no-dedicated.diff` | Dawn `src/dawn/native/vulkan/TextureVk.cpp` (console build only) | Keeps images the driver only prefers to dedicate in Dawn's shared heaps. Added while large textures came out black, before the heap-block cause above was found; not tested without it since. |
-| `patches/aurora-hbx-lighting-safe.diff` | `aurora-main/lib/gx/shader.cpp` (console build only) | Makes aurora's integer lighting ignore NaN, Inf and zero-length normals instead of converting them, and takes DriftDroid's mask-and-compare version of the 24-bit indirect texture coordinate helper. Added while chasing black surfaces, before their real cause (the heap blocks above) was found. It's unproven whether the driver needs it; a build without it hasn't been tested. |
-| `patches/aurora-hbx-console-input.diff` | aurora `pad.cpp`, `fifo.cpp`, `THPDec.cpp`, `thp.h`, `aurora_thp.cmake` | Physical A/B/X/Y layout, FIFO thread on its own core, and `THPVideoFrameSize` for the native video decoder (both decoder pieces adapted from DriftDroid). |
-| `patches/aurora-hbx-fifo-spin.diff`, `patches/aurora-hbx-drain-spin.diff` | aurora `lib/gx/fifo.cpp` | The GX threads have cores of their own, so they poll briefly instead of sleeping, and wake the worker once per batch instead of once per command. This saved hundreds of kernel wake-ups per frame. |
-| `patches/aurora-hbx-release-gpu.diff`, `patches/aurora-hbx-device-destroy.diff` | aurora `lib/aurora.cpp`, `lib/webgpu/gpu.cpp` | The game shares its process with HBLauncher. Before returning to the launcher it frees everything on the GPU (leaving the window, input and audio alone), otherwise the next launch ran out of GPU memory. |
-| `patches/aurora-hbx-diagnostics.diff`, `patches/aurora-hbx-frame-timing.diff`, `patches/hblauncher-runtime-syscall-counts.diff` | aurora and `sdk/linux/runtime.c` | Counters for the `MKW_PERF_STATS=1` report: frame timing, skipped draws, texture uploads, all-zero uploads and syscalls. |
-| `patches/aurora-hbx-texture-debug.diff` | `aurora-main/lib/gx/shader.cpp` (console build only) | Debugging: `AURORA_HBX_DEBUG_TEXTURE=1`, `2` or `3` draws each surface's first, second or third texture directly, bypassing TEV; `=rast` draws its lit vertex colour. |
-| `patches/aurora-hbx-bind-diag.diff` | `aurora-main/lib/gx/gx.cpp`, `lib/gx/texture.cpp` (console build only) | Debugging: logs sampled texture slots that are empty, every upload 512 wide or larger, and large textures drawn from an EFB copy. |
-| `patches/aurora-hbx-texture-selftest.diff` | `aurora-main/lib/webgpu/gpu.cpp` (console build only) | Debugging: `AURORA_HBX_SELFTEST=1` uploads six texture sizes at start-up, with and without dedicated memory, and logs the readback and sampled results. |
-| `patches/aurora-hbx-frame-check.diff` | aurora (console build only) | Debugging: `AURORA_HBX_VERIFY=1` compares uploaded textures with the GPU's copy, and `AURORA_HBX_CAPTURE=1` saves screens and draw lists to `UserData/Captures`. Also pins the render worker. |
-| `patches/aurora-hbx-upload-probe.diff`, `patches/dawn-hbx-buffer-log.diff`, `patches/hblauncher-runtime-memory-log.diff` | aurora, Dawn, `sdk/linux/memory.c` | Debugging: `AURORA_HBX_PROBE=1` follows uploaded texture rows through staging, the copy and later use. The logs list memory types and what the staging buffer uses. |
-| `patches/hblauncher-host-range-mapping.diff` | HBLauncher `host/lib/target.cjs`, `preflight.cjs`, `host/start.cjs`, `tests/host/range-safety.test.cjs` (the PC side) | Maps the app with ns2jb's range commands, up to 64 MiB per request. Records a source as retained before mapping, tracks partial progress, checks every reply, and after an uncertain failure blocks further use of that session and writes a failure marker instead of retrying. Splits writes into 32 MiB pieces, since the RPC refuses more than 64 MiB per write and this app's code image is about 117 MiB. Prebuilt launches no longer need cross compilers. Applied by `tools/setup-session.py`. |
-| `patches/ns2jb-range-mapping.diff` | ns2jb `engine/switch2/ro/worker-control.cjs`, `payload/main.c`, `process.c`, new `hbl-range.h`, `tests/` | Adds map RX, map RW and unmap for page ranges (`0x524f001a`–`0x524f001c`) to the RPC dispatcher and the native helper. The helper checks the caller's identity, bounds, alignment, memory state and permissions, never asks for writable and executable memory together, and rolls back once if setting permissions fails. The exploit and bootstrap are unchanged. Includes 50 native scenarios and protocol tests. Applied, rebuilt and checked by `tools/setup-session.py`. |
+## PGO
 
-The runtime patches are applied by `build.py deps` and `build.py runtime`.
+Profile-guided optimization (PGO) builds the game around the code a real race runs. On one
+console it cut the game's work per race frame by about a quarter, from about 17 to 13 ms (see
+[VALIDATION.md](VALIDATION.md)). `build` does it automatically with the recorded
+profile in `hblauncher/pgo/retro-rewind.profdata.xz`. The profile holds no game code, only
+function names and how often each ran.
+
+The profile covers the base game and the runtime. Retro Rewind's own code isn't recorded, because
+instrumenting it made each of its files take over 20 minutes to compile, so a Retro Rewind update
+doesn't need a new profile. Code that changed since the recording just builds without PGO, so
+re-record after larger changes to the runtime or the translator:
+
+```sh
+hblauncher/tools/pgo.sh
+```
+
+It builds the desktop version with recording on, plays it headless and offline in Docker for
+15 minutes (pressing A through the menus into a Grand Prix), and writes a new
+`hblauncher/pgo/retro-rewind.profdata.xz`. It needs `hblauncher/fsroot/` (step 5), and works on
+copies of your save and NAND inside the container, so `fsroot` doesn't change. Then `build` and
+`pack` again.
+
+Add `-DMKW_PGO=` to `build` to build without PGO. Plain Mario Kart Wii has its own profile,
+`hblauncher/pgo/wiicompiled.profdata.xz`, recorded with `pgo.sh --product wiicompiled`.
 
 ## Other build options
 
@@ -561,8 +507,8 @@ on Dawn's Null backend, with `SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy`
   WiiCompiled. Its native THP video decoder, lighting helper and thread-switch interrupt fix are
   used here, adapted, and its notes and fixes helped throughout.
 - **[KartPadNX](https://github.com/KawaiiBunga/KartPadNX)** by KawaiiBunga, another Switch 1 port
-  of WiiCompiled. Building with PGO came from KartPadNX and DriftDroid, which both use it; the
-  setup here is this port's own, with [LLVM](https://llvm.org)'s profile tools.
+  of WiiCompiled. The idea to use PGO came from KartPadNX and DriftDroid; the setup here is this
+  port's own, with [LLVM](https://llvm.org)'s profile tools.
 - **[Retro Rewind](https://wiki.tockdom.com/wiki/Retro_Rewind)** by ZPL and team, and
   **[Retro WFC](https://rwfc.net)**, the online service it plays on; you use their files and
   servers with your own copy.
