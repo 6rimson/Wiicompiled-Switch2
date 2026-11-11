@@ -55,8 +55,8 @@ for line in open(sys.argv[2], errors="replace"):
         continue
     if event.get("message") == "open":
         current = str(event.get("data", {}).get("run", "")).endswith("/" + run)
-    elif event.get("message") == "launch" and current:
-        launched = True
+    elif current and event.get("message") in ("launch", "app finished", "app returned", "app launch failed"):
+        launched = True  # launchers started with --app log "app finished" instead of "launch"
 sys.exit(0 if launched else 1)
 EOF
     then

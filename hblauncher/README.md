@@ -358,9 +358,26 @@ When upgrading an older build, rerun the `setup-session.py` command for your lau
 a package produced by the updated `runtime`, `build` and `pack` steps.
 The regular `session.sh launcher` command prepares card access for the new package at launch.
 To use the server for all game files, add `MKW_SD=0` to `hblauncher/fsroot/hbxl-env` and relaunch.
-With `MKW_PERF_STATS=1`, the game log reports cumulative opens, bytes, read time and missing-file
-fallbacks by source. Set `MKW_SD_BENCH=1` to compare eight reads of the same disc FST on both
-sources at startup. This measures repeated reads of that file.
+With `MKW_PERF_STATS=1`, the game log reports cumulative opens, bytes and read time by source, and
+how many files the game looked for that the card doesn't have. Set `MKW_SD_BENCH=1` to compare
+eight reads of the same disc FST on both sources at startup. This measures repeated reads of that
+file.
+
+**Experimental: everything on the card (`MKW_SD=all`).** The card then holds the only copy of the
+NAND, saves, settings and caches too, and the game writes them there; the PC copy is never changed.
+Prepare the card once with the card in the Mac (it copies `hblauncher/fsroot`, about 5 GB the first
+time), and copy progress back the same way:
+
+```sh
+hblauncher/tools/sd-card.sh push
+hblauncher/tools/sd-card.sh pull
+```
+
+`push` refuses a card that is already prepared, since it may hold newer progress than the PC; pull
+first, or add `--force`. `pull` backs up the PC's copies to `UserData/save-backup-<time>-before-pull`
+first. On a card that isn't prepared, `MKW_SD=all` acts like the default. The file server still
+supplies `hbxl-env` and the game log, so keep it running. `tests/sd-fake-card.sh` checks the backend
+against a simulated card on Linux.
 
 ### 6. Play
 

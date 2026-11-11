@@ -16,13 +16,25 @@
 #include <unistd.h>
 
 enum { FIRST = 2048, LIMIT = 4096, PATH_BYTES = 1024 };
+/* MKW_SD=all: every open of one writable file shares a node, because the console refuses a
+ * second open of a file that is open for writing. */
+struct node {
+    struct node *next;
+    uint32_t handle;
+    int refs, dirty;
+    int64_t size;
+    char path[];
+};
+static struct node *nodes;
 struct description {
     uint32_t handle;
     int directory, refs, flags;
     int64_t position, size;
+    struct node *node;
     struct listing listing;
     char path[];
 };
+static int64_t fsize(const struct description *f) { return f->node ? f->node->size : f->size; }
 static struct description *table[LIMIT - FIRST];
 static unsigned char cloexec[LIMIT - FIRST];
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -30,7 +42,7 @@ extern int hbxl_vfs_resolve_path(int, const char *, char *);
 static int in_range(long fd) { return fd >= FIRST && fd < LIMIT; }
 
 struct metrics {
-    uint64_t opens, bytes, ticks;
+    uint64_t opens, bytes, ticks, written;
 };
 static struct metrics sd_stats, pc_stats;
 static uint64_t fallbacks;
@@ -47,18 +59,21 @@ void hbxl_storage_perf(void) {
         totals[3 * i + 2] = GET(sides[i]->ticks);
     }
     totals[6] = GET(fallbacks);
-    if (!memcmp(previous, totals, sizeof(totals)))
+    const uint64_t written = GET(sd_stats.written);
+    static uint64_t previous_written;
+    if (!memcmp(previous, totals, sizeof(totals)) && written == previous_written)
         return;
     memcpy(previous, totals, sizeof(totals));
+    previous_written = written;
     double sd_rate = totals[2] ? totals[1] / 1048576.0 * hz / totals[2] : 0.0;
     double pc_rate = totals[5] ? totals[4] / 1048576.0 * hz / totals[5] : 0.0;
     fprintf(stderr,
             "[perf] storage cumulative: SD %llu opens %llu B %.1f ms %.2f MiB/s, "
             "PC %llu opens %llu B %.1f ms %.2f MiB/s, %llu "
-            "missing-file fallbacks\n",
+            "files not on SD, %llu B written to SD\n",
             (unsigned long long)totals[0], (unsigned long long)totals[1], totals[2] * 1000.0 / hz, sd_rate,
             (unsigned long long)totals[3], (unsigned long long)totals[4], totals[5] * 1000.0 / hz, pc_rate,
-            (unsigned long long)totals[6]);
+            (unsigned long long)totals[6], (unsigned long long)written);
 }
 
 static int root(const char *p, const char *prefix) {
@@ -69,13 +84,53 @@ static int asset_path(const char *p) {
     return !strcmp(p, "/RetroRewind") || root(p, "/disc") || root(p, "/RetroRewind/RetroRewind6") ||
            !strcmp(p, "/dsp_coef.bin");
 }
-static int enabled(void) {
+/* MKW_SD: unset = game assets from the card; 0 = all from the PC; all = everything from the
+ * card, with writes only to the card (experimental). */
+enum { SD_OFF, SD_ASSETS, SD_ALL };
+/* MKW_SD=all needs a card prepared by tools/sd-card.sh push, which copies the whole file-server
+ * root and writes /wiicompiled/.fsroot. Without it the game would start with no NAND or save,
+ * so an unprepared card stays in the assets mode. Checked once per launch. */
+/* The first file calls come before libc has set up thread data, so this must not use anything
+ * that needs it (pthread_once does): it is a plain flag, set under the mutex on first use. */
+int sd_card_prepared = -1; /* not static: tests/sd-fake-card.c resets it */
+extern void hbxl_vfs_write_console(int, const void *, size_t);
+static int prepared_card(void) { /* called with the mutex held */
+    if (sd_card_prepared < 0) {
+        sd_card_prepared = sd_type("/.fsroot") == 1;
+        if (!sd_card_prepared) {
+            static const char note[] = "[sd] MKW_SD=all needs a card prepared with tools/sd-card.sh "
+                                       "push; using game data from the card only\n";
+            hbxl_vfs_write_console(2, note, sizeof(note) - 1);
+        }
+    }
+    return sd_card_prepared;
+}
+/* MKW_SD as set; outside the mutex, "all" is only a request. */
+static int sd_request(void) {
     const struct sd_context *ctx = card();
     if (!ctx || ctx->magic != SD_MAGIC)
-        return 0;
+        return SD_OFF;
     const char *v = getenv("MKW_SD");
-    return !v || strcmp(v, "0");
+    if (!v)
+        return SD_ASSETS;
+    if (!strcmp(v, "0"))
+        return SD_OFF;
+    return strcmp(v, "all") ? SD_ASSETS : SD_ALL;
 }
+/* The mode in effect: "all" needs a prepared card. Only call it with the mutex held. */
+static int sd_mode(void) {
+    int mode = sd_request();
+    return mode == SD_ALL && !prepared_card() ? SD_ASSETS : mode;
+}
+static int enabled(void) { return sd_request() != SD_OFF; }
+/* Paths the card answers in this mode. /hbxl-env is read before the card is attached. */
+static int routed(const char *p) {
+    if (sd_mode() != SD_ALL)
+        return asset_path(p);
+    return *p == '/' && strcmp(p, "/hbxl-env") && !root(p, "/dev") && !root(p, "/proc") && !root(p, "/sys");
+}
+/* Paths the game may change on the card. The disc and Retro Rewind's own folder stay read-only. */
+static int writable(const char *p) { return sd_mode() == SD_ALL && routed(p) && !asset_path(p); }
 static void normalize(char *path) {
     char *dst = path, *src = path;
     while (*src) {
@@ -165,6 +220,7 @@ static long open_asset(const char *path, int flags) {
     f->handle = handle;
     f->size = size;
     f->directory = dir;
+    f->listing.card_only = dir && writable(path); /* the card is the only copy there */
     f->flags = flags;
     memcpy(f->path, path, n);
     table[fd - FIRST] = f;
@@ -172,25 +228,192 @@ static long open_asset(const char *path, int flags) {
     ADD(sd_stats.opens, 1);
     return fd;
 }
+static struct node *find_node(const char *path) {
+    for (struct node *n = nodes; n; n = n->next)
+        if (!strcmp(n->path, path))
+            return n;
+    return NULL;
+}
+static long release_node(struct node *n) {
+    if (--n->refs)
+        return 0;
+    long rc = n->dirty ? sd_flush(n->handle) : 0;
+    long closed = sd_close(n->handle);
+    for (struct node **link = &nodes; *link; link = &(*link)->next)
+        if (*link == n) {
+            *link = n->next;
+            break;
+        }
+    free(n);
+    return rc < 0 ? rc : closed;
+}
 static long close_fd(long fd) {
     struct description *f = table[fd - FIRST];
     table[fd - FIRST] = NULL;
     if (--f->refs)
         return 0;
-    long rc = sd_close(f->handle);
+    long rc = f->node ? release_node(f->node) : sd_close(f->handle);
     sd_free_listing(&f->listing);
     free(f);
     return rc;
+}
+
+/* ---- MKW_SD=all: writing to the card ------------------------------------------------------ */
+
+/* Creates every missing directory above path on the card. */
+static long make_parents(const char *path) {
+    char partial[PATH_BYTES];
+    size_t n = strlen(path);
+    if (n >= sizeof(partial))
+        return -ENAMETOOLONG;
+    memcpy(partial, path, n + 1);
+    for (char *slash = strchr(partial + 1, '/'); slash; slash = strchr(slash + 1, '/')) {
+        *slash = 0;
+        long type = sd_type(partial);
+        if (type == -ENOENT)
+            type = sd_mkdir(partial);
+        else if (type == 1)
+            type = -ENOTDIR;
+        *slash = '/';
+        if (type < 0 && type != -EEXIST)
+            return type;
+    }
+    return 0;
+}
+
+/* Opens a writable-area file on the card through its shared node. In MKW_SD=all the card is
+ * the only copy of these files: nothing falls back to the PC or is copied from it, so a file the
+ * game deleted (a SQLite journal, say) can't come back from the PC's older copy. */
+static long open_card(const char *path, int flags) {
+    const int access = flags & O_ACCMODE;
+    const int writes = access != O_RDONLY || (flags & (O_CREAT | O_TRUNC | O_APPEND));
+    int fd = vacant(FIRST);
+    if (fd < 0)
+        return fd;
+    long type = sd_type(path);
+    if (type == -ENOENT && (flags & O_CREAT)) {
+        long rc = make_parents(path);
+        if (!rc)
+            rc = sd_create(path, 0);
+        if (rc < 0)
+            return rc;
+        type = 1;
+    } else if (type < 0)
+        return type;
+    else if ((flags & O_CREAT) && (flags & O_EXCL))
+        return -EEXIST;
+    if (type == 0) {
+        if (writes)
+            return -EISDIR;
+        return -EAGAIN; /* a directory: the caller opens it like an asset directory */
+    }
+    if (flags & O_DIRECTORY)
+        return -ENOTDIR;
+    struct node *node = find_node(path);
+    size_t n = strlen(path) + 1;
+    if (!node) {
+        long handle = sd_open_mode(path, SD_READ | SD_WRITE | SD_APPEND);
+        if (handle < 0)
+            return handle;
+        long size = sd_size(handle);
+        node = size < 0 ? NULL : calloc(1, sizeof(*node) + n);
+        if (!node) {
+            sd_close(handle);
+            return size < 0 ? size : -ENOMEM;
+        }
+        node->handle = handle;
+        node->size = size;
+        memcpy(node->path, path, n);
+        node->next = nodes;
+        nodes = node;
+    }
+    struct description *f = calloc(1, sizeof(*f) + n);
+    if (!f) {
+        if (!node->refs)
+            release_node((node->refs = 1, node));
+        return -ENOMEM;
+    }
+    node->refs++;
+    if ((flags & O_TRUNC) && access != O_RDONLY && node->size) {
+        long rc = sd_set_size(node->handle, 0);
+        if (rc < 0) {
+            release_node(node);
+            free(f);
+            return rc;
+        }
+        node->size = 0;
+        node->dirty = 1;
+    }
+    f->refs = 1;
+    f->handle = node->handle;
+    f->node = node;
+    f->flags = flags;
+    memcpy(f->path, path, n);
+    table[fd - FIRST] = f;
+    cloexec[fd - FIRST] = !!(flags & O_CLOEXEC);
+    ADD(sd_stats.opens, 1);
+    return fd;
+}
+
+static long write_at(struct description *f, const void *buffer, size_t size, int64_t off) {
+    struct node *node = f->node;
+    if (!node || (f->flags & O_ACCMODE) == O_RDONLY)
+        return -EBADF;
+    if (off < 0 || size > LONG_MAX)
+        return -EINVAL;
+    if (off > node->size) { /* a gap: grow first, as a POSIX file would */
+        long rc = sd_set_size(node->handle, off);
+        if (rc < 0)
+            return rc;
+        node->size = off;
+    }
+    size_t done = 0;
+    while (done < size) {
+        size_t want = size - done < SD_CHUNK ? size - done : SD_CHUNK;
+        memcpy(card()->bounce, (const char *)buffer + done, want);
+        long rc = sd_write(node->handle, off + done, want);
+        if (rc < 0)
+            return done ? (long)done : rc;
+        done += want;
+    }
+    if (off + (int64_t)done > node->size)
+        node->size = off + done;
+    node->dirty = 1;
+    ADD(sd_stats.written, done);
+    return done;
+}
+static long vector_write(struct description *f, const struct iovec *vec, long count, int64_t off) {
+    if (count < 0 || count > IOV_MAX || off < 0)
+        return -EINVAL;
+    long done = 0;
+    for (long i = 0; i < count; i++) {
+        long put = write_at(f, vec[i].iov_base, vec[i].iov_len, off + done);
+        if (put < 0)
+            return done ? done : put;
+        done += put;
+    }
+    return done;
+}
+static long truncate_node(struct description *f, int64_t length) {
+    if (!f->node || (f->flags & O_ACCMODE) == O_RDONLY)
+        return -EINVAL;
+    long rc = sd_set_size(f->node->handle, length);
+    if (rc < 0)
+        return rc;
+    f->node->size = length;
+    f->node->dirty = 1;
+    return 0;
 }
 static long read_at(struct description *f, void *buffer, size_t size, int64_t off) {
     if (f->directory)
         return -EISDIR;
     if (off < 0 || size > LONG_MAX)
         return -EINVAL;
-    if (off >= f->size)
+    const int64_t end = fsize(f);
+    if (off >= end)
         return 0;
-    if (size > (size_t)(f->size - off))
-        size = f->size - off;
+    if (size > (size_t)(end - off))
+        size = end - off;
     size_t done = 0;
     while (done < size) {
         size_t want = size - done < SD_CHUNK ? size - done : SD_CHUNK;
@@ -229,7 +452,7 @@ static long seek(struct description *f, long offset, long whence) {
     if (whence == SEEK_SET)
         base = 0;
     else if (whence == SEEK_END && !f->directory)
-        base = f->size;
+        base = fsize(f);
     else if (whence != SEEK_CUR)
         return -EINVAL;
     int64_t next;
@@ -247,6 +470,7 @@ static long seek(struct description *f, long offset, long whence) {
 }
 
 static void metadata(const char *path, int dir, int64_t size, struct stat *st) {
+    const int rw = writable(path);
     uint64_t ino = 14695981039346656037ull;
     for (const unsigned char *p = (const unsigned char *)path; *p; p++)
         ino = (ino ^ *p) * 1099511628211ull;
@@ -254,7 +478,7 @@ static void metadata(const char *path, int dir, int64_t size, struct stat *st) {
     st->st_dev = 2;
     st->st_ino = ino;
     st->st_nlink = 1;
-    st->st_mode = dir ? S_IFDIR | 0555 : S_IFREG | 0444;
+    st->st_mode = dir ? S_IFDIR | (rw ? 0755 : 0555) : S_IFREG | (rw ? 0644 : 0444);
     st->st_size = size;
     st->st_blksize = 4096;
     st->st_blocks = (size + 511ull) / 512;
@@ -275,9 +499,12 @@ static long path_stat(const char *path, long n, long c, long e) {
     if (type < 0)
         return type;
     if (n == SYS_faccessat || n == 439)
-        return (c & X_OK) && type != 0 ? -EACCES : 0;
+        return ((c & X_OK) && type != 0) || ((c & W_OK) && !writable(path)) ? -EACCES : 0;
     long size = 0;
-    if (type != 0) {
+    const struct node *open_node = type != 0 ? find_node(path) : NULL;
+    if (open_node)
+        size = open_node->size;
+    else if (type != 0) {
         long file = sd_open(path, 0);
         if (file < 0)
             return file;
@@ -304,7 +531,7 @@ static long fd_call(struct description *f, long n, long a, long b, long c, long 
         return f->directory ? sd_list(&f->listing, f->handle, f->path, (void *)b, c) : -ENOTDIR;
     if (n == SYS_fstat || n == SYS_newfstatat || n == SYS_statx) {
         struct stat st;
-        metadata(f->path, f->directory, f->size, &st);
+        metadata(f->path, f->directory, fsize(f), &st);
         if (n == SYS_statx)
             extended(&st, (void *)e);
         else
@@ -331,6 +558,17 @@ static long fd_call(struct description *f, long n, long a, long b, long c, long 
             cloexec[a - FIRST] = !!(c & FD_CLOEXEC);
             return 0;
         }
+        if (b == F_SETFL) {
+            f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | (c & (O_APPEND | O_NONBLOCK));
+            return 0;
+        }
+        /* One process owns the card's files, as with the file server: locks are always granted. */
+        if (b == F_GETLK || b == F_OFD_GETLK) {
+            ((struct flock *)c)->l_type = F_UNLCK;
+            return 0;
+        }
+        if (b == F_SETLK || b == F_SETLKW || b == F_OFD_SETLK || b == F_OFD_SETLKW)
+            return 0;
         return -EINVAL;
     }
     if (n == SYS_read || n == SYS_pread64 || n == SYS_readv || n == SYS_preadv) {
@@ -350,6 +588,30 @@ static long fd_call(struct description *f, long n, long a, long b, long c, long 
         ADD(sd_stats.ticks, hbxl_svc_tick() - start);
         return got;
     }
+    if (n == SYS_write || n == SYS_pwrite64 || n == SYS_writev || n == SYS_pwritev) {
+        const int sequential = n == SYS_write || n == SYS_writev;
+        int64_t off = n == SYS_pwrite64 ? d
+                      : n == SYS_pwritev ? (int64_t)((uint64_t)d | ((uint64_t)e << 32))
+                      : (f->flags & O_APPEND) && f->node ? f->node->size
+                                                         : f->position;
+        long put = n == SYS_write || n == SYS_pwrite64 ? write_at(f, (const void *)b, c, off)
+                                                       : vector_write(f, (const void *)b, c, off);
+        if (put > 0 && sequential)
+            f->position = off + put;
+        return put;
+    }
+    if (n == SYS_ftruncate)
+        return b < 0 ? -EINVAL : truncate_node(f, b);
+    if (n == SYS_fsync || n == SYS_fdatasync) {
+        if (!f->node || !f->node->dirty)
+            return 0;
+        long rc = sd_flush(f->node->handle);
+        if (!rc)
+            f->node->dirty = 0;
+        return rc;
+    }
+    if (n == SYS_fchmod || n == SYS_fchown || n == SYS_flock || n == SYS_utimensat)
+        return 0;
     return -EBADF;
 }
 static int read_op(long n) { return n == SYS_read || n == SYS_readv || n == SYS_pread64 || n == SYS_preadv; }
@@ -408,14 +670,71 @@ static long pc_call(long n, long a, long b, long c, long d, long e, long f, int 
 static int fd_op(long n) {
     return read_op(n) || n == SYS_close || n == SYS_fstat || n == SYS_getdents64 || n == SYS_lseek ||
            n == SYS_fcntl || n == SYS_dup || n == SYS_dup3 || n == SYS_write || n == SYS_writev ||
-           n == SYS_pwrite64 || n == SYS_ftruncate;
+           n == SYS_pwrite64 || n == SYS_pwritev || n == SYS_ftruncate || n == SYS_fsync ||
+           n == SYS_fdatasync || n == SYS_fchmod || n == SYS_fchown || n == SYS_flock;
+}
+
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE 1
+#endif
+static int change_op(long n) {
+    return n == SYS_mkdirat || n == SYS_unlinkat || n == SYS_renameat || n == SYS_renameat2 ||
+           n == SYS_fchmodat || n == SYS_fchownat || n == SYS_utimensat;
+}
+/* MKW_SD=all: creating, deleting and renaming happen on the card only. Called with the mutex. */
+static long card_change(long n, const char *path, const char *target, long c, long e) {
+    if (!writable(path) || (target && !writable(target)))
+        return -EROFS;
+    if (n == SYS_mkdirat) {
+        long type = sd_type(path);
+        if (type >= 0)
+            return -EEXIST;
+        if (type != -ENOENT)
+            return type;
+        long rc = make_parents(path);
+        return rc ? rc : sd_mkdir(path);
+    }
+    if (n == SYS_unlinkat) {
+        if (find_node(path))
+            return -EBUSY; /* the console can't delete an open file */
+        return (c & AT_REMOVEDIR) ? sd_rmdir(path) : sd_delete(path);
+    }
+    if (n == SYS_renameat || n == SYS_renameat2) {
+        const long flags = n == SYS_renameat2 ? e : 0;
+        if (flags & ~(long)RENAME_NOREPLACE)
+            return -EINVAL;
+        if (find_node(path) || find_node(target))
+            return -EBUSY;
+        long type = sd_type(path);
+        if (type < 0)
+            return type;
+        long existing = sd_type(target);
+        if (existing >= 0) {
+            if (flags & RENAME_NOREPLACE)
+                return -EEXIST;
+            if (existing != type)
+                return existing == 0 ? -EISDIR : -ENOTDIR;
+            /* nn::fs won't replace a file on rename: remove the old one first. */
+            long rc = existing == 0 ? sd_rmdir(target) : sd_delete(target);
+            if (rc < 0)
+                return rc;
+        } else if (existing != -ENOENT)
+            return existing;
+        long rc = make_parents(target);
+        return rc ? rc : sd_rename(path, target, type == 0);
+    }
+    /* chmod, chown and timestamps: FAT keeps none of them. */
+    long type = sd_type(path);
+    return type >= 0 ? 0 : type;
 }
 
 long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled) {
-    int path_op = n == SYS_openat || n == SYS_newfstatat || n == SYS_faccessat || n == 439 || n == SYS_statx;
+    const int all = sd_request() == SD_ALL; /* confirmed under the mutex below */
+    int path_op = n == SYS_openat || n == SYS_newfstatat || n == SYS_faccessat || n == 439 || n == SYS_statx ||
+                  (all && change_op(n) && !(n == SYS_utimensat && !b));
     int empty = (n == SYS_newfstatat || n == SYS_statx) && ((n == SYS_statx ? c : d) & AT_EMPTY_PATH) &&
                 (!b || !*(const char *)b);
-    if (in_range(a) && (fd_op(n) || empty)) {
+    if (in_range(a) && (fd_op(n) || empty || (n == SYS_utimensat && !b))) {
         *handled = 1;
         pthread_mutex_lock(&mutex);
         struct description *desc = table[a - FIRST];
@@ -426,24 +745,50 @@ long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, lon
     if (!path_op || !enabled() || empty)
         return pc_call(n, a, b, c, d, e, f, handled);
     /* All pre-libc paths (including /hbxl-env) bypass the overlay lock. */
-    if (b && *(const char *)b == '/' && !asset_path((const char *)b) && !strstr((const char *)b, "/.") &&
+    if (!all && b && *(const char *)b == '/' && !asset_path((const char *)b) && !strstr((const char *)b, "/.") &&
         !strstr((const char *)b, "//"))
         return pc_call(n, a, b, c, d, e, f, handled);
-    char path[PATH_BYTES];
+    char path[PATH_BYTES], target[PATH_BYTES];
     pthread_mutex_lock(&mutex);
     long rc = resolve(a, (const char *)b, path);
-    int route = rc == 0 && asset_path(path);
-    if (n == SYS_openat && (c & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND)))
+    const int rename = n == SYS_renameat || n == SYS_renameat2;
+    if (rc == 0 && rename)
+        rc = resolve(c, (const char *)d, target);
+    if (all && change_op(n)) {
+        const int mine = rc == 0 && sd_mode() == SD_ALL && routed(path) && (!rename || routed(target));
+        if (mine)
+            rc = card_change(n, path, rename ? target : NULL, c, e);
+        pthread_mutex_unlock(&mutex);
+        if (mine || rc < 0) {
+            *handled = 1;
+            return rc;
+        }
+        return pc_call(n, a, b, c, d, e, f, handled);
+    }
+    int route = rc == 0 && routed(path);
+    const int writes = (n == SYS_openat && (c & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND))) ||
+                       ((n == SYS_faccessat || n == 439) && (c & W_OK));
+    if (route && writes && !writable(path)) {
+        if (sd_mode() == SD_ALL)
+            rc = n == SYS_openat ? -EROFS : -EACCES; /* the disc and Retro Rewind stay read-only */
         route = 0;
-    if ((n == SYS_faccessat || n == 439) && (c & W_OK))
-        route = 0;
+    }
     if (route) {
-        rc = n == SYS_openat ? open_asset(path, c) : path_stat(path, n, c, e);
+        if (n == SYS_openat) {
+            rc = writable(path) ? open_card(path, c) : open_asset(path, c);
+            if (rc == -EAGAIN)
+                rc = open_asset(path, c); /* a directory in the writable area */
+        } else
+            rc = path_stat(path, n, c, e);
         if (rc == -ENOENT && n == SYS_openat)
             ADD(fallbacks, 1);
     }
+    const int card_only = route && writable(path);
     pthread_mutex_unlock(&mutex);
     *handled = 1;
+    /* In MKW_SD=all the card is the only copy of writable files: no fallback for them. */
+    if (route && rc == -ENOENT && (writes || card_only))
+        return rc;
     if ((route && rc != -ENOENT) || (!route && rc < 0))
         return rc;
     return pc_call(n, AT_FDCWD, (long)path, c, d, e, f, handled);

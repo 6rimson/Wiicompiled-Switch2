@@ -81,6 +81,8 @@ static long load_pc(struct listing *l, const char *path) {
     return rc;
 }
 static long load(struct listing *l, uint32_t handle, const char *path) {
+    const char *mode = getenv("MKW_SD");
+    const int all = mode && !strcmp(mode, "all");
     long count;
     while ((count = sd_entries(handle)) > 0) {
         const struct sd_entry *entries = (const void *)card()->bounce;
@@ -91,7 +93,8 @@ static long load(struct listing *l, uint32_t handle, const char *path) {
             /* Finder creates AppleDouble files alongside assets copied to FAT. */
             if (!strncmp(entries[i].name, "._", 2) || !strcmp(entries[i].name, ".DS_Store"))
                 continue;
-            if (!strcmp(path, "/RetroRewind") && strcmp(entries[i].name, "RetroRewind6"))
+            /* Outside MKW_SD=all the card only answers for RetroRewind6 in this folder. */
+            if (!strcmp(path, "/RetroRewind") && strcmp(entries[i].name, "RetroRewind6") && !all)
                 continue;
             long rc = append(l, entries[i].name, n, entries[i].type ? DT_REG : DT_DIR, 0);
             if (rc < 0)
@@ -100,7 +103,7 @@ static long load(struct listing *l, uint32_t handle, const char *path) {
     }
     if (count < 0)
         return count;
-    long rc = load_pc(l, path);
+    long rc = l->card_only ? 0 : load_pc(l, path);
     if (rc < 0)
         return rc;
     if (l->count)

@@ -1,6 +1,7 @@
 #include "storage.h"
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 enum { SFCI = 0x49434653, SFCO = 0x4f434653 };
@@ -23,10 +24,19 @@ static long reply(uint32_t handle, int moved, uint32_t **data) {
     if (at + 6 > 1024 || p[at] != SFCO)
         return -EPROTO;
     uint32_t rc = p[at + 2] & 0x3fffff;
-    if (rc == 0x202)
-        return -ENOENT; /* FS PathNotFound */
-    if (rc)
+    if (rc) {
+        switch (rc) {
+        case 0x202: return -ENOENT;     /* FS 2002-0001 PathNotFound */
+        case 0x402: return -EEXIST;     /* 2002-0002 PathAlreadyExists */
+        case 0xe02: return -EBUSY;      /* 2002-0007 TargetLocked (the file is open) */
+        case 0x1002: return -ENOTEMPTY; /* 2002-0008 DirectoryNotEmpty */
+        case 0x3c02: return -ENOSPC;    /* 2002-0030 UsableSpaceNotEnough */
+        }
+        static int reported;
+        if (reported++ < 16)
+            fprintf(stderr, "[sd] file system result %04u-%04u\n", 2000 + (rc & 0x1ff), rc >> 9);
         return -EIO;
+    }
     if (!!child != moved)
         return -EPROTO;
     if (data)
@@ -34,25 +44,44 @@ static long reply(uint32_t handle, int moved, uint32_t **data) {
     return child;
 }
 
-static long path_call(const char *path, unsigned command, uint32_t mode, uint32_t **data) {
-    struct sd_context *ctx = card();
+/* Writes "/wiicompiled" + path into an SDK-heap buffer and its X (pointer) descriptor at d. */
+static long put_path(uint32_t *d, unsigned index, char *buffer, const char *path) {
     static const char prefix[] = "/wiicompiled";
     size_t n = strlen(path);
     if (sizeof(prefix) + n > SD_PATH)
         return -ENAMETOOLONG;
-    memcpy(ctx->path, prefix, sizeof(prefix) - 1);
-    memcpy(ctx->path + sizeof(prefix) - 1, path, n + 1);
-    uintptr_t addr = (uintptr_t)ctx->path;
+    memcpy(buffer, prefix, sizeof(prefix) - 1);
+    memcpy(buffer + sizeof(prefix) - 1, path, n + 1);
+    uintptr_t addr = (uintptr_t)buffer;
+    d[0] = index | (SD_PATH << 16) | (((addr >> 36) & 7) << 6) | (((addr >> 32) & 15) << 12);
+    d[1] = addr;
+    return 0;
+}
+
+/* IFileSystem commands taking one or two paths and up to four words of arguments. The second
+ * path goes in the bounce buffer, which no path command uses otherwise. */
+static long paths_call(unsigned command, const char *first, const char *second, const uint32_t *args,
+                       unsigned words, int moved, uint32_t **data) {
+    struct sd_context *ctx = card();
     uint32_t *p = ctx->command;
     memset(p, 0, 256);
-    p[0] = 4 | (1u << 16);
-    p[1] = command == 7 ? 8 : 9;
-    p[2] = (SD_PATH << 16) | (((addr >> 36) & 7) << 6) | (((addr >> 32) & 15) << 12);
-    p[3] = addr;
-    p[4] = SFCI;
-    p[6] = command;
-    p[8] = mode;
-    return reply(ctx->sd, command != 7, data);
+    unsigned count = second ? 2 : 1;
+    long rc = put_path(p + 2, 0, ctx->path, first);
+    if (!rc && second)
+        rc = put_path(p + 4, 1, (char *)ctx->bounce, second);
+    if (rc)
+        return rc;
+    unsigned at = (2 + 2 * count + 3) & ~3u;
+    p[0] = 4 | (count << 16);
+    p[1] = 8 + words;
+    p[at] = SFCI;
+    p[at + 2] = command;
+    if (words)
+        memcpy(p + at + 4, args, 4 * words);
+    return reply(ctx->sd, moved, data);
+}
+static long path_call(const char *path, unsigned command, uint32_t mode, uint32_t **data) {
+    return paths_call(command, path, NULL, &mode, command == 7 ? 0 : 1, command != 7, data);
 }
 
 long sd_type(const char *path) {
@@ -63,7 +92,18 @@ long sd_type(const char *path) {
     return *data <= 1 ? (long)*data : -EPROTO;
 }
 long sd_open(const char *path, int directory) {
-    return path_call(path, directory ? 9 : 8, directory ? 3 : 1, NULL);
+    return path_call(path, directory ? 9 : 8, directory ? 3 : SD_READ, NULL);
+}
+long sd_open_mode(const char *path, uint32_t mode) { return path_call(path, 8, mode, NULL); }
+long sd_create(const char *path, int64_t size) {
+    uint32_t args[4] = {0, 0, (uint32_t)size, (uint32_t)((uint64_t)size >> 32)}; /* option, pad, size */
+    return paths_call(0, path, NULL, args, 4, 0, NULL);
+}
+long sd_delete(const char *path) { return paths_call(1, path, NULL, NULL, 0, 0, NULL); }
+long sd_mkdir(const char *path) { return paths_call(2, path, NULL, NULL, 0, 0, NULL); }
+long sd_rmdir(const char *path) { return paths_call(3, path, NULL, NULL, 0, 0, NULL); }
+long sd_rename(const char *from, const char *to, int directory) {
+    return paths_call(directory ? 6 : 5, from, to, NULL, 0, 0, NULL);
 }
 
 static long count_reply(uint32_t handle) {
@@ -115,3 +155,44 @@ long sd_entries(uint32_t dir) {
     return rc > capacity && rc >= 0 ? -EPROTO : rc;
 }
 long sd_close(uint32_t handle) { return card()->close_handle(handle) ? -EIO : 0; }
+
+/* IFile commands without buffers: Flush (2), SetSize (3). */
+static long file_call(uint32_t file, unsigned command, const uint32_t *args, unsigned words) {
+    uint32_t *p = card()->command;
+    memset(p, 0, 256);
+    p[0] = 4;
+    p[1] = 8 + words;
+    p[4] = SFCI;
+    p[6] = command;
+    if (words)
+        memcpy(p + 8, args, 4 * words);
+    return reply(file, 0, NULL);
+}
+long sd_flush(uint32_t file) { return file_call(file, 2, NULL, 0); }
+long sd_set_size(uint32_t file, int64_t size) {
+    if (size < 0)
+        return -EINVAL;
+    uint32_t args[2] = {(uint32_t)size, (uint32_t)((uint64_t)size >> 32)};
+    return file_call(file, 3, args, 2);
+}
+/* IFile::Write (1): option, pad, offset, size, with the data in an A (send) descriptor. */
+long sd_write(uint32_t file, int64_t offset, size_t length) {
+    if (length > SD_CHUNK || offset < 0)
+        return -EINVAL;
+    struct sd_context *ctx = card();
+    uintptr_t addr = (uintptr_t)ctx->bounce;
+    uint32_t *p = ctx->command;
+    memset(p, 0, 256);
+    p[0] = 4 | (1u << 20);
+    p[1] = 14;
+    p[2] = length;
+    p[3] = addr;
+    p[4] = 1 | (((addr >> 36) & 7) << 2) | (((addr >> 32) & 15) << 28);
+    p[8] = SFCI;
+    p[10] = 1;
+    memcpy(p + 14, &offset, 8);
+    uint64_t size = length;
+    memcpy(p + 16, &size, 8);
+    long rc = reply(file, 0, NULL);
+    return rc < 0 ? rc : (long)length;
+}

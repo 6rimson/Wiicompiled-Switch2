@@ -21,10 +21,22 @@ struct sd_entry {
     int64_t size;
 };
 _Static_assert(sizeof(struct sd_entry) == 0x310, "directory entry ABI");
+/* nn::fs open modes */
+enum { SD_READ = 1, SD_WRITE = 2, SD_APPEND = 4 };
 long sd_type(const char *path);
 long sd_open(const char *path, int directory);
+long sd_open_mode(const char *path, uint32_t mode);
 long sd_size(uint32_t file);
 long sd_read(uint32_t file, int64_t offset, size_t length);
 long sd_entries(uint32_t dir);
 long sd_close(uint32_t handle);
+/* Writing (MKW_SD=all). sd_write sends the first `length` bytes of the bounce buffer. */
+long sd_create(const char *path, int64_t size);
+long sd_delete(const char *path);
+long sd_mkdir(const char *path);
+long sd_rmdir(const char *path);
+long sd_rename(const char *from, const char *to, int directory);
+long sd_write(uint32_t file, int64_t offset, size_t length);
+long sd_flush(uint32_t file);
+long sd_set_size(uint32_t file, int64_t size);
 long __real_hbxl_vfs_syscall(long, long, long, long, long, long, long, int *);
