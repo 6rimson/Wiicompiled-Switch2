@@ -6,6 +6,7 @@
 #       and marks the card prepared (/wiicompiled/.fsroot). With MKW_SD=all the game then uses the
 #       card as the only copy of its saves, settings and caches. Refuses a card that is already
 #       prepared, since that card may hold newer progress than the PC: pull first, or --force.
+#       The root's hbxl-env goes to the card too, with MKW_SD=all, for starting without the server.
 #   sd-card.sh pull [--root DIR] [--card /Volumes/NAME]
 #       Copies the NAND, settings, caches and Retro Rewind's save from the card back to the root,
 #       after backing up the root's copies to UserData/save-backup-<time>-before-pull.
@@ -51,6 +52,9 @@ push)
   fi
   "${RSYNC[@]}" --exclude UserData --exclude 'RetroRewind/riivolution' --exclude 'RetroRewind/*-backup' \
     --exclude fs-run.log --exclude session.env --exclude 'hbxl-env*' "$root/" "$dest/"
+  # The settings the game reads when it starts without the file server: the root's, with the card
+  # as the only copy (MKW_SD=all; earlier lines win).
+  { echo "MKW_SD=all"; [[ -f "$root/hbxl-env" ]] && grep -v '^MKW_SD=' "$root/hbxl-env"; true; } > "$dest/hbxl-env"
   printf 'prepared from %s on %s\n' "$root" "$(date '+%Y-%m-%d %H:%M')" > "$dest/.fsroot"
   # macOS keeps file metadata on FAT in ._ files, which dot_clean can't always merge there.
   find "$dest" -name '._*' -delete

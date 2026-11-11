@@ -5,6 +5,7 @@
 #include <string.h>
 
 enum { SFCI = 0x49434653, SFCO = 0x4f434653 };
+uint32_t sd_last_result; /* the card's last result code, for log lines */
 
 static long reply(uint32_t handle, int moved, uint32_t **data) {
     struct sd_context *ctx = card();
@@ -24,6 +25,7 @@ static long reply(uint32_t handle, int moved, uint32_t **data) {
     if (at + 6 > 1024 || p[at] != SFCO)
         return -EPROTO;
     uint32_t rc = p[at + 2] & 0x3fffff;
+    sd_last_result = rc;
     if (rc) {
         switch (rc) {
         case 0x202: return -ENOENT;     /* FS 2002-0001 PathNotFound */
@@ -104,6 +106,18 @@ long sd_mkdir(const char *path) { return paths_call(2, path, NULL, NULL, 0, 0, N
 long sd_rmdir(const char *path) { return paths_call(3, path, NULL, NULL, 0, 0, NULL); }
 long sd_rename(const char *from, const char *to, int directory) {
     return paths_call(directory ? 6 : 5, from, to, NULL, 0, 0, NULL);
+}
+/* IFileSystem::GetFileTimeStampRaw (14): created, modified and accessed in seconds, then whether
+ * the card has them. */
+long sd_modified(const char *path, int64_t *seconds) {
+    uint32_t *data;
+    long rc = paths_call(14, path, NULL, NULL, 0, 0, &data);
+    if (rc < 0)
+        return rc;
+    if (!(data[6] & 0xff))
+        return -ENODATA;
+    memcpy(seconds, data + 2, sizeof(*seconds));
+    return 0;
 }
 
 static long count_reply(uint32_t handle) {

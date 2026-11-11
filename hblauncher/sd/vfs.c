@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 enum { FIRST = 2048, LIMIT = 4096, PATH_BYTES = 1024 };
@@ -482,10 +483,20 @@ static void metadata(const char *path, int dir, int64_t size, struct stat *st) {
     st->st_size = size;
     st->st_blksize = 4096;
     st->st_blocks = (size + 511ull) / 512;
+    /* The game deletes logs older than four days by their date, so files it can change get the
+     * card's date (the console's local time, which is close enough for that), or now where the
+     * card has none, as for folders. Game data stays at 0: one card call less. */
+    if (rw) {
+        int64_t seconds;
+        st->st_mtim.tv_sec = dir || sd_modified(path, &seconds) ? time(NULL) : seconds;
+        st->st_atim = st->st_ctim = st->st_mtim;
+    }
 }
 static void extended(const struct stat *st, struct statx *sx) {
     memset(sx, 0, sizeof(*sx));
-    sx->stx_mask = STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_INO | STATX_SIZE | STATX_BLOCKS;
+    sx->stx_mask = STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_INO | STATX_SIZE | STATX_BLOCKS |
+                   STATX_MTIME | STATX_ATIME | STATX_CTIME;
+    sx->stx_mtime.tv_sec = sx->stx_atime.tv_sec = sx->stx_ctime.tv_sec = st->st_mtim.tv_sec;
     sx->stx_mode = st->st_mode;
     sx->stx_size = st->st_size;
     sx->stx_ino = st->st_ino;
@@ -690,16 +701,23 @@ static uint32_t log_file;
 static int64_t log_offset;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Before libc starts, environ is still unset and so is MKW_SD: the runtime's first lines are kept
+ * in case the mode turns out to be "all". Only one thread runs then, so no lock is needed (or
+ * safe: libc hasn't set up thread data). */
+extern char **environ;
 static void log_append(const void *data, size_t length) {
-    if (log_state < 0 || !length || sd_request() != SD_ALL)
+    const int early = !environ, mode = sd_request();
+    if (log_state < 0 || !length || mode == SD_OFF || (!early && mode != SD_ALL))
         return;
-    pthread_mutex_lock(&log_mutex);
+    if (!early)
+        pthread_mutex_lock(&log_mutex);
     if (log_used + length <= LOG_BYTES) {
         memcpy(log_buffer + log_used, data, length);
         log_used += length;
     } else
         log_dropped += length;
-    pthread_mutex_unlock(&log_mutex);
+    if (!early)
+        pthread_mutex_unlock(&log_mutex);
 }
 
 /* Called with the mutex held. */
@@ -709,8 +727,14 @@ static int log_open(void) {
         return -1;
     if (sd_type(path) == 1) {
         sd_delete(previous);
-        if (sd_rename(path, previous, 0) < 0)
+        long rc = sd_rename(path, previous, 0);
+        if (rc < 0) {
+            char line[96];
+            int n = snprintf(line, sizeof(line), "[sd] couldn't keep the previous log: %ld (result %04u-%04u)\n", rc,
+                             2000 + (sd_last_result & 0x1ff), sd_last_result >> 9);
+            log_append(line, n > 0 && n < (int)sizeof(line) ? (size_t)n : 0);
             sd_delete(path);
+        }
     }
     if (sd_create(path, 0) < 0)
         return -1;
@@ -781,6 +805,56 @@ void __wrap_hbxl_vfs_write_console(int fd, const void *data, size_t length) {
     __real_hbxl_vfs_write_console(fd, data, length);
 }
 
+/* Starting without the file server. The runtime reads /hbxl-env (the settings, MKW_SD=all among
+ * them) from the server before libc starts. With no server it gets the card's copy, written by
+ * tools/sd-card.sh push. That read happens before any other thread exists and before libc can
+ * allocate, so the copy lives in a static buffer behind a reserved descriptor. */
+enum { ENV_FD = LIMIT - 1 };
+static char env_copy[4096];
+static long env_length, env_at;
+static int env_open;
+static long card_env(void) {
+    static const char missing[] = "[sd] no file server, and no settings on the card: prepare it with tools/sd-card.sh push\n",
+                      found[] = "[sd] no file server; settings from the card's hbxl-env\n";
+    if (sd_type("/.fsroot") != 1 || sd_type("/hbxl-env") != 1) {
+        hbxl_vfs_write_console(2, missing, sizeof(missing) - 1);
+        return -EIO;
+    }
+    long handle = sd_open("/hbxl-env", 0);
+    if (handle < 0)
+        return handle;
+    long got = sd_size(handle);
+    if (got > (long)sizeof(env_copy) - 1)
+        got = sizeof(env_copy) - 1;
+    if (got > 0)
+        got = sd_read(handle, 0, got);
+    if (got > 0)
+        memcpy(env_copy, card()->bounce, got);
+    sd_close(handle);
+    if (got < 0)
+        return got;
+    env_length = got;
+    env_at = 0;
+    env_open = 1;
+    sd_card_prepared = 1;
+    hbxl_vfs_write_console(2, found, sizeof(found) - 1);
+    return ENV_FD;
+}
+static long env_call(long n, long buffer, long size) {
+    if (n == SYS_close) {
+        env_open = 0;
+        return 0;
+    }
+    if (n != SYS_read)
+        return -EINVAL;
+    long k = size < env_length - env_at ? size : env_length - env_at;
+    if (k < 0)
+        return -EINVAL;
+    memcpy((void *)buffer, env_copy + env_at, k);
+    env_at += k;
+    return k;
+}
+
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE 1
 #endif
@@ -804,7 +878,10 @@ static long card_change(long n, const char *path, const char *target, long c, lo
     if (n == SYS_unlinkat) {
         if (find_node(path))
             return -EBUSY; /* the console can't delete an open file */
-        return (c & AT_REMOVEDIR) ? sd_rmdir(path) : sd_delete(path);
+        if (c & AT_REMOVEDIR)
+            return sd_rmdir(path);
+        long rc = sd_delete(path);
+        return rc == -ENOENT && sd_type(path) == 0 ? -EISDIR : rc; /* remove() then tries rmdir */
     }
     if (n == SYS_renameat || n == SYS_renameat2) {
         const long flags = n == SYS_renameat2 ? e : 0;
@@ -846,6 +923,17 @@ long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, lon
                     log_append(((const struct iovec *)b)[i].iov_base, ((const struct iovec *)b)[i].iov_len);
         }
         log_maybe_write_out(0);
+    }
+    if (env_open && a == ENV_FD) {
+        *handled = 1;
+        return env_call(n, b, c);
+    }
+    if (n == SYS_openat && b && !strcmp((const char *)b, "/hbxl-env") && enabled()) {
+        long rc = pc_call(n, a, b, c, d, e, f, handled);
+        if (rc != -EIO)
+            return rc;
+        *handled = 1;
+        return card_env(); /* -EIO: no file server */
     }
     int path_op = n == SYS_openat || n == SYS_newfstatat || n == SYS_faccessat || n == 439 || n == SYS_statx ||
                   (all && change_op(n) && !(n == SYS_utimensat && !b));

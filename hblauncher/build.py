@@ -286,7 +286,7 @@ def link_flags(variant, build):
         raise SystemExit("Build the runtime first: build.py runtime")
     toolchain = required("HBXL_TOOLCHAIN", "bin/aarch64-linux-musl-gcc")
     sd_objects = []
-    for source in ("storage", "directory", "vfs", "benchmark"):
+    for source in ("storage", "directory", "vfs", "benchmark", "offline"):
         obj = build / f"sd-{source}.o"
         run([toolchain / "bin/aarch64-linux-musl-gcc", "-O2", "-fno-pie", "-mbranch-protection=bti",
              "-Wall", "-Wextra", "-Werror", f"-I{hbl_sdk() / 'sdk/include'}", f"-I{hbl_sdk() / 'sdk/linux'}",
@@ -302,7 +302,8 @@ def link_flags(variant, build):
     fs_host = octets[0] | octets[1] << 8 | octets[2] << 16 | octets[3] << 24   # sockaddr byte order
     print(f"file server address compiled in: {FS_HOST}")
     return " ".join([
-        "-nostartfiles", "-Wl,--wrap=hbxl_vfs_syscall", "-Wl,--wrap=hbxl_vfs_shutdown", "-Wl,--wrap=hbxl_vfs_write_console", *sd_objects, f"-Wl,-T,{ld}",
+        "-nostartfiles", "-Wl,--wrap=hbxl_vfs_syscall", "-Wl,--wrap=hbxl_vfs_shutdown", "-Wl,--wrap=hbxl_vfs_write_console",
+        "-Wl,--wrap=hbxl_vfs_init", "-Wl,--wrap=hbxl_vfs_time_offset_ns", *sd_objects, f"-Wl,-T,{ld}",
         f"-Wl,--defsym=HBXL_CODE_BASE={linux['code_base']}", f"-Wl,--defsym=HBXL_DATA_BASE={linux['data_base']}",
         f"-Wl,--defsym=HBXL_FS_PORT={FS_PORT}", f"-Wl,--defsym=HBXL_FS_HOST=0x{fs_host:08x}",
         # Hot functions first: the game's code is 120 MB, more than the TLBs and L2 can hold.

@@ -39,4 +39,6 @@ long sd_rename(const char *from, const char *to, int directory);
 long sd_write(uint32_t file, int64_t offset, size_t length);
 long sd_flush(uint32_t file);
 long sd_set_size(uint32_t file, int64_t size);
+long sd_modified(const char *path, int64_t *seconds);
+extern uint32_t sd_last_result;
 long __real_hbxl_vfs_syscall(long, long, long, long, long, long, long, int *);

@@ -56,10 +56,13 @@ int hbxl_vfs_resolve_path(int fd, const char *name, char *out) {
     return 0;
 }
 static void on_pc(const char *path, char *out) { snprintf(out, 1024, "%s%s", pc_root, path); }
-/* The file server: the same calls on a folder. */
+/* The file server: the same calls on a folder, or -EIO for everything when it isn't running. */
+static int offline;
 long __real_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled) {
     char p1[1024], p2[1024];
     *handled = 1;
+    if (offline)
+        return -EIO;
     long rc;
     switch (n) {
     case SYS_openat: case SYS_newfstatat: case SYS_faccessat: case SYS_mkdirat: case SYS_unlinkat:
@@ -201,6 +204,15 @@ static uint32_t send(void *message, uint64_t size, uint32_t handle) {
             if (stat(other, &target) == 0) { respond(ALREADY_EXISTS, 0); return 0; }
             if (open_with_write(host, 1)) { locked_refusals++; respond(TARGET_LOCKED, 0); return 0; }
             respond(rename(host, other) ? PATH_NOT_FOUND : 0, 0);
+            return 0;
+        }
+        case 14: { /* GetFileTimeStampRaw */
+            if (!exists) { respond(PATH_NOT_FOUND, 0); return 0; }
+            uint32_t *out = respond(0, 0);
+            int64_t when = st.st_mtime;
+            for (int i = 0; i < 3; i++)
+                memcpy(out + 2 * i, &when, 8);
+            out[6] = 1;
             return 0;
         }
         case 7: /* GetEntryType */
@@ -484,6 +496,10 @@ int main(void) {
     /* The game log goes to the card: the runtime's lines and the game's own writes to stdout and
      * stderr. The previous launch's log is kept. */
     host_write(card_root, "/UserData/Logs/console.log", "last launch\n", 12);
+    char **environment = environ; /* before libc starts, environ is unset and so is MKW_SD */
+    environ = NULL;
+    __wrap_hbxl_vfs_write_console(2, "hbxl: before libc\n", 18);
+    environ = environment;
     __wrap_hbxl_vfs_write_console(2, "hbxl: runtime line\n", 19);
     CHECK(call(SYS_write, 2, (long)"game stderr\n", 12, 0, 0) == 12);
     struct iovec parts[2] = {{"game ", 5}, {"stdout\n", 7}};
@@ -492,8 +508,44 @@ int main(void) {
     char log[256] = {0};
     CHECK(host_read(card_root, "/UserData/Logs/console.log", log, sizeof(log) - 1) > 0);
     CHECK(strstr(log, "hbxl: runtime line") && strstr(log, "game stderr") && strstr(log, "game stdout"));
+    CHECK(strstr(log, "hbxl: before libc") && strstr(log, "before libc") < strstr(log, "runtime line"));
     CHECK(host_read(card_root, "/UserData/Logs/console.prev.log", log, sizeof(log) - 1) == 12);
     CHECK(server_used && memmem(server_log, server_used, "runtime line", 12)); /* the server still gets it */
+
+    /* Dates: the game prunes its Logs folder by them. Removing a folder with unlink fails as on
+     * Linux, so remove() goes on to rmdir. */
+    struct stat when;
+    char old_log[300];
+    snprintf(old_log, sizeof(old_log), "%s/UserData/Logs/console.prev.log", card_root);
+    struct timespec days_ago[2] = {{time(NULL) - 5 * 86400, 0}, {time(NULL) - 5 * 86400, 0}};
+    utimensat(AT_FDCWD, old_log, days_ago, 0);
+    CHECK(call(SYS_newfstatat, AT_FDCWD, (long)"/UserData/Logs/console.prev.log", (long)&when, 0, 0) == 0 &&
+          when.st_mtime == days_ago[1].tv_sec);
+    CHECK(call(SYS_newfstatat, AT_FDCWD, (long)"/UserData/Logs/console.log", (long)&when, 0, 0) == 0 &&
+          when.st_mtime > time(NULL) - 60);
+    CHECK(mkdir_("/UserData/Logs/run") == 0 && unlink_("/UserData/Logs/run", 0) == -EISDIR &&
+          unlink_("/UserData/Logs/run", AT_REMOVEDIR) == 0);
+
+    /* Starting without the file server: the settings come from the card's copy of /hbxl-env. */
+    static const char card_env[] = "MKW_SD=all\nHBXL_ARGS=--x\n";
+    host_write(pc_root, "/hbxl-env", "MKW_SD=0\n", 9);
+    host_write(card_root, "/hbxl-env", card_env, sizeof(card_env) - 1);
+    char env[64] = {0};
+    fd = open_("/hbxl-env", O_RDONLY); /* the server is up: its copy */
+    CHECK(fd >= 0 && fd < 2048 && call(SYS_read, fd, (long)env, sizeof(env) - 1, 0, 0) == 9);
+    close_(fd);
+    offline = 1;
+    memset(env, 0, sizeof(env));
+    fd = open_("/hbxl-env", O_RDONLY);
+    CHECK(fd == 4095 && call(SYS_read, fd, (long)env, 10, 0, 0) == 10 &&
+          call(SYS_read, fd, (long)env + 10, sizeof(env) - 11, 0, 0) == (long)sizeof(card_env) - 11);
+    CHECK(!strcmp(env, card_env) && call(SYS_read, fd, (long)env, 8, 0, 0) == 0);
+    CHECK(close_(fd) == 0 && call(SYS_read, 4095, (long)env, 8, 0, 0) == -EBADF);
+    char card_copy[300];
+    snprintf(card_copy, sizeof(card_copy), "%s/hbxl-env", card_root);
+    unlink(card_copy);
+    CHECK(open_("/hbxl-env", O_RDONLY) == -EIO); /* no copy on the card: as before */
+    offline = 0;
 
     CHECK(locked_refusals == 0); /* the backend never makes the card refuse an open file */
     printf("%d of %d checks passed\n", checks - failures, checks);
