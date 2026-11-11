@@ -5,8 +5,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 # Where this machine keeps its checkouts: fsroot is private, so a local paths file can live there.
-if [[ -f "$HERE/fsroot/session.env" ]]; then
-  source "$HERE/fsroot/session.env"
+config="${HBL_SESSION_ENV:-$HERE/fsroot/session.env}"
+if [[ -f "$config" ]]; then
+  source "$config"
 fi
 export HBL_ROOT="${HBL_ROOT:?Set HBL_ROOT to your HBLauncher checkout, in fsroot/session.env or the environment}"
 NS2JB="${HBL_NS2JB:?Set HBL_NS2JB to your ns2jb checkout, in fsroot/session.env or the environment}"
@@ -27,6 +28,7 @@ runner)
 launcher)
   cd "$HBL_ROOT"
   export HBL_NS2JB="$NS2JB"
+  export HBL_SD_SESSION="$HERE/tools/sd-session.cjs"
   export HBL_RPC_TARGET="$ADDRESS"
   export HBL_PAYLOAD="$NS2JB/engine/switch2/ro/payload/main"
   # The patched helper setup-session.py built; the launcher refuses any other.

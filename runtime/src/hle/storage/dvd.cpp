@@ -15,9 +15,6 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
 #include "runtime_log.h"
 #include "runtime_product.h"
 #include "runtime_stall.h"
-#if defined(HBX_SWITCH2)
-#include "sd_card_file.h"
-#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -258,38 +255,21 @@ static void LoadFstIndex() {
     g_fstLoaded = true;
 
     const fs::path fstPath = GetDvdRoot() / "sys" / "fst.bin";
-    std::vector<uint8_t> data;
-#if defined(HBX_SWITCH2)
-    // Experimental (branch experimental/sd-card): the card mirrors the file-server root, so the
-    // disc's FST is at /wiicompiled<DVD root>/sys/fst.bin there. A complete card copy is used;
-    // anything else falls back to the usual one below. A real FST is far below 4 MiB.
-    const std::string fstFsrootPath = fstPath.generic_string();
-    if (!fstFsrootPath.empty() && fstFsrootPath.front() == '/') {
-        if (auto card = SdCardFile::ReadAll(fstFsrootPath, 4u << 20)) {
-            data = std::move(*card);
-        }
+    std::ifstream fstFile(fstPath, std::ios::binary);
+    if (!fstFile.is_open()) {
+        return;
     }
-#endif
-    if (data.empty()) {
-        std::ifstream fstFile(fstPath, std::ios::binary);
-        if (!fstFile.is_open()) {
-            return;
-        }
 
-        fstFile.seekg(0, std::ios::end);
-        const std::streamsize size = fstFile.tellg();
-        fstFile.seekg(0, std::ios::beg);
-        if (size < 12) {
-            return;
-        }
-
-        data.resize(static_cast<size_t>(size));
-        fstFile.read(reinterpret_cast<char*>(data.data()), size);
-        if (!fstFile) {
-            return;
-        }
+    fstFile.seekg(0, std::ios::end);
+    const std::streamsize size = fstFile.tellg();
+    fstFile.seekg(0, std::ios::beg);
+    if (size < 12) {
+        return;
     }
-    if (data.size() < 12) {
+
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    fstFile.read(reinterpret_cast<char*>(data.data()), size);
+    if (!fstFile) {
         return;
     }
 

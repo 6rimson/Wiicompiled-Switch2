@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent.parent
 PINS = json.loads((HERE / "dependencies.json").read_text())
 PATCHES = HERE / "patches"
 HBL_PATCH = PATCHES / PINS["hblauncher"]["host_patch"]
+SD_HOST_PATCH = PATCHES / "hblauncher-host-sd-assets.diff"
 NS2JB_PATCH = PATCHES / PINS["ns2jb"]["patch"]
 REFERENCE = PINS["hblauncher"]["reference"]
 PAYLOAD = PINS["ns2jb"]["payload"]
@@ -78,6 +79,7 @@ def inspect_hblauncher(directory):
     if work["clone"]:
         return work
     work["patch"] = patch_state(directory, HBL_PATCH)
+    work["sd_patch"] = patch_state(directory, SD_HOST_PATCH)
     if git(directory, "cat-file", "-e", REFERENCE["commit"] + "^{commit}", check=False).returncode != 0:
         raise Stop(f"HBLauncher: commit {REFERENCE['commit'][:7]} is missing from {directory} "
                    "(a shallow clone?). Run git fetch --unshallow there, then try again.")
@@ -191,6 +193,8 @@ def report(hbl, ns2jb, hbl_work, ns2jb_work):
     else:
         if hbl_work["patch"] == "applicable":
             todo.append(f"apply {HBL_PATCH.name}")
+        if hbl_work["sd_patch"] == "applicable":
+            todo.append(f"apply {SD_HOST_PATCH.name}")
         missing = [r for r in REFERENCE["files"] if not (hbl / REFERENCE["directory"] / r).exists()]
         if missing:
             todo.append(f"write {len(missing)} reference files")
@@ -241,6 +245,7 @@ def main():
             if ns2jb_work["clone"]:
                 clone("ns2jb", ns2jb, args.ns2jb_url, PINS["ns2jb"]["commit"])
             apply("HBLauncher", hbl, HBL_PATCH)
+            apply("HBLauncher", hbl, SD_HOST_PATCH)
             write_reference_files(hbl)
             apply("ns2jb", ns2jb, NS2JB_PATCH)
             build_helper(ns2jb, zig)

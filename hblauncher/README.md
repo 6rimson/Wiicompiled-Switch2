@@ -38,7 +38,7 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 
 ## Known issues
 
-- **A PC has to stay on.** Every file is read from and written to your PC over the network through HBLauncher's file server. There's no SD card support and no play away from home, and ns2jb needs both the PC and the console on Ethernet.
+- **A PC has to stay on.** The file server supplies saves, settings, caches and any assets missing from the microSD. The session needs both the PC and console on Ethernet.
 - **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the SmileBASIC program that keeps the session alive. The game keeps running for about two minutes, then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick click**.
 - **Not a locked 60 FPS.** Busy moments with lots of karts on screen dip to the mid 50s, briefly lower in the busiest ones, and there's a short dip right before the countdown. Offline, the game also runs slightly slower than normal speed in those moments.
 - **Change the resolution outside races.** Changing it during a race breaks the graphics until you restart the game; changing it in the game's menus works.
@@ -129,7 +129,7 @@ hblauncher/tools/setup-session.py --hblauncher ~/Switch2/HBLauncher --ns2jb ~/Sw
 
 It clones any folder that doesn't exist yet and checks out the pinned commit, then:
 
-- applies `patches/hblauncher-host-range-mapping.diff` to HBLauncher;
+- applies the range-mapping and SD asset session patches to HBLauncher;
 - writes the inspectors and HID signatures the launcher needs into
   `reference/hblauncher-cpu-sdk/`, taken from HBLauncher's own history (commit `9d00834`, MIT);
 - applies `patches/ns2jb-range-mapping.diff` to ns2jb, rebuilds its native helper with Zig,
@@ -337,6 +337,31 @@ console data, is ignored by Git, and should never be shared:
 | `hbxl-env` | options read at launch (see below) |
 | `icon.png` | optional launcher icon; add your own |
 
+#### Optional microSD game assets
+
+With the console stopped, copy the folders you want to use from your file-server root to the card.
+Keep the same directory layout under `wiicompiled` at the root of the card.
+
+| From `hblauncher/fsroot/` | Destination on microSD |
+|---|---|
+| `disc/DATA/` | `/wiicompiled/disc/DATA/` |
+| `RetroRewind/RetroRewind6/` | `/wiicompiled/RetroRewind/RetroRewind6/` |
+| `dsp_coef.bin` (optional) | `/wiicompiled/dsp_coef.bin` |
+
+You may copy a subset. The game looks on the card first for each eligible read and uses the PC copy
+if the file is missing. Directory scans combine both sources. The save under
+`RetroRewind/riivolution/save/`, settings, NAND, caches and logs still use the PC. Keep the server running.
+After adding or removing files on the card, move `UserData/Cache/dvd_index_rr.bin` out of the PC
+file-server root while the game is closed to force a fresh disc scan.
+
+When upgrading an older build, rerun the `setup-session.py` command for your launcher and use
+a package produced by the updated `runtime`, `build` and `pack` steps.
+The regular `session.sh launcher` command prepares card access for the new package at launch.
+To use the server for all game files, add `MKW_SD=0` to `hblauncher/fsroot/hbxl-env` and relaunch.
+With `MKW_PERF_STATS=1`, the game log reports cumulative opens, bytes, read time and missing-file
+fallbacks by source. Set `MKW_SD_BENCH=1` to compare eight reads of the same disc FST on both
+sources at startup. This measures repeated reads of that file.
+
 ### 6. Play
 
 Create `hblauncher/fsroot/session.env` with the two lines `setup-session.py` printed, for example:
@@ -443,8 +468,7 @@ slow).
 - **Graphics:** Dawn's Vulkan backend on HBLauncher's device, presenting to the `nn::vi` window
   (TP's Dawn and aurora patches). SDL3 uses the offscreen video, `hbx` audio and `hbx` joystick
   drivers (TP's SDL3 patch; HBLauncher sets `SDL_VIDEO_DRIVER`/`SDL_AUDIO_DRIVER`).
-- **Files:** every file is read and written over TCP through HBLauncher's file server. The app's
-  own folder is the file-server root.
+- **Files:** read-only game assets can come from microSD. The file server supplies other paths and handles writes.
 - **Speed:** built with PGO (see below). In Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
   is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
   boost mode is on at launch (about 1534 MHz instead of 1107).

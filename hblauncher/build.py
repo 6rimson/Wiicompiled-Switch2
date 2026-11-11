@@ -92,7 +92,7 @@ RUNTIME_PATCHES = (
     "hblauncher-runtime-main-stack.diff",
     "hblauncher-runtime-file-modes.diff",
     "hblauncher-runtime-syscall-counts.diff",
-    "hblauncher-runtime-fast-clock.diff", "hblauncher-runtime-thread-pin.diff", "hblauncher-runtime-memory-log.diff", "hblauncher-runtime-sockets.diff", "hblauncher-runtime-net-fixes.diff", "hblauncher-runtime-net-trace.diff", "hblauncher-runtime-net-nonblock.diff",
+    "hblauncher-runtime-fast-clock.diff", "hblauncher-runtime-thread-pin.diff", "hblauncher-runtime-memory-log.diff", "hblauncher-runtime-sockets.diff", "hblauncher-runtime-net-fixes.diff", "hblauncher-runtime-net-trace.diff", "hblauncher-runtime-net-nonblock.diff", "hblauncher-runtime-sd-path.diff",
 )
 
 
@@ -284,6 +284,14 @@ def link_flags(variant, build):
     lib = BUILD / "libhbxl.a"
     if not lib.exists():
         raise SystemExit("Build the runtime first: build.py runtime")
+    toolchain = required("HBXL_TOOLCHAIN", "bin/aarch64-linux-musl-gcc")
+    sd_objects = []
+    for source in ("storage", "directory", "vfs", "benchmark"):
+        obj = build / f"sd-{source}.o"
+        run([toolchain / "bin/aarch64-linux-musl-gcc", "-O2", "-fno-pie", "-mbranch-protection=bti",
+             "-Wall", "-Wextra", "-Werror", f"-I{hbl_sdk() / 'sdk/include'}", f"-I{hbl_sdk() / 'sdk/linux'}",
+             "-c", HERE / "sd" / (source + ".c"), "-o", obj])
+        sd_objects.append(str(obj))
     ld = hbl_sdk() / "sdk/linux/hbxl.ld"
     linux = MANIFEST["linux"]
     if any(c.isspace() for c in f"{ld}{lib}"):
@@ -294,7 +302,7 @@ def link_flags(variant, build):
     fs_host = octets[0] | octets[1] << 8 | octets[2] << 16 | octets[3] << 24   # sockaddr byte order
     print(f"file server address compiled in: {FS_HOST}")
     return " ".join([
-        "-nostartfiles", f"-Wl,-T,{ld}",
+        "-nostartfiles", "-Wl,--wrap=hbxl_vfs_syscall", "-Wl,--wrap=hbxl_vfs_shutdown", *sd_objects, f"-Wl,-T,{ld}",
         f"-Wl,--defsym=HBXL_CODE_BASE={linux['code_base']}", f"-Wl,--defsym=HBXL_DATA_BASE={linux['data_base']}",
         f"-Wl,--defsym=HBXL_FS_PORT={FS_PORT}", f"-Wl,--defsym=HBXL_FS_HOST=0x{fs_host:08x}",
         # Hot functions first: the game's code is 120 MB, more than the TLBs and L2 can hold.
@@ -371,7 +379,12 @@ def pack(elf):
     # Distribute only the manifest and the images, never build caches, discs or saves.
     dest = HERE / "dist" / APP_ID
     (dest / "build").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(APP_DIR / "manifest.json", dest / "manifest.json")
+    nm = required("HBXL_TOOLCHAIN") / "bin/aarch64-linux-musl-nm"
+    symbols = subprocess.check_output([nm, "--defined-only", elf], text=True)
+    manifest = dict(MANIFEST)
+    if any(line.endswith(" T hbxl_storage_perf") for line in symbols.splitlines()):
+        manifest["sd_assets"] = True
+    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for name in ("code.bin", "data.bin", "report.json"):
         shutil.copy2(APP_DIR / "build" / name, dest / "build" / name)
     write_fs_host_record(dest, FS_HOST)

@@ -1,0 +1,11 @@
+--- a/sdk/linux/vfs.c
++++ b/sdk/linux/vfs.c
+@@ -291,3 +291,8 @@
+ }
+ 
++/* Resolve relative openat paths against file-server descriptors for the SD overlay. */
++int hbxl_vfs_resolve_path(int dirfd, const char *path, char *out) {
++    return join_path(dirfd, path, out);
++}
++
+ static int alloc_fd(void) {

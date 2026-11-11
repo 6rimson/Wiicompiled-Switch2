@@ -32,6 +32,7 @@ extern std::atomic<uint64_t> aurora_hbx_gpu_done_count;
 extern std::atomic<uint64_t> aurora_hbx_drain_us;
 extern std::atomic<uint64_t> aurora_hbx_drain_count;
 extern "C" uint64_t hbxl_syscall_counts[512] __attribute__((weak));
+extern "C" void hbxl_storage_perf() __attribute__((weak));
 extern "C" int g_gxFrameCount;
 extern "C" volatile long hbxl_net_inflight_call __attribute__((weak));
 extern "C" volatile long hbxl_net_inflight_fd __attribute__((weak));
@@ -356,6 +357,7 @@ void OnFramePresented() noexcept {
     RT_LOGF("perf", "game time-base reads/frame %llu; one clock read costs %.0f ns\n",
             static_cast<unsigned long long>((reads - lastReads) / kWindow), clockNs);
     lastReads = reads;
+    if (hbxl_storage_perf) hbxl_storage_perf();
     if (hbxl_syscall_counts != nullptr) {
         static uint64_t lastCounts[512];
         uint64_t top[5] = {};

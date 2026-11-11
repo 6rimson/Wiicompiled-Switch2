@@ -1,0 +1,32 @@
+--- a/host/lib/runtime.cjs
++++ b/host/lib/runtime.cjs
+@@ -723,6 +723,7 @@
+     const started = Date.now();
+     let codeSource = 0, dataSource = 0, heap = 0, stack = 0, assetsBlock = 0, saveBlock = 0;
+     let importBlock = 0;
++    let sdSession;
+     let exclusive = false;
+     let appStatus = 0;
+     try {
+@@ -805,6 +806,11 @@
+         ctx.buffer.writeBigUInt64LE(BigInt(pkg.saveBytes), ABI.ctx.args + 56);
+       }
+ 
++      if (pkg.manifest.sd_assets && this.target.kind === 'live' && process.env.HBL_SD_SESSION) {
++        sdSession = await require(process.env.HBL_SD_SESSION).prepare(this.runDir);
++        ctx.buffer.writeBigUInt64LE(BigInt(sdSession.descriptor), ABI.ctx.args + 40);
++        this.log.info('SD asset filesystem', {available: !!sdSession.descriptor, result: sdSession.result || 0});
++      }
+       await this.target.write(this.ctxBlock, ctx.buffer);
+       const threaded = !!report.spawn && this.target.kind === 'live' &&
+         process.env.HBL_BLOCKING_APPS !== '1';
+@@ -826,6 +832,9 @@
+       this.log.error('app launch failed', {id: pkg.manifest.id, error: error.message,
+         code: error.code});
+     } finally {
++      if (sdSession && !this.target.client?.pending && !this.target.mappingFailure) {
++        try { await sdSession.close(); } catch (error) { this.log.warn('SD cleanup: ' + error.message); }
++      }
+       await this.readLog();
+       if (saveBlock) {
+         try { await this.storeSave(pkg, saveBlock); }
