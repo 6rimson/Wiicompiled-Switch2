@@ -375,8 +375,10 @@ hblauncher/tools/sd-card.sh pull
 
 `push` refuses a card that is already prepared, since it may hold newer progress than the PC; pull
 first, or add `--force`. `pull` backs up the PC's copies to `UserData/save-backup-<time>-before-pull`
-first. On a card that isn't prepared, `MKW_SD=all` acts like the default. The file server still
-supplies `hbxl-env` and the game log, so keep it running. `tests/sd-fake-card.sh` checks the backend
+first. On a card that isn't prepared, `MKW_SD=all` acts like the default. The game log goes to
+`UserData/Logs/console.log` on the card too (the previous launch's is `console.prev.log`), apart from
+the runtime's first lines before the C library starts. The file server still supplies `hbxl-env`, so
+keep it running. `tests/sd-fake-card.sh` checks the backend
 against a simulated card on Linux.
 
 ### 6. Play

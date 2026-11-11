@@ -38,6 +38,18 @@ uint64_t hbxl_svc_tick(void) {
 int hbxl_threads_live(void) { return 0; }
 void __real_hbxl_vfs_shutdown(void) {}
 void hbxl_vfs_write_console(int fd, const void *data, size_t n) { (void)!write(fd, data, n); }
+/* What still reaches the file server's log. */
+static char server_log[4096];
+static size_t server_used;
+void __real_hbxl_vfs_write_console(int fd, const void *data, size_t n) {
+    (void)fd;
+    if (server_used + n < sizeof(server_log)) {
+        memcpy(server_log + server_used, data, n);
+        server_used += n;
+    }
+}
+void __wrap_hbxl_vfs_write_console(int, const void *, size_t);
+void __wrap_hbxl_vfs_shutdown(void);
 int hbxl_vfs_resolve_path(int fd, const char *name, char *out) {
     (void)fd;
     snprintf(out, 1024, "%s%s", *name == '/' ? "" : "/", name);
@@ -468,6 +480,20 @@ int main(void) {
     }
     CHECK(old == 1 && saved == 1 && pc_only == 0); /* only the card's entries */
     close_(fd);
+
+    /* The game log goes to the card: the runtime's lines and the game's own writes to stdout and
+     * stderr. The previous launch's log is kept. */
+    host_write(card_root, "/UserData/Logs/console.log", "last launch\n", 12);
+    __wrap_hbxl_vfs_write_console(2, "hbxl: runtime line\n", 19);
+    CHECK(call(SYS_write, 2, (long)"game stderr\n", 12, 0, 0) == 12);
+    struct iovec parts[2] = {{"game ", 5}, {"stdout\n", 7}};
+    CHECK(call(SYS_writev, 1, (long)parts, 2, 0, 0) == 12);
+    __wrap_hbxl_vfs_shutdown(); /* writes out what's left, as at exit */
+    char log[256] = {0};
+    CHECK(host_read(card_root, "/UserData/Logs/console.log", log, sizeof(log) - 1) > 0);
+    CHECK(strstr(log, "hbxl: runtime line") && strstr(log, "game stderr") && strstr(log, "game stdout"));
+    CHECK(host_read(card_root, "/UserData/Logs/console.prev.log", log, sizeof(log) - 1) == 12);
+    CHECK(server_used && memmem(server_log, server_used, "runtime line", 12)); /* the server still gets it */
 
     CHECK(locked_refusals == 0); /* the backend never makes the card refuse an open file */
     printf("%d of %d checks passed\n", checks - failures, checks);

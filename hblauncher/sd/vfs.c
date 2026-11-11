@@ -674,6 +674,113 @@ static int fd_op(long n) {
            n == SYS_fdatasync || n == SYS_fchmod || n == SYS_fchown || n == SYS_flock;
 }
 
+/* ---- MKW_SD=all: the game log on the card ------------------------------------------------- */
+
+/* Everything the game and the runtime print goes to /UserData/Logs/console.log on the card too
+ * (the previous launch's is kept as console.prev.log), so a session needs no file server to keep
+ * its log. Text collects in a buffer, and the buffer goes to the card at most every quarter
+ * second, then is flushed so a crash keeps what came before it. Log text can come from inside a
+ * card operation that holds the mutex, so writing out only ever tries the mutex. */
+enum { LOG_BYTES = 64 * 1024 };
+static char log_buffer[LOG_BYTES];
+static size_t log_used;
+static uint64_t log_dropped, log_last_flush;
+static int log_state; /* 0 not decided yet, 1 writing to the card, -1 off */
+static uint32_t log_file;
+static int64_t log_offset;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_append(const void *data, size_t length) {
+    if (log_state < 0 || !length || sd_request() != SD_ALL)
+        return;
+    pthread_mutex_lock(&log_mutex);
+    if (log_used + length <= LOG_BYTES) {
+        memcpy(log_buffer + log_used, data, length);
+        log_used += length;
+    } else
+        log_dropped += length;
+    pthread_mutex_unlock(&log_mutex);
+}
+
+/* Called with the mutex held. */
+static int log_open(void) {
+    static const char path[] = "/UserData/Logs/console.log", previous[] = "/UserData/Logs/console.prev.log";
+    if (sd_mode() != SD_ALL || make_parents(path) < 0)
+        return -1;
+    if (sd_type(path) == 1) {
+        sd_delete(previous);
+        if (sd_rename(path, previous, 0) < 0)
+            sd_delete(path);
+    }
+    if (sd_create(path, 0) < 0)
+        return -1;
+    long handle = sd_open_mode(path, SD_WRITE | SD_APPEND);
+    if (handle < 0)
+        return -1;
+    log_file = handle;
+    log_offset = 0;
+    return 1;
+}
+
+/* Called with the mutex held. The text is copied out first and log_mutex released before any
+ * card call, since a card error prints a line that comes back through log_append. */
+static char log_out[LOG_BYTES + 64];
+static void log_write_out(void) {
+    if (!log_state)
+        log_state = log_open();
+    pthread_mutex_lock(&log_mutex);
+    size_t used = log_state < 0 ? 0 : log_used;
+    memcpy(log_out, log_buffer, used);
+    const uint64_t dropped = log_dropped;
+    log_used = 0;
+    log_dropped = 0;
+    pthread_mutex_unlock(&log_mutex);
+    if (log_state < 0)
+        return;
+    if (dropped) {
+        int n = snprintf(log_out + used, 64, "\n[sd] %llu bytes of log dropped here\n",
+                         (unsigned long long)dropped);
+        if (n > 0 && n < 64)
+            used += n;
+    }
+    long rc = 0;
+    for (size_t done = 0; done < used && rc >= 0;) {
+        size_t want = used - done < SD_CHUNK ? used - done : SD_CHUNK;
+        memcpy(card()->bounce, log_out + done, want);
+        rc = sd_write(log_file, log_offset, want);
+        if (rc >= 0) {
+            log_offset += want;
+            done += want;
+        }
+    }
+    if (rc < 0 || sd_flush(log_file) < 0) {
+        sd_close(log_file);
+        log_state = -1; /* the card refused: stop trying */
+    }
+}
+
+/* Writes the buffer out if a quarter second has passed or it's getting full. */
+static void log_maybe_write_out(int force) {
+    if (!__atomic_load_n(&log_used, __ATOMIC_RELAXED) || log_state < 0)
+        return;
+    const uint64_t now = hbxl_svc_tick();
+    const uint64_t hz = hbxl_ctx && hbxl_ctx->tick_hz ? hbxl_ctx->tick_hz : 19200000;
+    if (!force && now - log_last_flush < hz / 4 && log_used < LOG_BYTES / 2)
+        return;
+    if (pthread_mutex_trylock(&mutex))
+        return; /* inside a card operation (maybe this thread's): next time */
+    log_last_flush = now;
+    log_write_out();
+    pthread_mutex_unlock(&mutex);
+}
+
+/* hbxl_log and hbxl_logf from the runtime come through here (linked with --wrap). */
+extern void __real_hbxl_vfs_write_console(int, const void *, size_t);
+void __wrap_hbxl_vfs_write_console(int fd, const void *data, size_t length) {
+    log_append(data, length);
+    __real_hbxl_vfs_write_console(fd, data, length);
+}
+
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE 1
 #endif
@@ -730,6 +837,16 @@ static long card_change(long n, const char *path, const char *target, long c, lo
 
 long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, long f, int *handled) {
     const int all = sd_request() == SD_ALL; /* confirmed under the mutex below */
+    if (all) {
+        if ((a == 1 || a == 2) && (n == SYS_write || n == SYS_writev)) {
+            if (n == SYS_write)
+                log_append((const void *)b, c);
+            else
+                for (long i = 0; i < c && i < IOV_MAX; i++)
+                    log_append(((const struct iovec *)b)[i].iov_base, ((const struct iovec *)b)[i].iov_len);
+        }
+        log_maybe_write_out(0);
+    }
     int path_op = n == SYS_openat || n == SYS_newfstatat || n == SYS_faccessat || n == 439 || n == SYS_statx ||
                   (all && change_op(n) && !(n == SYS_utimensat && !b));
     int empty = (n == SYS_newfstatat || n == SYS_statx) && ((n == SYS_statx ? c : d) & AT_EMPTY_PATH) &&
@@ -796,9 +913,14 @@ long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, lon
 
 extern void __real_hbxl_vfs_shutdown(void);
 void __wrap_hbxl_vfs_shutdown(void) {
+    log_maybe_write_out(1);
     /* The runtime can stop while worker threads are still unwinding. Let
      * normal shutdown join them before freeing any remaining SD descriptions. */
     if (!hbxl_threads_live()) {
+        if (log_state > 0) {
+            sd_close(log_file);
+            log_state = -1;
+        }
         for (int fd = FIRST; fd < LIMIT; fd++)
             if (table[fd - FIRST])
                 close_fd(fd);
