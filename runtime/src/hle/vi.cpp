@@ -397,6 +397,20 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
             if (now < target) {
                 return advancedAny;
             }
+            // After the console sleeps (its clock keeps running) or the process stalls, every
+            // missed retrace would be replayed back to back and the game would fast-forward
+            // through the gap: hours of it after a night asleep. Past kMaxRetraceBacklog the
+            // backlog is dropped and the game continues from now. Shorter hitches, such as
+            // shader builds (well under a second), still catch up as before.
+            constexpr auto kMaxRetraceBacklog = std::chrono::seconds(5);
+            if (now - target > kMaxRetraceBacklog) {
+                const auto skipped = (now - target) / g_vi.retraceInterval;
+                std::fprintf(stderr, "[vi] %.1f s behind (the console slept or stalled): skipped %lld retraces\n",
+                             std::chrono::duration<double>(now - target).count(),
+                             static_cast<long long>(skipped));
+                g_vi.lastRetrace = now - g_vi.retraceInterval;
+                target = now;
+            }
         }
 
 
