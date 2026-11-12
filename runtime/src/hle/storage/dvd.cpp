@@ -836,6 +836,16 @@ static void AppendStat(std::string& key, const fs::path& path) {
     key += fs::is_directory(status) ? ":d" : ":f";
 }
 
+// The overlay's version text itself: a Retro Rewind update changes it, but not always its size
+// (6.13.5 -> 6.13.6), and on an SD card the game files report no dates, so the stat alone can
+// miss an update copied over the old files by hand.
+static void AppendText(std::string& key, const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    char text[64];
+    in.read(text, sizeof(text));
+    key += "|text=" + std::string(text, static_cast<size_t>(in ? sizeof(text) : in.gcount()));
+}
+
 static std::string BuildKey(const fs::path& rootPath, const std::vector<RuntimeRiivolution::Overlay>& overlays) {
     std::string key = "v" + std::to_string(kVersion) + (RuntimeProduct::IsRetroRewind() ? "|rr" : "|base");
     key += "|game=" + std::to_string(CurrentDiscGameCode());
@@ -846,6 +856,7 @@ static std::string BuildKey(const fs::path& rootPath, const std::vector<RuntimeR
         key += "|root=" + RuntimeConfigFile::PathToUtf8(overlay->root);
         AppendStat(key, overlay->root);
         AppendStat(key, overlay->root / "version.txt");
+        AppendText(key, overlay->root / "version.txt");
         if (!overlay->patches) {
             key += "|noxml";
             continue;
