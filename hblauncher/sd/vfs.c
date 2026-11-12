@@ -86,22 +86,23 @@ static int asset_path(const char *p) {
     return !strcmp(p, "/RetroRewind") || root(p, "/disc") || root(p, "/RetroRewind/RetroRewind6") ||
            !strcmp(p, "/dsp_coef.bin");
 }
-/* MKW_SD: unset = game assets from the card; 0 = all from the PC; all = everything from the
- * card, with writes only to the card (experimental). */
+/* MKW_SD: unset or all = everything from a full card (writes only to the card), else game assets
+ * from the card; 0 = all from the PC. */
 enum { SD_OFF, SD_ASSETS, SD_ALL };
-/* MKW_SD=all needs a card prepared by tools/sd-card.sh push, which copies the whole file-server
- * root and writes /wiicompiled/.fsroot. Without it the game would start with no NAND or save,
- * so an unprepared card stays in the assets mode. Checked once per launch. */
+/* A full card is a copy of the whole file-server root in /wiicompiled, which a copy by hand makes:
+ * it has UserData/NAND (or tools/sd-card.sh push's /.fsroot). Without one the game would start with
+ * no NAND or save, so another card only gives game assets. Checked once per launch. */
 /* The first file calls come before libc has set up thread data, so this must not use anything
  * that needs it (pthread_once does): it is a plain flag, set under the mutex on first use. */
 int sd_card_prepared = -1; /* not static: tests/sd-fake-card.c resets it */
 extern void hbxl_vfs_write_console(int, const void *, size_t);
+static int full_card(void) { return sd_type("/UserData/NAND") == 0 || sd_type("/.fsroot") == 1; }
 static int prepared_card(void) { /* called with the mutex held */
     if (sd_card_prepared < 0) {
-        sd_card_prepared = sd_type("/.fsroot") == 1;
+        sd_card_prepared = full_card();
         if (!sd_card_prepared) {
-            static const char note[] = "[sd] MKW_SD=all needs a card prepared with tools/sd-card.sh "
-                                       "push; using game data from the card only\n";
+            static const char note[] = "[sd] the card has no wiicompiled/UserData/NAND (a copy of all of "
+                                       "fsroot): only game files come from it\n";
             hbxl_vfs_write_console(2, note, sizeof(note) - 1);
         }
     }
@@ -113,11 +114,9 @@ static int sd_request(void) {
     if (!ctx || ctx->magic != SD_MAGIC)
         return SD_OFF;
     const char *v = getenv("MKW_SD");
-    if (!v)
-        return SD_ASSETS;
-    if (!strcmp(v, "0"))
-        return SD_OFF;
-    return strcmp(v, "all") ? SD_ASSETS : SD_ALL;
+    if (!v || !strcmp(v, "all"))
+        return SD_ALL;
+    return strcmp(v, "0") ? SD_ASSETS : SD_OFF;
 }
 /* The mode in effect: "all" needs a prepared card. Only call it with the mutex held. */
 static int sd_mode(void) {
@@ -853,20 +852,29 @@ void __wrap_hbxl_vfs_write_console(int fd, const void *data, size_t length) {
     __real_hbxl_vfs_write_console(fd, data, length);
 }
 
-/* Starting without the file server. The runtime reads /hbxl-env (the settings, MKW_SD=all among
- * them) from the server before libc starts. With no server it gets the card's copy, written by
- * tools/sd-card.sh push. That read happens before any other thread exists and before libc can
- * allocate, so the copy lives in a static buffer behind a reserved descriptor. */
+/* Starting without the file server. The runtime reads /hbxl-env (the settings) from the server
+ * before libc starts. With no server it gets the full card's copy, or no settings if the card has
+ * none. That read happens before any other thread exists and before libc can allocate, so the copy
+ * lives in a static buffer behind a reserved descriptor. */
 enum { ENV_FD = LIMIT - 1 };
 static char env_copy[4096];
 static long env_length, env_at;
 static int env_open;
 static long card_env(void) {
-    static const char missing[] = "[sd] no file server, and no settings on the card: prepare it with tools/sd-card.sh push\n",
-                      found[] = "[sd] no file server; settings from the card's hbxl-env\n";
-    if (sd_type("/.fsroot") != 1 || sd_type("/hbxl-env") != 1) {
+    static const char missing[] = "[sd] no file server, and the card has no wiicompiled/UserData/NAND: "
+                                  "copy all of fsroot to it\n",
+                      found[] = "[sd] no file server; settings from the card's hbxl-env\n",
+                      none[] = "[sd] no file server; no hbxl-env on the card, so default settings\n";
+    if (!full_card()) {
         hbxl_vfs_write_console(2, missing, sizeof(missing) - 1);
         return -EIO;
+    }
+    if (sd_type("/hbxl-env") != 1) {
+        env_length = env_at = 0;
+        env_open = 1;
+        sd_card_prepared = 1;
+        hbxl_vfs_write_console(2, none, sizeof(none) - 1);
+        return ENV_FD;
     }
     long handle = sd_open("/hbxl-env", 0);
     if (handle < 0)

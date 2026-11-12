@@ -612,13 +612,35 @@ int main(void) {
     char card_copy[300];
     snprintf(card_copy, sizeof(card_copy), "%s/hbxl-env", card_root);
     unlink(card_copy);
-    CHECK(open_("/hbxl-env", O_RDONLY) == -EIO); /* no copy on the card: as before */
+    fd = open_("/hbxl-env", O_RDONLY); /* a full card without settings: the defaults */
+    CHECK(fd == 4095 && call(SYS_read, fd, (long)env, 8, 0, 0) == 0 && close_(fd) == 0);
     /* Game folders list from the card alone, and a file the card lacks is missing, not an error. */
     fd = open_("/disc/DATA/sys", O_RDONLY | O_DIRECTORY);
     CHECK(fd >= 2048 && call(SYS_getdents64, fd, (long)listing, sizeof(listing), 0, 0) > 0);
     close_(fd);
     CHECK(open_("/disc/DATA/sys/missing.bin", O_RDONLY) == -ENOENT);
     offline = 0;
+
+    /* A copy of the whole root made by hand (no /.fsroot, no MKW_SD): everything from the card. */
+    char marker[300];
+    snprintf(marker, sizeof(marker), "%s/.fsroot", card_root);
+    unlink(marker);
+    unsetenv("MKW_SD");
+    prepared_reset();
+    offline = 1;
+    CHECK(open_("/hbxl-env", O_RDONLY) == -EIO); /* no NAND yet: not a full card */
+    offline = 0;
+    host_write(card_root, "/UserData/hand.txt", "card", 4);
+    host_write(pc_root, "/UserData/hand.txt", "pc!!", 4);
+    prepared_reset();
+    fd = open_("/UserData/hand.txt", O_RDONLY);
+    CHECK(fd >= 0 && fd < 2048 && call(SYS_read, fd, (long)got, 16, 0, 0) == 4 && !memcmp(got, "pc!!", 4));
+    close_(fd);
+    host_write(card_root, "/UserData/NAND/shared2/sys/SYSCONF", "sysconf", 7);
+    prepared_reset();
+    fd = open_("/UserData/hand.txt", O_RDONLY);
+    CHECK(fd >= 2048 && pread_(fd, got, 16, 0) == 4 && !memcmp(got, "card", 4));
+    close_(fd);
 
     CHECK(locked_refusals == 0); /* the backend never makes the card refuse an open file */
     printf("%d of %d checks passed\n", checks - failures, checks);

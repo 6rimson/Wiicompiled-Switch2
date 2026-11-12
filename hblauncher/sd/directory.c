@@ -155,8 +155,7 @@ int sd_known(const char *path, int *directory, int64_t *size) {
 }
 
 static long load(struct listing *l, uint32_t handle, const char *path) {
-    const char *mode = getenv("MKW_SD");
-    const int all = mode && !strcmp(mode, "all");
+    const int all = l->card_only; /* everything from a full card (vfs.c sets it) */
     struct known_entry *seen = NULL;
     size_t seen_count = 0, seen_capacity = 0;
     long count, reads = 0;
