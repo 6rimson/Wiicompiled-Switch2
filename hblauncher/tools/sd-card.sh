@@ -44,18 +44,27 @@ push)
   rm -f "$dest/.fsroot"  # an interrupted copy leaves the card unprepared
   # The writable folders become exact copies (--delete), so nothing stale is left behind, such as
   # an old SQLite journal. Game data only gets new and changed files.
+  # The card keeps its own saved file index (Cache/dvd_index_*.bin): the PC's was built from the
+  # PC's folder dates and never matches the card, and rebuilding one from the card is slow.
   "${RSYNC[@]}" --delete --exclude 'save-backup-*' --exclude 'Cache.run3-backup' --exclude Captures \
-    "$root/UserData/" "$dest/UserData/"
+    --exclude 'dvd_index_*' "$root/UserData/" "$dest/UserData/"
   if [[ -d "$root/RetroRewind/riivolution" ]]; then
     mkdir -p "$dest/RetroRewind"
     "${RSYNC[@]}" --delete "$root/RetroRewind/riivolution/" "$dest/RetroRewind/riivolution/"
   fi
-  "${RSYNC[@]}" --exclude UserData --exclude 'RetroRewind/riivolution' --exclude 'RetroRewind/*-backup' \
-    --exclude fs-run.log --exclude session.env --exclude 'hbxl-env*' "$root/" "$dest/"
+  changed="$("${RSYNC[@]}" --out-format='%n' --exclude UserData --exclude 'RetroRewind/riivolution' \
+    --exclude 'RetroRewind/*-backup' --exclude fs-run.log --exclude session.env --exclude 'hbxl-env*' \
+    "$root/" "$dest/" | grep -cv '/$' || true)"
   # The settings the game reads when it starts without the file server: the root's, with the card
   # as the only copy (MKW_SD=all; earlier lines win).
   { echo "MKW_SD=all"; [[ -f "$root/hbxl-env" ]] && grep -v '^MKW_SD=' "$root/hbxl-env"; true; } > "$dest/hbxl-env"
   printf 'prepared from %s on %s\n' "$root" "$(date '+%Y-%m-%d %H:%M')" > "$dest/.fsroot"
+  # New or changed game files (a Retro Rewind update, say): the card's file index is out of date.
+  # Its check can miss that on the card, where game files have no dates, so remove it here.
+  if [[ "$changed" -gt 0 ]]; then
+    echo "$changed game file(s) changed: the game will rebuild its file index on the next start."
+    rm -f "$dest"/UserData/Cache/dvd_index_*.bin
+  fi
   # macOS keeps file metadata on FAT in ._ files, which dot_clean can't always merge there.
   find "$dest" -name '._*' -delete
   sync
@@ -72,7 +81,8 @@ pull)
   fi
   # Exact copies (--delete): a cache database with another copy's leftover journal is damaged.
   "${RSYNC[@]}" --delete "$dest/UserData/NAND/" "$root/UserData/NAND/"
-  "${RSYNC[@]}" --delete "$dest/UserData/Cache/" "$root/UserData/Cache/"
+  # The card's file index is for the card's folder dates; the PC keeps its own.
+  "${RSYNC[@]}" --delete --exclude 'dvd_index_*' "$dest/UserData/Cache/" "$root/UserData/Cache/"
   [[ -f "$dest/UserData/Config.toml" ]] && "${RSYNC[@]}" "$dest/UserData/Config.toml" "$root/UserData/"
   if [[ -d "$dest/RetroRewind/riivolution/save" ]]; then
     "${RSYNC[@]}" --delete "$dest/RetroRewind/riivolution/save/" "$root/RetroRewind/riivolution/save/"

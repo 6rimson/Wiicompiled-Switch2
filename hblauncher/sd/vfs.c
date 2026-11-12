@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,6 +204,9 @@ static long open_asset(const char *path, int flags) {
     int dir = type == 0;
     if ((flags & O_DIRECTORY) && !dir)
         return -ENOTDIR;
+    const int scan = dir && (root(path, "/disc") || root(path, "/RetroRewind/RetroRewind6"));
+    if (scan)
+        sd_trace("[sd] opening folder %s", path);
     long handle = sd_open(path, dir);
     if (handle < 0)
         return handle;
@@ -221,7 +225,25 @@ static long open_asset(const char *path, int flags) {
     f->handle = handle;
     f->size = size;
     f->directory = dir;
-    f->listing.card_only = dir && writable(path); /* the card is the only copy there */
+    /* With MKW_SD=all the card is a full copy of the root (sd-card.sh push), so folders list the
+     * card only: the PC's copy may be stale, or not running at all. */
+    f->listing.card_only = dir && sd_mode() == SD_ALL;
+    /* The game can't change these, so stat may answer from what the listing said (sd_known). */
+    f->listing.remember = scan;
+    if (dir) {
+        /* The whole listing now, and the folder closed on the card at once. The console's file
+         * service stops for good (the whole console with it) when one more folder is opened while
+         * a few are open: rebuilding the game's file index, which walks folders with all their
+         * parents open, froze the console opening its 5th. Reading ahead keeps one open at most. */
+        long listed = sd_load(&f->listing, handle, path);
+        long closed = sd_close(handle);
+        f->handle = 0;
+        if (listed < 0 || closed < 0) {
+            sd_free_listing(&f->listing);
+            free(f);
+            return listed < 0 ? listed : closed;
+        }
+    }
     f->flags = flags;
     memcpy(f->path, path, n);
     table[fd - FIRST] = f;
@@ -253,7 +275,7 @@ static long close_fd(long fd) {
     table[fd - FIRST] = NULL;
     if (--f->refs)
         return 0;
-    long rc = f->node ? release_node(f->node) : sd_close(f->handle);
+    long rc = f->node ? release_node(f->node) : f->directory ? 0 : sd_close(f->handle); /* see open_asset */
     sd_free_listing(&f->listing);
     free(f);
     return rc;
@@ -506,14 +528,18 @@ static void extended(const struct stat *st, struct statx *sx) {
     sx->stx_dev_minor = st->st_dev;
 }
 static long path_stat(const char *path, long n, long c, long e) {
-    long type = sd_type(path);
+    int directory;
+    int64_t size = 0;
+    const int known = sd_known(path, &directory, &size); /* no card calls */
+    long type = known ? !directory : sd_type(path);
     if (type < 0)
         return type;
     if (n == SYS_faccessat || n == 439)
         return ((c & X_OK) && type != 0) || ((c & W_OK) && !writable(path)) ? -EACCES : 0;
-    long size = 0;
-    const struct node *open_node = type != 0 ? find_node(path) : NULL;
-    if (open_node)
+    const struct node *open_node = type != 0 && !known ? find_node(path) : NULL;
+    if (known)
+        size = type ? size : 0;
+    else if (open_node)
         size = open_node->size;
     else if (type != 0) {
         long file = sd_open(path, 0);
@@ -798,6 +824,28 @@ static void log_maybe_write_out(int force) {
     pthread_mutex_unlock(&mutex);
 }
 
+/* A line for the log that reaches the card at once, for steps that might stop the console (a
+ * folder scan): the last line then shows where. Call with the mutex held and the bounce buffer
+ * free, as the write uses both. */
+void sd_trace(const char *format, ...) {
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(line, sizeof(line) - 1, format, args);
+    va_end(args);
+    if (n < 0)
+        return;
+    if (n > (int)sizeof(line) - 2)
+        n = sizeof(line) - 2;
+    line[n++] = '\n';
+    if (sd_mode() != SD_ALL) {
+        hbxl_vfs_write_console(2, line, n);
+        return;
+    }
+    log_append(line, n);
+    log_write_out();
+}
+
 /* hbxl_log and hbxl_logf from the runtime come through here (linked with --wrap). */
 extern void __real_hbxl_vfs_write_console(int, const void *, size_t);
 void __wrap_hbxl_vfs_write_console(int fd, const void *data, size_t length) {
@@ -996,7 +1044,9 @@ long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, lon
         return rc;
     if ((route && rc != -ENOENT) || (!route && rc < 0))
         return rc;
-    return pc_call(n, AT_FDCWD, (long)path, c, d, e, f, handled);
+    long pc = pc_call(n, AT_FDCWD, (long)path, c, d, e, f, handled);
+    /* -EIO: no file server. A file the card doesn't have is then simply missing. */
+    return route && pc == -EIO ? -ENOENT : pc;
 }
 
 extern void __real_hbxl_vfs_shutdown(void);

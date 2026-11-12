@@ -427,11 +427,18 @@ struct RecordedRegistration {
     uint32_t size = 0;
 };
 static std::vector<RecordedRegistration>* g_recordedRegistrations = nullptr;
+static long long g_indexScanStartMs = 0;
 
 static void RegisterFileEntry(std::string dvdPath, const fs::path& hostPath, uint32_t size) {
     dvdPath = DvdFstContract::CanonicalizePath(dvdPath);
     if (g_recordedRegistrations) {
         g_recordedRegistrations->push_back({dvdPath, RuntimeConfigFile::PathToUtf8(hostPath), size});
+        // A full scan can take a while from slow storage (an SD card on a console): show progress.
+        if (g_recordedRegistrations->size() % 1000 == 0) {
+            RT_LOG(RT_TAG_DVD) << "disc index: " << g_recordedRegistrations->size()
+                      << " file(s) so far (" << (RuntimeStall::NowMs() - g_indexScanStartMs) << " ms)"
+                      << std::endl;
+        }
     }
 
     DVDFileEntry fileEntry;
@@ -520,8 +527,10 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
             return;
         }
 
-        const fs::path relative = fs::relative(entry.path(), root, entryEc);
-        if (entryEc) {
+        // The walk builds each path from root itself, so the relative part is plain text: no
+        // fs::relative, which asks the file system about every path twice more per file.
+        const fs::path relative = entry.path().lexically_relative(root);
+        if (relative.empty()) {
             return;
         }
 
@@ -991,6 +1000,9 @@ extern "C" void DVDInit_8015EA1C()
     const bool indexFromCache = DvdIndexCache::Load(indexKey, cachedVanillaEntryCount);
     std::vector<RecordedRegistration> recorded;
     if (!indexFromCache) {
+        RT_LOG(RT_TAG_DVD) << "disc index: no saved index matches, scanning every file (slow the "
+                     "first time)" << std::endl;
+        g_indexScanStartMs = indexStartMs;
         g_recordedRegistrations = &recorded;
 
         // Map "<dvd_root>/files" -> "/"

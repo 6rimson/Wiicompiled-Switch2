@@ -80,29 +80,135 @@ static long load_pc(struct listing *l, const char *path) {
     __real_hbxl_vfs_syscall(SYS_close, fd, 0, 0, 0, 0, 0, &handled);
     return rc;
 }
+/* Folders of read-only game data listed this launch. Rebuilding the game's file index lists
+ * every folder and then asks for the type and size of each of its ~6,000 files, 4 card calls
+ * apiece when the card is asked, and that many calls froze the console. The listing already
+ * says both, and the game can't change these folders, so stat answers from it instead. */
+struct known_entry {
+    char *name;
+    int64_t size;
+    int directory;
+};
+struct known_folder {
+    struct known_folder *next;
+    struct known_entry *entries; /* sorted by name */
+    size_t count;
+    char path[];
+};
+enum { BUCKETS = 1024, KNOWN_LIMIT = 50000 };
+static struct known_folder *known[BUCKETS];
+static size_t known_total;
+
+static unsigned bucket(const char *s, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ (unsigned char)s[i]) * 16777619u;
+    return h & (BUCKETS - 1);
+}
+static struct known_folder *find_folder(const char *path, size_t n) {
+    for (struct known_folder *f = known[bucket(path, n)]; f; f = f->next)
+        if (!strncmp(f->path, path, n) && !f->path[n])
+            return f;
+    return NULL;
+}
+static int by_name(const void *a, const void *b) {
+    return strcmp(((const struct known_entry *)a)->name, ((const struct known_entry *)b)->name);
+}
+static void forget(struct known_entry *entries, size_t count) {
+    for (size_t i = 0; i < count; i++)
+        free(entries[i].name);
+    free(entries);
+}
+/* Takes ownership of entries. Memory runs short? Then that folder just isn't remembered. */
+static void remember(const char *path, struct known_entry *entries, size_t count) {
+    const size_t n = strlen(path);
+    struct known_folder *f = NULL;
+    if (!find_folder(path, n) && known_total + count <= KNOWN_LIMIT)
+        f = malloc(sizeof(*f) + n + 1);
+    if (!f) {
+        forget(entries, count);
+        return;
+    }
+    qsort(entries, count, sizeof(*entries), by_name);
+    f->entries = entries;
+    f->count = count;
+    memcpy(f->path, path, n + 1);
+    const unsigned b = bucket(path, n);
+    f->next = known[b];
+    known[b] = f;
+    known_total += count;
+}
+int sd_known(const char *path, int *directory, int64_t *size) {
+    const char *slash = strrchr(path, '/');
+    if (!slash || !slash[1])
+        return 0;
+    const struct known_folder *f = find_folder(path, slash == path ? 1 : (size_t)(slash - path));
+    if (!f)
+        return 0;
+    struct known_entry key = {(char *)slash + 1, 0, 0};
+    const struct known_entry *e = bsearch(&key, f->entries, f->count, sizeof(key), by_name);
+    if (!e)
+        return 0;
+    *directory = e->directory;
+    *size = e->size;
+    return 1;
+}
+
 static long load(struct listing *l, uint32_t handle, const char *path) {
     const char *mode = getenv("MKW_SD");
     const int all = mode && !strcmp(mode, "all");
-    long count;
-    while ((count = sd_entries(handle)) > 0) {
+    struct known_entry *seen = NULL;
+    size_t seen_count = 0, seen_capacity = 0;
+    long count, reads = 0;
+    for (;;) {
+        /* Before each card read, where the bounce buffer is free (it holds the entries after). */
+        if (l->remember)
+            sd_trace("[sd] %s: reading entries (%zu so far, read %ld)", path, l->count, reads + 1);
+        if ((count = sd_entries(handle)) <= 0)
+            break;
+        reads++;
         const struct sd_entry *entries = (const void *)card()->bounce;
         for (long i = 0; i < count; i++) {
             size_t n = strnlen(entries[i].name, sizeof(entries[i].name));
-            if (n == sizeof(entries[i].name))
-                return -EIO;
+            long rc = n == sizeof(entries[i].name) ? -EIO : 0;
             /* Finder creates AppleDouble files alongside assets copied to FAT. */
-            if (!strncmp(entries[i].name, "._", 2) || !strcmp(entries[i].name, ".DS_Store"))
+            if (!rc && (!strncmp(entries[i].name, "._", 2) || !strcmp(entries[i].name, ".DS_Store")))
                 continue;
             /* Outside MKW_SD=all the card only answers for RetroRewind6 in this folder. */
-            if (!strcmp(path, "/RetroRewind") && strcmp(entries[i].name, "RetroRewind6") && !all)
+            if (!rc && !strcmp(path, "/RetroRewind") && strcmp(entries[i].name, "RetroRewind6") && !all)
                 continue;
-            long rc = append(l, entries[i].name, n, entries[i].type ? DT_REG : DT_DIR, 0);
-            if (rc < 0)
+            if (!rc)
+                rc = append(l, entries[i].name, n, entries[i].type ? DT_REG : DT_DIR, 0);
+            if (!rc && l->remember && seen_count == seen_capacity) {
+                size_t capacity = seen_capacity ? 2 * seen_capacity : 64;
+                struct known_entry *grown = realloc(seen, capacity * sizeof(*seen));
+                if (grown) {
+                    seen = grown;
+                    seen_capacity = capacity;
+                } else
+                    l->remember = 0; /* stat asks the card, as before */
+            }
+            if (!rc && l->remember) {
+                char *name = strndup(entries[i].name, n);
+                if (name)
+                    seen[seen_count++] = (struct known_entry){name, entries[i].size, !entries[i].type};
+                else
+                    l->remember = 0;
+            }
+            if (rc < 0) {
+                forget(seen, seen_count);
                 return rc;
+            }
         }
     }
+    if (l->remember)
+        sd_trace("[sd] %s: %zu entries in %ld read(s), result %ld", path, l->count, reads, count);
+    if (count < 0 || !l->remember)
+        forget(seen, seen_count);
     if (count < 0)
         return count;
+    if (l->remember)
+        remember(path, seen, seen_count);
     long rc = l->card_only ? 0 : load_pc(l, path);
     if (rc < 0)
         return rc;
@@ -118,11 +224,14 @@ static long load(struct listing *l, uint32_t handle, const char *path) {
     l->count = used;
     return 0;
 }
+long sd_load(struct listing *l, uint32_t handle, const char *path) {
+    long rc = load(l, handle, path);
+    l->loaded = rc < 0 ? rc : 1;
+    return rc < 0 ? rc : 0;
+}
 long sd_list(struct listing *l, uint32_t handle, const char *path, void *buffer, size_t size) {
-    if (!l->loaded) {
-        long rc = load(l, handle, path);
-        l->loaded = rc < 0 ? rc : 1;
-    }
+    if (!l->loaded)
+        sd_load(l, handle, path);
     if (l->loaded < 0)
         return l->loaded;
     size_t used = 0;

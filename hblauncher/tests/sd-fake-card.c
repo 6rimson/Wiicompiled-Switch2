@@ -96,6 +96,9 @@ struct object {
     int count;
 };
 static struct object objects[MAXH];
+/* The console's file service freezes the whole console when a 5th folder is opened while 4 are
+ * open (found on hardware): count how many are open at once. */
+static int open_folders, most_open_folders;
 static uint32_t command[1024];
 static char path_buffer[SD_PATH];
 static uint8_t bounce[SD_CHUNK];
@@ -141,6 +144,8 @@ static int new_object(int dir, const char *host, int mode, int fd) {
             memset(&objects[i], 0, sizeof(objects[i]));
             objects[i].used = 1;
             objects[i].dir = dir;
+            if (dir && ++open_folders > most_open_folders)
+                most_open_folders = open_folders;
             objects[i].mode = mode;
             objects[i].fd = fd;
             snprintf(objects[i].path, sizeof(objects[i].path), "%s", host);
@@ -149,8 +154,10 @@ static int new_object(int dir, const char *host, int mode, int fd) {
     return -1;
 }
 static int keep_entry(const struct dirent *e) { return strcmp(e->d_name, ".") && strcmp(e->d_name, ".."); }
+static long card_calls; /* every request to the card */
 static uint32_t send(void *message, uint64_t size, uint32_t handle) {
     (void)size;
+    card_calls++;
     uint32_t *p = message;
     unsigned nx = (p[0] >> 16) & 15, na = (p[0] >> 20) & 15, nb = (p[0] >> 24) & 15;
     uint64_t x[2] = {0}, buffer = 0, buffer_size = 0;
@@ -291,6 +298,7 @@ static uint32_t send(void *message, uint64_t size, uint32_t handle) {
     return 1;
 }
 static uint32_t close_handle(uint32_t handle) {
+    card_calls++;
     if (handle >= MAXH || !objects[handle].used)
         return 1;
     struct object *o = &objects[handle];
@@ -299,6 +307,7 @@ static uint32_t close_handle(uint32_t handle) {
     for (int i = 0; i < o->count; i++)
         free(o->entries[i]);
     free(o->entries);
+    open_folders -= o->dir;
     o->used = 0;
     return 0;
 }
@@ -504,6 +513,65 @@ int main(void) {
     CHECK(call(SYS_write, 2, (long)"game stderr\n", 12, 0, 0) == 12);
     struct iovec parts[2] = {{"game ", 5}, {"stdout\n", 7}};
     CHECK(call(SYS_writev, 1, (long)parts, 2, 0, 0) == 12);
+    /* Rebuilding the game's file index: a folder bigger than one card read (334 entries), then
+     * the type and size of each file, which the listing already gave: no card calls. */
+    enum { RACE_FILES = 800 };
+    host_write(card_root, "/disc/files/Race/Course/sub/x.szs", "x", 1);
+    host_write(card_root, "/disc/files/Race/Unlisted/y.szs", "y", 1);
+    for (int i = 0; i < RACE_FILES; i++) {
+        char name[1100];
+        snprintf(name, sizeof(name), "%s/disc/files/Race/Course/track%03d.szs", card_root, i);
+        FILE *file = fopen(name, "wb");
+        for (int k = 0; k < i; k++)
+            fputc(k, file);
+        fclose(file);
+    }
+    /* The scan keeps every parent folder open while it walks: the card has one open at most. */
+    most_open_folders = open_folders;
+    const char *chain[] = {"/disc", "/disc/files", "/disc/files/Race", "/disc/files/Race/Course",
+                           "/disc/files/Race/Course/sub"};
+    long parents[5];
+    for (int i = 0; i < 5; i++)
+        parents[i] = open_(chain[i], O_RDONLY | O_DIRECTORY);
+    long first = call(SYS_getdents64, parents[4], (long)listing, sizeof(listing), 0, 0);
+    CHECK(parents[0] >= 2048 && parents[4] >= 2048 && first > 0 && most_open_folders <= 1);
+    CHECK(call(SYS_lseek, parents[4], 0, SEEK_SET, 0, 0) == 0 &&
+          call(SYS_getdents64, parents[4], (long)listing, sizeof(listing), 0, 0) == first); /* rewinds */
+    for (int i = 0; i < 5; i++)
+        close_(parents[i]);
+    CHECK(open_folders == 0);
+    fd = open_("/disc/files/Race/Course", O_RDONLY | O_DIRECTORY);
+    long names = 0, got_bytes;
+    while ((got_bytes = call(SYS_getdents64, fd, (long)listing, sizeof(listing), 0, 0)) > 0)
+        for (long i = 0; i < got_bytes; i += ((struct dirent *)(listing + i))->d_reclen)
+            names++;
+    CHECK(fd >= 2048 && got_bytes == 0 && names == RACE_FILES + 1);
+    close_(fd);
+    /* Each step of a scan is in the card's log at once: the last line shows where a scan stopped. */
+    static char trace[1 << 20];
+    CHECK(host_read(card_root, "/UserData/Logs/console.log", trace, sizeof(trace) - 1) > 0 &&
+          strstr(trace, "[sd] opening folder /disc/files/Race/Course\n") &&
+          strstr(trace, "[sd] /disc/files/Race/Course: reading entries (668 so far, read 3)\n") &&
+          strstr(trace, "[sd] /disc/files/Race/Course: 801 entries in 3 read(s), result 0\n"));
+    const long before = card_calls;
+    int right = 0;
+    for (int i = 0; i < RACE_FILES; i++) {
+        char name[128];
+        struct stat st;
+        snprintf(name, sizeof(name), "/disc/files/Race/Course/track%03d.szs", i);
+        right += call(SYS_newfstatat, AT_FDCWD, (long)name, (long)&st, 0, 0) == 0 && S_ISREG(st.st_mode) &&
+                 st.st_size == i;
+    }
+    struct stat folder;
+    CHECK(right == RACE_FILES);
+    CHECK(call(SYS_newfstatat, AT_FDCWD, (long)"/disc/files/Race/Course/sub", (long)&folder, 0, 0) == 0 &&
+          S_ISDIR(folder.st_mode));
+    CHECK(card_calls == before);
+    /* Not listed: asked from the card, as before. */
+    CHECK(call(SYS_newfstatat, AT_FDCWD, (long)"/disc/files/Race/Unlisted/y.szs", (long)&folder, 0, 0) == 0 &&
+          folder.st_size == 1 && card_calls > before);
+    CHECK(call(SYS_newfstatat, AT_FDCWD, (long)"/disc/files/Race/Course/none.szs", (long)&folder, 0, 0) == -ENOENT);
+
     __wrap_hbxl_vfs_shutdown(); /* writes out what's left, as at exit */
     char log[256] = {0};
     CHECK(host_read(card_root, "/UserData/Logs/console.log", log, sizeof(log) - 1) > 0);
@@ -545,6 +613,11 @@ int main(void) {
     snprintf(card_copy, sizeof(card_copy), "%s/hbxl-env", card_root);
     unlink(card_copy);
     CHECK(open_("/hbxl-env", O_RDONLY) == -EIO); /* no copy on the card: as before */
+    /* Game folders list from the card alone, and a file the card lacks is missing, not an error. */
+    fd = open_("/disc/DATA/sys", O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 2048 && call(SYS_getdents64, fd, (long)listing, sizeof(listing), 0, 0) > 0);
+    close_(fd);
+    CHECK(open_("/disc/DATA/sys/missing.bin", O_RDONLY) == -ENOENT);
     offline = 0;
 
     CHECK(locked_refusals == 0); /* the backend never makes the card refuse an open file */
