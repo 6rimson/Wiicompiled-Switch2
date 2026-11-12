@@ -41,3 +41,17 @@ tested on their own, so "why" says what was seen at the time, not that the patch
 | `patches/ns2jb-range-mapping.diff` | ns2jb `engine/switch2/ro/worker-control.cjs`, `payload/main.c`, `process.c`, new `hbl-range.h`, `tests/` | Adds map RX, map RW and unmap for page ranges (`0x524f001a`–`0x524f001c`) to the RPC dispatcher and the native helper. The helper checks the caller's identity, bounds, alignment, memory state and permissions, never asks for writable and executable memory together, and rolls back once if setting permissions fails. The exploit and bootstrap are unchanged. Includes 50 native scenarios and protocol tests. Applied, rebuilt and checked by `tools/setup-session.py`. |
 
 The runtime patches are applied by `build.py deps` and `build.py runtime`.
+
+## How the console build differs from a desktop build
+
+- **Guest memory:** `MKW_GUEST_FLAT_CHECKED_ONLY`. HBLauncher can neither place memory at a fixed
+  address nor alias it, so every guest access goes through the checked page table.
+- **Fibers:** the BTI-safe AArch64 context switch (`runtime/src/platform/aarch64/co_switch_elf.S`).
+  Console code pages are BTI-guarded.
+- **Graphics:** Dawn's Vulkan backend on HBLauncher's device, presenting to the `nn::vi` window
+  (TP's Dawn and aurora patches). SDL3 uses the offscreen video, `hbx` audio and `hbx` joystick
+  drivers (TP's SDL3 patch; HBLauncher sets `SDL_VIDEO_DRIVER`/`SDL_AUDIO_DRIVER`).
+- **Files:** from the PC's file server, or everything from the microSD.
+- **Speed:** built with PGO (see the README). In Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
+  is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
+  boost mode is on at launch (about 1534 MHz instead of 1107).

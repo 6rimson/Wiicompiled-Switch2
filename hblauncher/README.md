@@ -22,7 +22,7 @@ A built package contains translated game code, so please don't share one either.
 ## Status
 
 Built on HBLauncher `18b4748` and ns2jb `81d5bb1` (November 2026). The main build is Retro Rewind;
-plain Mario Kart Wii also works but is experimental. PAL disc only.
+plain Mario Kart Wii also works. PAL disc only.
 
 ## What works
 
@@ -30,15 +30,18 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 6.13.5:
 
 - Retro Rewind boots; menus, offline races, online races on Retro WFC and saves work.
-- Races run at or near 60 FPS, thanks to [PGO](#pgo). Busy moments with lots of karts on screen can
+- Races run at or near 60 FPS, thanks to PGO. Busy moments with lots of karts on screen can
   dip to the mid 50s, briefly lower in the busiest ones. The numbers are in
   [VALIDATION.md](VALIDATION.md).
 - Returning to HBLauncher and launching again.
-- Plain Mario Kart Wii (experimental) boots and runs offline races near 60 FPS.
+- Sleep mode, including going online after waking.
+- Experimental: playing from the microSD, so the PC is only needed to start the game.
+- Plain Mario Kart Wii boots and runs races near 60 FPS.
 
 ## Known issues
 
-- **A PC has to stay on.** The file server supplies saves, settings, caches and any assets missing from the microSD. The session needs both the PC and console on Ethernet.
+- **A PC has to stay on**, on Ethernet with the console, unless the game is on the microSD ([experimental](#optional-microsd-card-experimental)).
+- **Unplugging ends the HBLauncher session.** With the game on the microSD you can unplug the Ethernet once the game is running, but you can't go back to HBLauncher's menu afterwards. To play again, close SmileBASIC 4, open it again, and start a new runner and 4/4 session.
 - **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the SmileBASIC program that keeps the session alive. The game keeps running for about two minutes, then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick click**.
 - **Not a locked 60 FPS.** Busy moments with lots of karts on screen dip to the mid 50s, briefly lower in the busiest ones, and there's a short dip right before the countdown. Offline, the game also runs slightly slower than normal speed in those moments.
 - **Change the resolution outside races.** Changing it during a race breaks the graphics until you restart the game; changing it in the game's menus works.
@@ -47,6 +50,7 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 - **Plain Mario Kart Wii can drop to 30 FPS.** Like a real Wii, it waits for the screen refresh, so a frame that's slightly late costs a whole extra frame. PGO keeps frames fast enough that this rarely happens.
 - **New places stutter the first time** while their shaders build; they're saved after that. A new install stutters a lot in its first races. Each launch also spends about half a minute rebuilding the saved shaders, so wait on the title screen before racing.
 - **Retro Rewind updates need a rebuild.** Every update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
+- **Black textures after sleep (seen once).** If it happens, please share `UserData/Logs/console.log` before restarting the game twice.
 - **Only built on an Apple Silicon Mac.** The scripts should also work on aarch64 Linux, but I haven't tried.
 - **Updates elsewhere can break it.** It may stop working after an HBLauncher, ns2jb, firmware or Retro Rewind update. It was tested with HBLauncher `18b4748` and ns2jb `81d5bb1`, patched as in step 2.
 
@@ -280,15 +284,30 @@ What each does:
 - `translate --online`: translates the base game and Retro Rewind. Leave out `--online` for
   offline only (then the payload isn't needed).
 - `build`: compiles and links the game for the console (up to 30 minutes), optimized with the
-  recorded profile in `hblauncher/pgo/` (see [PGO](#pgo)).
+  recorded profile in `hblauncher/pgo/`.
 - `pack`: makes the HBLauncher package in `hblauncher/dist/wiicompiled-rr`.
 
 **You should see** `pack` end with `Package: …/hblauncher/dist/wiicompiled-rr`. Running a failed step
 again is safe. In a new terminal, run the `export` line again before continuing.
 
-That builds Retro Rewind. To build plain Mario Kart Wii (experimental) instead, use the same steps
-with `--product wiicompiled` and without `--online`; see
-[Plain Mario Kart Wii](#plain-mario-kart-wii-experimental) below.
+#### Plain Mario Kart Wii
+
+`--product wiicompiled` builds it as a separate app, **Mario Kart Wii**, with its own file-server
+folder (`hblauncher/fsroot-wiicompiled/`). Steps 1–3 are the same, without the Retro Rewind folder
+or payload:
+
+```sh
+hblauncher/docker/run.sh translate --product wiicompiled
+hblauncher/docker/run.sh build --product wiicompiled
+hblauncher/docker/run.sh pack --product wiicompiled
+python3 hblauncher/build.py install --product wiicompiled
+python3 hblauncher/build.py fsroot --product wiicompiled --nand /path/to/NAND
+hblauncher/tools/session.sh server --product wiicompiled
+```
+
+`translate --product wiicompiled` replaces the Retro Rewind translation in the Docker volume, so
+building Retro Rewind afterwards needs `translate --online` again (or use another `HBX_VOLUME`).
+The file server serves one game at a time; start it with the game you'll pick in HBLauncher.
 
 You don't need to set your Mac's address: the file server (step 6) writes it into the installed game
 each time it starts.
@@ -337,53 +356,14 @@ console data, is ignored by Git, and should never be shared:
 | `hbxl-env` | options read at launch (see below) |
 | `icon.png` | optional launcher icon; add your own |
 
-#### Optional microSD game assets
+#### Optional: microSD card (experimental)
 
-With the console stopped, copy the folders you want to use from your file-server root to the card.
-Keep the same directory layout under `wiicompiled` at the root of the card.
+With the console off, copy everything in `hblauncher/fsroot/` to a `wiicompiled` folder at the root
+of the card. The game then runs from the card, and the PC is only needed to start it (step 6, the
+runner and the launcher).
 
-| From `hblauncher/fsroot/` | Destination on microSD |
-|---|---|
-| `disc/DATA/` | `/wiicompiled/disc/DATA/` |
-| `RetroRewind/RetroRewind6/` | `/wiicompiled/RetroRewind/RetroRewind6/` |
-| `dsp_coef.bin` (optional) | `/wiicompiled/dsp_coef.bin` |
-
-You may copy a subset. The game looks on the card first for each eligible read and uses the PC copy
-if the file is missing. Directory scans combine both sources. The save under
-`RetroRewind/riivolution/save/`, settings, NAND, caches and logs still use the PC. Keep the server running.
-After adding or removing files on the card, move `UserData/Cache/dvd_index_rr.bin` out of the PC
-file-server root while the game is closed to force a fresh disc scan.
-
-When upgrading an older build, rerun the `setup-session.py` command for your launcher and use
-a package produced by the updated `runtime`, `build` and `pack` steps.
-The regular `session.sh launcher` command prepares card access for the new package at launch.
-To use the server for all game files, add `MKW_SD=0` to `hblauncher/fsroot/hbxl-env` and relaunch.
-With `MKW_PERF_STATS=1`, the game log reports cumulative opens, bytes and read time by source, and
-how many files the game looked for that the card doesn't have. Set `MKW_SD_BENCH=1` to compare
-eight reads of the same disc FST on both sources at startup. This measures repeated reads of that
-file.
-
-**Experimental: everything on the card (`MKW_SD=all`).** The card then holds the only copy of the
-NAND, saves, settings and caches too, and the game writes them there; the PC copy is never changed.
-Prepare the card once with the card in the Mac (it copies `hblauncher/fsroot`, about 5 GB the first
-time), and copy progress back the same way:
-
-```sh
-hblauncher/tools/sd-card.sh push
-hblauncher/tools/sd-card.sh pull
-```
-
-`push` refuses a card that is already prepared, since it may hold newer progress than the PC; pull
-first, or add `--force`. `pull` backs up the PC's copies to `UserData/save-backup-<time>-before-pull`
-first. On a card that isn't prepared, `MKW_SD=all` acts like the default. The game log goes to
-`UserData/Logs/console.log` on the card too (the previous launch's is `console.prev.log`).
-
-With a prepared card the game also starts **without the file server**: run only the runner and the
-launcher (step 6, terminals 2 and 3). The game waits up to 3 seconds for a server, then uses the
-card's copy of `hbxl-env` (`push` writes it, with `MKW_SD=all`) and the console's clock for the time
-of day. HBLauncher keeps the game in memory from when the launcher started, so after installing a
-new build, start a new launcher rather than relaunching from its menu. `tests/sd-fake-card.sh`
-checks the backend against a simulated card on Linux.
+Your saves are then on the card, and the PC's copy stops changing. To back them up, copy
+`wiicompiled/UserData/` and `wiicompiled/RetroRewind/riivolution/` back to `hblauncher/fsroot/`.
 
 ### 6. Play
 
@@ -394,10 +374,12 @@ HBL_ROOT=$HOME/Switch2/HBLauncher
 HBL_NS2JB=$HOME/Switch2/ns2jb
 ```
 
-Each session goes like this; open three terminal windows in `~/Switch2/WiiCompiled-Switch2`:
+Each session goes like this; open three terminal windows in `~/Switch2/WiiCompiled-Switch2` (two
+with the game on the microSD):
 
 1. **On the console:** restart it, open SmileBASIC and go to Direct mode.
-2. **Terminal 1, the file server:**
+2. **Terminal 1, the file server** (skip it if the game is on the
+   [microSD](#optional-microsd-card-experimental)):
 
    ```sh
    hblauncher/tools/session.sh server
@@ -433,31 +415,8 @@ Each session goes like this; open three terminal windows in `~/Switch2/WiiCompil
    HBLauncher appears on the console; pick **Retro Rewind**. The first boot waits a few minutes on
    a shader screen (L + R + right stick opens the settings there), then the game starts.
 
-Keep the server and runner running while you play. To play again, relaunch from HBLauncher's menu. HBLauncher on its own stops after about 15 minutes in its menu
-(64 launcher turns); `session.sh launcher` asks for 10,000 turns, about 40 hours, instead. Add
-`--entries N` to choose another limit. Pause is on **Minus**; never press **Plus** (see known
+Keep the server (if you use it) and the runner running while you play. To play again, relaunch from HBLauncher's menu. Pause is on **Minus**; never press **Plus** (see known
 issues). HBLauncher writes its own log to `~/Switch2/HBLauncher/build/hbl-session.log`.
-
-### Plain Mario Kart Wii (experimental)
-
-`--product wiicompiled` builds the game without Retro Rewind as a separate app, **Mario Kart Wii**,
-with its own file-server folder (`hblauncher/fsroot-wiicompiled/`). Its HBLauncher app is defined in
-`hblauncher/app-wiicompiled/`, next to Retro Rewind's in `hblauncher/app/`. It's offline only (Retro WFC
-is part of Retro Rewind) and built with its own PGO profile. Steps 1–3 are the same, without the
-Retro Rewind folder or payload:
-
-```sh
-hblauncher/docker/run.sh translate --product wiicompiled
-hblauncher/docker/run.sh build --product wiicompiled
-hblauncher/docker/run.sh pack --product wiicompiled
-python3 hblauncher/build.py install --product wiicompiled
-python3 hblauncher/build.py fsroot --product wiicompiled --nand /path/to/NAND
-hblauncher/tools/session.sh server --product wiicompiled
-```
-
-`translate --product wiicompiled` replaces the Retro Rewind translation in the Docker volume, so
-building Retro Rewind afterwards needs `translate --online` again (or use another `HBX_VOLUME`).
-The file server serves one game at a time; start it with the game you'll pick in HBLauncher.
 
 ## Options
 
@@ -482,52 +441,17 @@ line to `hblauncher/fsroot/hbxl-env`: `MKW_CPU_BOOST=0`, `MKW_RACE_WORKER=0` or 
 sets the shader build threads (default 2), and `HBXL_TRACE=1` logs unimplemented system calls (very
 slow).
 
-## How it differs from a desktop build
-
-- **Guest memory:** `MKW_GUEST_FLAT_CHECKED_ONLY`. HBLauncher can neither place memory at a fixed
-  address nor alias it, so every guest access goes through the checked page table.
-- **Fibers:** the BTI-safe AArch64 context switch (`runtime/src/platform/aarch64/co_switch_elf.S`).
-  Console code pages are BTI-guarded.
-- **Graphics:** Dawn's Vulkan backend on HBLauncher's device, presenting to the `nn::vi` window
-  (TP's Dawn and aurora patches). SDL3 uses the offscreen video, `hbx` audio and `hbx` joystick
-  drivers (TP's SDL3 patch; HBLauncher sets `SDL_VIDEO_DRIVER`/`SDL_AUDIO_DRIVER`).
-- **Files:** read-only game assets can come from microSD. The file server supplies other paths and handles writes.
-- **Speed:** built with PGO (see below). In Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
-  is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
-  boost mode is on at launch (about 1534 MHz instead of 1107).
-
 ## Patches
 
 The patches this port applies to HBLauncher, ns2jb, aurora, Dawn and SDL, and why each was added,
 are listed in [PATCHES.md](PATCHES.md).
 
-## PGO
-
-Profile-guided optimization (PGO) builds the game around the code a real race runs. On one
-console it cut the game's work per race frame by about a quarter, from about 17 to 13 ms (see
-[VALIDATION.md](VALIDATION.md)). `build` does it automatically with the recorded
-profile in `hblauncher/pgo/retro-rewind.profdata.xz`. The profile holds no game code, only
-function names and how often each ran.
-
-The profile covers the base game and the runtime. Retro Rewind's own code isn't recorded, because
-instrumenting it made each of its files take over 20 minutes to compile, so a Retro Rewind update
-doesn't need a new profile. Code that changed since the recording just builds without PGO, so
-re-record after larger changes to the runtime or the translator:
-
-```sh
-hblauncher/tools/pgo.sh
-```
-
-It builds the desktop version with recording on, plays it headless and offline in Docker for
-15 minutes (pressing A through the menus into a Grand Prix), and writes a new
-`hblauncher/pgo/retro-rewind.profdata.xz`. It needs `hblauncher/fsroot/` (step 5), and works on
-copies of your save and NAND inside the container, so `fsroot` doesn't change. Then `build` and
-`pack` again.
-
-Add `-DMKW_PGO=` to `build` to build without PGO. Plain Mario Kart Wii has its own profile,
-`hblauncher/pgo/wiicompiled.profdata.xz`, recorded with `pgo.sh --product wiicompiled`.
-
 ## Other build options
+
+`build` uses the recorded speed profile (PGO) in `hblauncher/pgo/` on its own; it holds no game code. After
+larger runtime or translator changes, record a new one with `hblauncher/tools/pgo.sh` (15 minutes,
+headless in Docker; `--product wiicompiled` for plain Mario Kart Wii), then `build` and `pack` again.
+Add `-DMKW_PGO=` to `build` to build without it.
 
 On native aarch64 Linux, run `python3 hblauncher/build.py <action>` directly, with
 `HBXL_TOOLCHAIN` pointing at the toolchain. Linux has no automatic address lookup, so before
