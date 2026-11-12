@@ -53,10 +53,6 @@ extern "C" void PAD_HLE_SetRumbleEnabled(bool enabled);
 
 extern "C" int g_gxFrameCount;
 
-#if defined(HBX_SWITCH2)
-void ConsoleSdProbeOnce();  // sd_probe.cpp: MKW_SD_PROBE=1, experimental
-#endif
-
 // Defined in runtime/src/hle/audio/ax_mix.cpp. That header is private to the HLE
 // directory and is not on this target's include path.
 namespace AxDspHle {
@@ -1962,7 +1958,6 @@ void DrawConsoleMenu() {
         return false;
     }();
     (void)s_startupBoost;
-    ::ConsoleSdProbeOnce();
     ConsoleMenuInput(rows);
     if (g_consoleMeasureIn > 0 && --g_consoleMeasureIn == 0) {
         g_consoleCpuMhz = PerfStats::MeasureCpuMhz();
