@@ -54,4 +54,5 @@ The runtime patches are applied by `build.py deps` and `build.py runtime`.
 - **Files:** from the PC's file server, or everything from the microSD.
 - **Speed:** built with PGO (see the README). In Retro Rewind's offline races the game draws every tick (Retro Rewind's frame skip
   is off), and in every offline race the race GX worker replays graphics on its own core. The CPU
-  boost mode is on at launch (about 1534 MHz instead of 1107).
+  is at its stock maximum at launch (1702.4 MHz through the clock service, `sd/clock.c`; about 1523 MHz
+  through `nn::oe` boost mode with an older launcher setup).

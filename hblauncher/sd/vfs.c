@@ -1058,7 +1058,9 @@ long __wrap_hbxl_vfs_syscall(long n, long a, long b, long c, long d, long e, lon
 }
 
 extern void __real_hbxl_vfs_shutdown(void);
+void hbxl_cpu_clock_restore(void);
 void __wrap_hbxl_vfs_shutdown(void) {
+    hbxl_cpu_clock_restore(); /* clock.c: the CPU back to its launch rate if the game raised it */
     log_maybe_write_out(1);
     /* The runtime can stop while worker threads are still unwinding. Let
      * normal shutdown join them before freeing any remaining SD descriptions. */

@@ -1804,6 +1804,32 @@ void ConsoleApplyCpuSettings(bool setOverclock, bool setBoost, bool readConfigur
     g_consoleMeasureIn = 90;
 }
 
+// CPU boost. When the launcher opened the CPU's clock (hblauncher/sd/clock.c, via
+// tools/sd-session.cjs), On is the CPU's stock maximum (1702.4 MHz) and Off is the rate from before
+// the game started; nothing else changes. Otherwise On is nn::oe boost mode (about 1523 MHz).
+extern "C" int hbxl_cpu_clock_rates(uint32_t* launchHz, uint32_t* maxHz) __attribute__((weak));
+extern "C" long hbxl_cpu_clock_boost(int on) __attribute__((weak));
+extern "C" void hbxl_cpu_clock_restore() __attribute__((weak));
+bool g_consoleCpuAtMax = false;
+
+void ConsoleSetCpuBoost(int mode, bool readConfiguration) {
+    uint32_t launchHz = 0, maxHz = 0;
+    if (hbxl_cpu_clock_rates != nullptr && hbxl_cpu_clock_rates(&launchHz, &maxHz)) {
+        const bool on = mode != 0;
+        const long rc = hbxl_cpu_clock_boost(on ? 1 : 0);
+        RT_LOGF("perf", "cpu clock %s %.1f MHz: %s (%ld)\n", on ? "to the maximum," : "back to the launch rate,",
+                static_cast<double>(on ? maxHz : launchHz) / 1e6, rc == 0 ? "read back" : "failed", rc);
+        if (rc == 0) {
+            g_consoleBoostMode = on ? 1 : 0;
+            g_consoleCpuAtMax = on;
+        }
+        g_consoleMeasureIn = 90;
+        return;
+    }
+    g_consoleBoostMode = mode;
+    ConsoleApplyCpuSettings(false, true, readConfiguration);
+}
+
 int g_consoleMenuRow = 0;
 bool g_consoleExitArmed = false;
 // Plus reaches SmileBASIC too, which stops its program, and with it the launcher's link to the PC.
@@ -1815,6 +1841,9 @@ bool g_consoleReturnRequested = false;
 // what it keeps allocated would still be allocated for the next launch.
 [[noreturn]] void ConsoleReturnToLauncher() noexcept {
     RT_LOGF("perf", "returning to the launcher\n");
+    if (hbxl_cpu_clock_restore != nullptr) {
+        hbxl_cpu_clock_restore();  // the CPU back to its launch rate if CPU boost raised it
+    }
     std::fflush(stderr);
     // A thread still alive at exit keeps all the app's memory mapped, so this one must finish.
     std::atomic<bool> finished{false};
@@ -1897,8 +1926,7 @@ void ConsoleMenuInput(int rows) {
             } else if (g_consoleMenuRow == 2 && change != 0) {
                 ConsoleChangeVolume(change * 5);
             } else if (g_consoleMenuRow == 3 && (change != 0 || confirm)) {
-                g_consoleBoostMode = g_consoleBoostMode == 0 ? 1 : 0;
-                ConsoleApplyCpuSettings(false, true);
+                ConsoleSetCpuBoost(g_consoleBoostMode == 0 ? 1 : 0, true);
             } else if (g_consoleMenuRow == 4 && (change != 0 || confirm)) {
                 GxWorker::SetRaceDeferring(!GxWorker::RaceDeferring());
                 RT_LOGF("perf", "race GX worker %s\n", GxWorker::RaceDeferring() ? "on" : "off");
@@ -1946,13 +1974,13 @@ void DrawConsoleMenu() {
     const int buttons = static_cast<int>(kControllerButtons.size());
     const int rows = 6 + buttons + 2;
     const bool wasOpen = g_consoleMenuOpen;
-    // Boost mode 1 at launch, about 1534 MHz. MKW_CPU_BOOST=<mode> in hbxl-env changes it; 0 turns it off.
+    // CPU boost on at launch (see ConsoleSetCpuBoost). MKW_CPU_BOOST=0 in hbxl-env leaves it off; another
+    // number picks the nn::oe boost mode when the launcher has no clock access.
     static const bool s_startupBoost = [] {
         const char* mode = std::getenv("MKW_CPU_BOOST");
         const int boost = mode != nullptr ? std::atoi(mode) : 1;
         if (boost > 0) {
-            g_consoleBoostMode = boost;
-            ConsoleApplyCpuSettings(false, true, false);
+            ConsoleSetCpuBoost(boost, false);
             return true;
         }
         return false;
@@ -1992,7 +2020,7 @@ void DrawConsoleMenu() {
         row(0, std::string("Resolution: ") + scale);
         row(1, std::string("Show FPS: ") + (g_showFps ? "On" : "Off"));
         row(2, "Volume: " + std::to_string(g_audioVolumePercent) + "%");
-        row(3, std::string("CPU boost: ") + (g_consoleBoostMode != 0 ? "On" : "Off"));
+        row(3, std::string("CPU boost: ") + (g_consoleCpuAtMax ? "On (max)" : g_consoleBoostMode != 0 ? "On" : "Off"));
         row(4, std::string("Race GX worker: ") + (GxWorker::RaceDeferring() ? "On" : "Off"));
         row(5, std::string("Frame skip (offline): ") + (RetroRewindFrameSkip() ? "On" : "Off"));
         ImGui::TextDisabled("  CPU speed: about %.0f MHz", static_cast<double>(g_consoleCpuMhz));

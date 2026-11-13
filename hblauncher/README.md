@@ -428,7 +428,7 @@ rebind a button, B to close):
 | Resolution | 1.0× | 1.5× (about 720p) and 2× run about the same. Change it in menus, not during a race. Saved. |
 | Show FPS | off | Saved. |
 | Volume | 100% | Saved. |
-| CPU boost | on | Raises the CPU from about 1107 to 1534 MHz. Every FPS figure here was measured with it on. |
+| CPU boost | on | Runs the CPU at its stock maximum, 1702 MHz, instead of about 1100. Off, or leaving the game, puts it back. The FPS figures here were measured at the older 1534 MHz boost. |
 | Race GX worker | on | Moves graphics work off the game's main thread in offline races. |
 | Frame skip (offline) | off | Retro Rewind's frame skip in offline races. Online, it's always on. |
 | Buttons | A, B, X, Y as labelled | Rebind any button. Saved. |

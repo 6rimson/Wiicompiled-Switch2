@@ -38,6 +38,9 @@ uint64_t hbxl_svc_tick(void) {
 int hbxl_threads_live(void) { return 0; }
 void __real_hbxl_vfs_shutdown(void) {}
 void hbxl_vfs_write_console(int fd, const void *data, size_t n) { (void)!write(fd, data, n); }
+/* The runtime's log formatter: the format alone is enough here. */
+static char last_log[256];
+void hbxl_logf(const char *format, ...) { snprintf(last_log, sizeof(last_log), "%s", format); }
 /* What still reaches the file server's log. */
 static char server_log[4096];
 static size_t server_used;
@@ -155,8 +158,32 @@ static int new_object(int dir, const char *host, int mode, int fd) {
 }
 static int keep_entry(const struct dirent *e) { return strcmp(e->d_name, ".") && strcmp(e->d_name, ".."); }
 static long card_calls; /* every request to the card */
+/* The CPU's clock session (clock.c): reads and sets one rate, within the stock range. */
+enum { CPU_HANDLE = 0x9000, LAUNCH_HZ = 1100800000, MAX_HZ = 1702400000 };
+static uint32_t cpu_hz = LAUNCH_HZ;
+static long clock_requests;
+static uint32_t clock_send(uint32_t *p) {
+    clock_requests++;
+    if (p[4] != 0x49434653 || p[0] != 4)
+        return 1;
+    const uint32_t cmd = p[6], hz = p[8];
+    uint32_t rc = 0, value = 0;
+    if (cmd == 8)
+        value = cpu_hz;
+    else if (cmd == 7 && hz >= 115200000 && hz <= MAX_HZ)
+        cpu_hz = hz;
+    else
+        rc = 2 | (1 << 9);
+    memset(p, 0, 64);
+    p[4] = 0x4f434653;
+    p[6] = rc;
+    p[8] = value;
+    return 0;
+}
 static uint32_t send(void *message, uint64_t size, uint32_t handle) {
     (void)size;
+    if (handle == CPU_HANDLE)
+        return clock_send(message);
     card_calls++;
     uint32_t *p = message;
     unsigned nx = (p[0] >> 16) & 15, na = (p[0] >> 20) & 15, nb = (p[0] >> 24) & 15;
@@ -311,7 +338,12 @@ static uint32_t close_handle(uint32_t handle) {
     o->used = 0;
     return 0;
 }
-static struct sd_context sd = {SD_MAGIC, ROOT, send, close_handle, command, path_buffer, bounce};
+static uint32_t cpu_command[1024] __attribute__((aligned(4096)));
+static struct sd_context sd = {SD_MAGIC,     ROOT,       send,   close_handle, command,    path_buffer,
+                               bounce,       CPU_MAGIC,  CPU_HANDLE, LAUNCH_HZ, MAX_HZ, cpu_command};
+int hbxl_cpu_clock_rates(uint32_t *, uint32_t *);
+long hbxl_cpu_clock_boost(int);
+void hbxl_cpu_clock_restore(void);
 
 /* ---- helpers ------------------------------------------------------------------------------ */
 static long call(long n, long a, long b, long c, long d, long e) {
@@ -641,6 +673,27 @@ int main(void) {
     fd = open_("/UserData/hand.txt", O_RDONLY);
     CHECK(fd >= 2048 && pread_(fd, got, 16, 0) == 4 && !memcmp(got, "card", 4));
     close_(fd);
+
+    /* CPU boost: the maximum, then the launch rate, each read back; at exit the launch rate again,
+     * unless the system chose another rate since. No card requests. */
+    const long card_before = card_calls;
+    uint32_t launch = 0, top = 0;
+    CHECK(hbxl_cpu_clock_rates(&launch, &top) && launch == LAUNCH_HZ && top == MAX_HZ);
+    CHECK(hbxl_cpu_clock_boost(1) == 0 && cpu_hz == MAX_HZ);
+    CHECK(hbxl_cpu_clock_boost(0) == 0 && cpu_hz == LAUNCH_HZ);
+    CHECK(hbxl_cpu_clock_boost(1) == 0);
+    hbxl_cpu_clock_restore();
+    CHECK(cpu_hz == LAUNCH_HZ);
+    long requests = clock_requests;
+    hbxl_cpu_clock_restore(); /* twice: nothing to do */
+    CHECK(clock_requests == requests);
+    CHECK(hbxl_cpu_clock_boost(1) == 0);
+    cpu_hz = 1523200000; /* the system's own change */
+    hbxl_cpu_clock_restore();
+    CHECK(cpu_hz == 1523200000 && card_calls == card_before && strstr(last_log, "left as it is"));
+    sd.cpu_magic = 0; /* an older launcher */
+    CHECK(!hbxl_cpu_clock_rates(&launch, &top) && hbxl_cpu_clock_boost(1) == -ENODEV);
+    sd.cpu_magic = CPU_MAGIC;
 
     CHECK(locked_refusals == 0); /* the backend never makes the card refuse an open file */
     printf("%d of %d checks passed\n", checks - failures, checks);

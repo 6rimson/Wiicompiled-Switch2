@@ -286,7 +286,7 @@ def link_flags(variant, build):
         raise SystemExit("Build the runtime first: build.py runtime")
     toolchain = required("HBXL_TOOLCHAIN", "bin/aarch64-linux-musl-gcc")
     sd_objects = []
-    for source in ("storage", "directory", "vfs", "benchmark", "offline", "network"):
+    for source in ("storage", "directory", "vfs", "benchmark", "offline", "network", "clock"):
         obj = build / f"sd-{source}.o"
         run([toolchain / "bin/aarch64-linux-musl-gcc", "-O2", "-fno-pie", "-mbranch-protection=bti",
              "-Wall", "-Wextra", "-Werror", f"-I{hbl_sdk() / 'sdk/include'}", f"-I{hbl_sdk() / 'sdk/linux'}",

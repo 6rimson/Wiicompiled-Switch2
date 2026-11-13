@@ -8,6 +8,6 @@ docker run --rm -v "${HBX_VOLUME:-wiicompiled-hbx}:/opt/work:ro" -v "$HERE:/h:ro
 set -e
 SDK=/opt/work/deps/hblauncher/sdk
 /opt/work/toolchain/bin/aarch64-linux-musl-gcc -static -O1 -g -Wall -Wextra -Wno-unused-result \
-  -I$SDK/include -I$SDK/linux /h/sd/storage.c /h/sd/directory.c /h/sd/vfs.c /h/tests/sd-fake-card.c \
+  -I$SDK/include -I$SDK/linux /h/sd/storage.c /h/sd/directory.c /h/sd/vfs.c /h/sd/clock.c /h/tests/sd-fake-card.c \
   -o /tmp/sd-fake-card
 /tmp/sd-fake-card'
