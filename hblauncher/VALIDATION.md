@@ -2,6 +2,10 @@
 
 What has been tested, and on what.
 
+> [!NOTE]
+> The FPS and frame-time figures below come from older builds (CPU boost at about 1534 MHz,
+> before the November 2026 smoothness fixes). Current builds are faster; see the README.
+
 ## First build
 
 The first build, before anything ran on a Switch 2, against HBLauncher `18b4748` (ABI 3). Later

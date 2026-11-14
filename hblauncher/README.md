@@ -30,9 +30,8 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 6.13.5:
 
 - Retro Rewind boots; menus, offline races, online races on Retro WFC and saves work.
-- Races run at or near 60 FPS, thanks to PGO. Busy moments with lots of karts on screen can
-  dip to the mid 50s, briefly lower in the busiest ones. The numbers are in
-  [VALIDATION.md](VALIDATION.md).
+- Offline races hold 60 FPS nearly all the time: in recent tests, 97% of race seconds were a full
+  60, with the CPU at 1702 MHz and PGO. Older measurements are in [VALIDATION.md](VALIDATION.md).
 - Returning to HBLauncher and launching again.
 - Sleep mode, including going online after waking.
 - Experimental: playing from the microSD, so the PC is only needed to start the game.
@@ -43,12 +42,12 @@ Tested on one Switch 2, with the defaults below, a PC on the same home network, 
 - **A PC has to stay on**, on Ethernet with the console, unless the game is on the microSD ([experimental](#optional-microsd-card-experimental)).
 - **Unplugging ends the HBLauncher session.** With the game on the microSD you can unplug the Ethernet once the game is running, but you can't go back to HBLauncher's menu afterwards. To play again, close SmileBASIC 4, open it again, and start a new runner and 4/4 session.
 - **Don't press Plus.** SmileBASIC sees the controller behind the game, and Plus stops the SmileBASIC program that keeps the session alive. The game keeps running for about two minutes, then the session dies. Pause is on **Minus**, and the port's menu is **L + R + right stick click**.
-- **Not a locked 60 FPS.** Busy moments with lots of karts on screen dip to the mid 50s, briefly lower in the busiest ones, and there's a short dip right before the countdown. Offline, the game also runs slightly slower than normal speed in those moments.
+- **Not always 60 FPS.** A few one-off stutters remain in offline races, for example when a music track starts.
 - **Change the resolution outside races.** Changing it during a race breaks the graphics until you restart the game; changing it in the game's menus works.
 - **Online can dip briefly.** Online keeps Retro Rewind's frame skip, so a slow moment skips frames instead of slowing the game down. With PGO it's rare.
 - **Restart SmileBASIC after a crash or a new install.** The game shares SmileBASIC's process with HBLauncher, so memory it didn't free stays taken, and the next launch can close SmileBASIC. Close SmileBASIC, open it again, and start a new runner and 4/4 session. To play again normally, relaunch from HBLauncher's menu; `session.sh launcher` refuses to start a second time in a session where the game already ran.
-- **Plain Mario Kart Wii can drop to 30 FPS.** Like a real Wii, it waits for the screen refresh, so a frame that's slightly late costs a whole extra frame. PGO keeps frames fast enough that this rarely happens.
-- **New places stutter the first time** while their shaders build; they're saved after that. A new install stutters a lot in its first races. Each launch also spends about half a minute rebuilding the saved shaders, so wait on the title screen before racing.
+- **Plain Mario Kart Wii can drop to 30 FPS** in heavy moments, for example around Waluigi Stadium's first boost ramp. Like a real Wii, it waits for the screen refresh, so a frame that's slightly late costs a whole extra frame.
+- **New places stutter the first time** while their shaders build; they're saved after that. A new install stutters a lot in its first races. Each launch also spends about 15-20 seconds rebuilding the saved shaders, so wait on the title screen before racing.
 - **Retro Rewind updates need a rebuild.** Every update that changes `Code.pul` needs a new `translate`, `build` and `pack`.
 - **Black textures after sleep (seen once).** If it happens, please share `UserData/Logs/console.log` before restarting the game twice.
 - **Only built on an Apple Silicon Mac.** The scripts should also work on aarch64 Linux, but I haven't tried.
@@ -428,7 +427,7 @@ rebind a button, B to close):
 | Resolution | 1.0× | 1.5× (about 720p) and 2× run about the same. Change it in menus, not during a race. Saved. |
 | Show FPS | off | Saved. |
 | Volume | 100% | Saved. |
-| CPU boost | on | Runs the CPU at its stock maximum, 1702 MHz, instead of about 1100. Off, or leaving the game, puts it back. The FPS figures here were measured at the older 1534 MHz boost. |
+| CPU boost | on | Runs the CPU at its stock maximum, 1702 MHz, instead of about 1100. Off, or leaving the game, puts it back. VALIDATION.md's figures were measured at the older 1534 MHz boost. |
 | Race GX worker | on | Moves graphics work off the game's main thread in offline races. |
 | Frame skip (offline) | off | Retro Rewind's frame skip in offline races. Online, it's always on. |
 | Buttons | A, B, X, Y as labelled | Rebind any button. Saved. |
