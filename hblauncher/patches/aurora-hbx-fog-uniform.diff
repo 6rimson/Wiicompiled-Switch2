@@ -1,0 +1,123 @@
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -1074,6 +1074,10 @@
+     if (config.version != configVersion) {
+       continue;
+     }
++    if constexpr (std::is_same_v<PipelineConfig, gx::PipelineConfig>) {
++      // Saved before the fog type became a uniform: copies differing only in it are now one pipeline.
++      config.shaderConfig.fogType = gx::canonical_fog_type(config.shaderConfig.fogType);
++    }
+ 
+     remember_pipeline_config(type, config, firstFrameUsed, true);
+     ++acceptedRows;
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -522,7 +522,9 @@
+   config.shaderConfig = {};
+ 	config.shaderConfig.forceAlphaOne = !g_gxState.colorUpdate && g_gxState.alphaUpdate &&
+ 		g_gxState.dstAlpha != UINT32_MAX && g_gxState.dstAlpha != 0;
+-  config.shaderConfig.fogType = g_gxState.fog.type;
++  // Only whether there is fog: its formula (linear, exponential...; perspective or orthographic) is a
++  // uniform read by the shader, so a fog change never needs a new pipeline (shader.cpp).
++  config.shaderConfig.fogType = canonical_fog_type(g_gxState.fog.type);
+ 	config.shaderConfig.zTextureOp = g_gxState.zTextureOp;
+ 	if (g_gxState.zTextureOp != GX_ZT_DISABLE) {
+ 		config.shaderConfig.zTextureFormat = g_gxState.zTextureFormat;
+--- a/lib/gx/pipeline.hpp
++++ b/lib/gx/pipeline.hpp
+@@ -19,6 +19,12 @@
+   uint32_t dstAlpha;
+ };
+ 
++// The pipeline key's fog type: GX_FOG_NONE or GX_FOG_PERSP_LIN for any fog. The actual type is
++// in the fog uniform. Saved configs from before are folded the same way when loaded.
++constexpr u8 canonical_fog_type(uint32_t type) noexcept {
++  return type == GX_FOG_NONE ? static_cast<u8>(GX_FOG_NONE) : static_cast<u8>(GX_FOG_PERSP_LIN);
++}
++
+ constexpr uint32_t GXPipelineConfigVersion = 14;
+ struct PipelineConfig {
+   uint32_t version = GXPipelineConfigVersion;
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1750,48 +1750,31 @@
+         "}";
+     uniBufAttrs += "\n    fog: Fog,";
+ 
+-    if ((config.fogType & 0x08) != 0) {
+-      fragmentFn += fmt::format("\n    // Orthographic fog\n    var fogBase = ubuf.fog.a * {};", fogDepth);
+-    } else {
+-      fragmentFn +=
+-          fmt::format("\n    // Perspective fog\n    var fogBase = ubuf.fog.a / (ubuf.fog.b - {});", fogDepth);
+-    }
++    // The fog type is a uniform (the colour's alpha) rather than part of the pipeline, so a game that
++    // changes fog types mid-scene doesn't build a new pipeline for each type (gx.cpp).
++    fragmentFn += fmt::format(
++        "\n    // Fog, of the type in fog.color.a: bit 3 orthographic, low bits the curve"
++        "\n    let fogType = u32(ubuf.fog.color.a + 0.5);"
++        "\n    var fogBase = ubuf.fog.a / (ubuf.fog.b - {0});"
++        "\n    if ((fogType & 8u) != 0u) {{"
++        "\n        fogBase = ubuf.fog.a * {0};"
++        "\n    }}",
++        fogDepth);
+ 
+     if (config.fogRangeEnabled) {
+       fragmentFn += "\n        fogBase *= bitcast<f32>(abuf[imm.fog_range_base + u32(in.pos.x)]);";
+     }
+ 
+-    fragmentFn += "\n    var fogF = clamp(fogBase - ubuf.fog.c, 0.0, 1.0);";
+-
+-    switch (config.fogType) {
+-      DEFAULT_FATAL("invalid fog type {}", config.fogType);
+-    case static_cast<GXFogType>(1):
+-    case static_cast<GXFogType>(3):
+-    case GX_FOG_PERSP_LIN:
+-    case static_cast<GXFogType>(9):
+-    case static_cast<GXFogType>(11):
+-    case GX_FOG_ORTHO_LIN:
+-      fragmentFn += "\n    var fogZ = fogF;";
+-      break;
+-    case GX_FOG_PERSP_EXP:
+-    case GX_FOG_ORTHO_EXP:
+-      fragmentFn += "\n    var fogZ = 1.0 - exp2(-8.0 * fogF);";
+-      break;
+-    case GX_FOG_PERSP_EXP2:
+-    case GX_FOG_ORTHO_EXP2:
+-      fragmentFn += "\n    var fogZ = 1.0 - exp2(-8.0 * fogF * fogF);";
+-      break;
+-    case GX_FOG_PERSP_REVEXP:
+-    case GX_FOG_ORTHO_REVEXP:
+-      fragmentFn += "\n    var fogZ = exp2(-8.0 * (1.0 - fogF));";
+-      break;
+-    case GX_FOG_PERSP_REVEXP2:
+-    case GX_FOG_ORTHO_REVEXP2:
+-      fragmentFn +=
+-          "\n    fogF = 1.0 - fogF;"
+-          "\n    var fogZ = exp2(-8.0 * fogF * fogF);";
+-      break;
+-    }
++    fragmentFn +=
++        "\n    var fogF = clamp(fogBase - ubuf.fog.c, 0.0, 1.0);"
++        "\n    var fogZ = fogF;"
++        "\n    switch (fogType & 7u) {"
++        "\n        case 4u: { fogZ = 1.0 - exp2(-8.0 * fogF); }"
++        "\n        case 5u: { fogZ = 1.0 - exp2(-8.0 * fogF * fogF); }"
++        "\n        case 6u: { fogZ = exp2(-8.0 * (1.0 - fogF)); }"
++        "\n        case 7u: { let fogR = 1.0 - fogF; fogZ = exp2(-8.0 * fogR * fogR); }"
++        "\n        default: { }"
++        "\n    }";
+ 
+     fragmentFn += "\n    prev = vec4f(mix(prev.rgb, ubuf.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
+   }
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -507,7 +507,7 @@
+     const float logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
+     const float renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
+     Fog fog{
+-        .color = state.color,
++        .color = {state.color[0], state.color[1], state.color[2], static_cast<float>(state.type)},
+         .a = state.a,
+         .b = state.b,
+         .c = state.c,
