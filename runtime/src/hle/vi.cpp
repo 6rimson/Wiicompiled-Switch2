@@ -13,6 +13,7 @@
 #include "perf_stats.h"
 
 #include <dolphin/vi.h>
+#include <aurora/gfx.h>
 
 #include <algorithm>
 #include <array>
@@ -562,6 +563,18 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     struct SequenceGuard {
         ~SequenceGuard() { s_presentSequenceActive.store(false, std::memory_order_release); }
     } sequenceGuard;
+#if defined(HBX_SWITCH2)
+    {
+        // Shader caches wait in memory during races: writing them to the microSD made the game's own
+        // reads (music) wait behind them. Aurora writes them once the race is over.
+        static bool s_cacheWritesDeferred = false;
+        const bool race = VI_HLE_InRaceSection();
+        if (race != s_cacheWritesDeferred) {
+            s_cacheWritesDeferred = race;
+            aurora_set_cache_writes_deferred(race);
+        }
+    }
+#endif
     {
         // Screen-change freezes (restart, next race, change course...) are many small reads and
         // saves rather than one slow call, so report each long frame with the file I/O done in it.

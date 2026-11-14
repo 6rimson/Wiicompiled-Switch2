@@ -1,0 +1,168 @@
+--- a/include/aurora/gfx.h
++++ b/include/aurora/gfx.h
+@@ -47,6 +47,9 @@
+ const AuroraStats* aurora_get_stats();
+ float aurora_get_fps();
+ void aurora_get_present_timing(AuroraPresentTiming* timing);
++// While true (a race), new shaders and pipeline records stay in memory instead of being written to
++// storage, which can make the game's own file reads wait; they are written once it is false again.
++void aurora_set_cache_writes_deferred(bool deferred);
+ 
+ // Interpolation health: the per-frame fields describe the last frame, the counters accumulate
+ // since it was configured.
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -38,6 +38,12 @@
+ void clear_shader_module_cache();
+ }
+ 
++namespace aurora::webgpu {
++void set_cache_stores_deferred(bool deferred);
++bool has_deferred_stores();
++void flush_deferred_stores();
++} // namespace aurora::webgpu
++
+ namespace aurora::gfx {
+ static Module Log("aurora::gfx::pipeline_cache");
+ 
+@@ -111,6 +117,9 @@
+ static std::mutex g_pipelineCacheWriterMutex;
+ static std::deque<PipelineCacheWrite> g_pipelineCacheWriteQueue;
+ static bool g_pipelineCacheWriterStop = false;
++// aurora_set_cache_writes_deferred: during races the writer holds new records, and the Dawn shader
++// cache keeps new shaders in memory, so nothing is written to storage then.
++static bool g_pipelineCacheWritesDeferred = false;
+ static int g_sdlVfsRegisterResult = SQLITE_ERROR;
+ 
+ static SdlVfsSqliteFile* sdl_vfs_file(sqlite3_file* file) { return reinterpret_cast<SdlVfsSqliteFile*>(file); }
+@@ -968,13 +977,18 @@
+     std::deque<PipelineCacheWrite> batch;
+     {
+       std::unique_lock lock{g_pipelineCacheWriterMutex};
+-      g_pipelineCacheWriterCv.wait(lock,
+-                                   [] { return g_pipelineCacheWriterStop || !g_pipelineCacheWriteQueue.empty(); });
++      g_pipelineCacheWriterCv.wait(lock, [] {
++        return g_pipelineCacheWriterStop ||
++               (!g_pipelineCacheWritesDeferred && (!g_pipelineCacheWriteQueue.empty() || webgpu::has_deferred_stores()));
++      });
+       if (g_pipelineCacheWriterStop && g_pipelineCacheWriteQueue.empty()) {
++        lock.unlock();
++        webgpu::flush_deferred_stores();
+         return;
+       }
+       batch.swap(g_pipelineCacheWriteQueue);
+     }
++    webgpu::flush_deferred_stores();
+ 
+     bool writeFailed = false;
+     {
+@@ -1302,3 +1316,16 @@
+ }
+ 
+ } // namespace aurora::gfx
++
++extern "C" void aurora_set_cache_writes_deferred(bool deferred) {
++  using namespace aurora;
++  {
++    std::lock_guard lock{gfx::g_pipelineCacheWriterMutex};
++    if (gfx::g_pipelineCacheWritesDeferred == deferred) {
++      return;
++    }
++    gfx::g_pipelineCacheWritesDeferred = deferred;
++    webgpu::set_cache_stores_deferred(deferred);
++  }
++  gfx::g_pipelineCacheWriterCv.notify_one();
++}
+--- a/lib/webgpu/gpu_cache.cpp
++++ b/lib/webgpu/gpu_cache.cpp
+@@ -1,5 +1,6 @@
+ #include <cstring>
+ #include <cstdint>
++#include <atomic>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+@@ -27,6 +28,27 @@
+ static bool cache_broken;
+ static std::mutex cache_mutex;
+ static std::vector<XXH128_hash_t> cache_keys_used;
++
++// While stores are deferred (races, aurora_set_cache_writes_deferred), new shaders wait here instead
++// of being written to storage from the compiling thread, and the pipeline cache writer thread writes
++// them afterwards. Loads look here first.
++struct DeferredStore {
++  std::vector<uint8_t> key;
++  std::vector<uint8_t> value;
++};
++static std::atomic_bool stores_deferred{false};
++static std::vector<DeferredStore> deferred_stores;
++static size_t deferred_bytes = 0;
++constexpr size_t MaxDeferredBytes = 64u * 1024u * 1024u;
++
++static const DeferredStore* find_deferred(void const* key, size_t keySize) {
++  for (const auto& entry : deferred_stores) {
++    if (entry.key.size() == keySize && std::memcmp(entry.key.data(), key, keySize) == 0) {
++      return &entry;
++    }
++  }
++  return nullptr;
++}
+ #if defined(AURORA_CACHE_USE_ZSTD)
+ static std::vector<uint8_t> compress_buffer;
+ #endif
+@@ -252,6 +274,13 @@
+ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valueSize, void*) {
+   std::lock_guard lock(cache_mutex);
+ 
++  if (const auto* deferred = find_deferred(key, keySize)) {
++    if (value && valueSize == deferred->value.size()) {
++      std::memcpy(value, deferred->value.data(), valueSize);
++    }
++    return deferred->value.size();
++  }
++
+   if (!cache_init()) {
+     return 0;
+   }
+@@ -348,9 +377,41 @@
+   return foundSize;
+ }
+ 
++static void store_locked(void const* key, size_t keySize, void const* value, size_t valueSize);
++
+ void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void*) {
+   std::lock_guard lock(cache_mutex);
++  if (stores_deferred.load(std::memory_order_acquire) && deferred_bytes + keySize + valueSize <= MaxDeferredBytes) {
++    if (!find_deferred(key, keySize)) {
++      const auto* keyBytes = static_cast<const uint8_t*>(key);
++      const auto* valueBytes = static_cast<const uint8_t*>(value);
++      deferred_stores.push_back({{keyBytes, keyBytes + keySize}, {valueBytes, valueBytes + valueSize}});
++      deferred_bytes += keySize + valueSize;
++      cache_keys_used.push_back(XXH128(key, keySize, 0));
++    }
++    return;
++  }
++  store_locked(key, keySize, value, valueSize);
++}
+ 
++void set_cache_stores_deferred(bool deferred) { stores_deferred.store(deferred, std::memory_order_release); }
++
++bool has_deferred_stores() {
++  std::lock_guard lock(cache_mutex);
++  return !deferred_stores.empty();
++}
++
++// From the pipeline cache writer thread once a race is over, and at shutdown.
++void flush_deferred_stores() {
++  std::lock_guard lock(cache_mutex);
++  for (const auto& entry : deferred_stores) {
++    store_locked(entry.key.data(), entry.key.size(), entry.value.data(), entry.value.size());
++  }
++  deferred_stores.clear();
++  deferred_bytes = 0;
++}
++
++static void store_locked(void const* key, size_t keySize, void const* value, size_t valueSize) {
+   if (!cache_init()) {
+     return;
+   }
