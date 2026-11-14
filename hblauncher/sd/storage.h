@@ -49,6 +49,10 @@ long sd_rename(const char *from, const char *to, int directory);
 long sd_write(uint32_t file, int64_t offset, size_t length);
 long sd_flush(uint32_t file);
 long sd_set_size(uint32_t file, int64_t size);
+/* The same from a thread with its own 4 KiB command page and data buffer (both SDK heap), which
+ * then needs no lock shared with the other card calls: the card log's writer. */
+long sd_write_from(uint32_t *command, const uint8_t *data, uint32_t file, int64_t offset, size_t length);
+long sd_flush_from(uint32_t *command, uint32_t file);
 long sd_modified(const char *path, int64_t *seconds);
 extern uint32_t sd_last_result;
 long __real_hbxl_vfs_syscall(long, long, long, long, long, long, long, int *);

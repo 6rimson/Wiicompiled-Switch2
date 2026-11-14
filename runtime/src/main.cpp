@@ -1596,6 +1596,11 @@ int RuntimeMain(int argc, char** argv) {
     }
 }
 
+#if defined(HBX_SWITCH2)
+// hblauncher/sd/vfs.c: the microSD log written by a thread of its own, not by whichever thread logs.
+extern "C" void hbxl_card_log_start(void) __attribute__((weak));
+#endif
+
 int main(int argc, char** argv) {
 #if defined(__linux__) && !defined(__GLIBC__)
     // musl gives new threads a 128 KiB stack where glibc gives 8 MiB, and Dawn's shader compiler
@@ -1607,6 +1612,11 @@ int main(int argc, char** argv) {
         pthread_attr_setstacksize(&threadDefaults, 8u << 20);
         pthread_setattr_default_np(&threadDefaults);
         pthread_attr_destroy(&threadDefaults);
+    }
+#endif
+#if defined(HBX_SWITCH2)
+    if (hbxl_card_log_start != nullptr) {
+        hbxl_card_log_start();
     }
 #endif
     return RuntimeMain(argc, argv);

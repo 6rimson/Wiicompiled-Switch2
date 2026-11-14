@@ -7,9 +7,9 @@
 enum { SFCI = 0x49434653, SFCO = 0x4f434653 };
 uint32_t sd_last_result; /* the card's last result code, for log lines */
 
-static long reply(uint32_t handle, int moved, uint32_t **data) {
+/* The request in p (a 4 KiB SDK-heap page) and its reply. */
+static long reply_in(uint32_t *p, uint32_t handle, int moved, uint32_t **data) {
     struct sd_context *ctx = card();
-    uint32_t *p = ctx->command;
     if (ctx->send(p, 4096, handle))
         return -EIO;
     unsigned at = 2;
@@ -45,6 +45,7 @@ static long reply(uint32_t handle, int moved, uint32_t **data) {
         *data = p + at + 4;
     return child;
 }
+static long reply(uint32_t handle, int moved, uint32_t **data) { return reply_in(card()->command, handle, moved, data); }
 
 /* Writes "/wiicompiled" + path into an SDK-heap buffer and its X (pointer) descriptor at d. */
 static long put_path(uint32_t *d, unsigned index, char *buffer, const char *path) {
@@ -171,8 +172,7 @@ long sd_entries(uint32_t dir) {
 long sd_close(uint32_t handle) { return card()->close_handle(handle) ? -EIO : 0; }
 
 /* IFile commands without buffers: Flush (2), SetSize (3). */
-static long file_call(uint32_t file, unsigned command, const uint32_t *args, unsigned words) {
-    uint32_t *p = card()->command;
+static long file_call_in(uint32_t *p, uint32_t file, unsigned command, const uint32_t *args, unsigned words) {
     memset(p, 0, 256);
     p[0] = 4;
     p[1] = 8 + words;
@@ -180,9 +180,13 @@ static long file_call(uint32_t file, unsigned command, const uint32_t *args, uns
     p[6] = command;
     if (words)
         memcpy(p + 8, args, 4 * words);
-    return reply(file, 0, NULL);
+    return reply_in(p, file, 0, NULL);
+}
+static long file_call(uint32_t file, unsigned command, const uint32_t *args, unsigned words) {
+    return file_call_in(card()->command, file, command, args, words);
 }
 long sd_flush(uint32_t file) { return file_call(file, 2, NULL, 0); }
+long sd_flush_from(uint32_t *command, uint32_t file) { return file_call_in(command, file, 2, NULL, 0); }
 long sd_set_size(uint32_t file, int64_t size) {
     if (size < 0)
         return -EINVAL;
@@ -190,12 +194,10 @@ long sd_set_size(uint32_t file, int64_t size) {
     return file_call(file, 3, args, 2);
 }
 /* IFile::Write (1): option, pad, offset, size, with the data in an A (send) descriptor. */
-long sd_write(uint32_t file, int64_t offset, size_t length) {
+static long write_in(uint32_t *p, const uint8_t *data, uint32_t file, int64_t offset, size_t length) {
     if (length > SD_CHUNK || offset < 0)
         return -EINVAL;
-    struct sd_context *ctx = card();
-    uintptr_t addr = (uintptr_t)ctx->bounce;
-    uint32_t *p = ctx->command;
+    uintptr_t addr = (uintptr_t)data;
     memset(p, 0, 256);
     p[0] = 4 | (1u << 20);
     p[1] = 14;
@@ -207,6 +209,12 @@ long sd_write(uint32_t file, int64_t offset, size_t length) {
     memcpy(p + 14, &offset, 8);
     uint64_t size = length;
     memcpy(p + 16, &size, 8);
-    long rc = reply(file, 0, NULL);
+    long rc = reply_in(p, file, 0, NULL);
     return rc < 0 ? rc : (long)length;
+}
+long sd_write(uint32_t file, int64_t offset, size_t length) {
+    return write_in(card()->command, card()->bounce, file, offset, length);
+}
+long sd_write_from(uint32_t *command, const uint8_t *data, uint32_t file, int64_t offset, size_t length) {
+    return write_in(command, data, file, offset, length);
 }

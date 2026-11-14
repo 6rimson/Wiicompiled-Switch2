@@ -36,6 +36,16 @@ uint64_t hbxl_svc_tick(void) {
     return (uint64_t)ts.tv_sec * 19200000u + (uint64_t)ts.tv_nsec * 192u / 10000u;
 }
 int hbxl_threads_live(void) { return 0; }
+/* SDK heap: low static memory, as request buffers can only name addresses below 2^39. */
+static uint8_t sdk_heap[512 * 1024] __attribute__((aligned(4096)));
+static size_t sdk_heap_used;
+void *hbxl_sdk_memalign(size_t align, size_t size) {
+    size_t at = (sdk_heap_used + align - 1) / align * align;
+    if (at + size > sizeof(sdk_heap)) return NULL;
+    sdk_heap_used = at + size;
+    return sdk_heap + at;
+}
+void hbxl_card_log_start(void);
 void __real_hbxl_vfs_shutdown(void) {}
 void hbxl_vfs_write_console(int fd, const void *data, size_t n) { (void)!write(fd, data, n); }
 /* The runtime's log formatter: the format alone is enough here. */
@@ -128,18 +138,21 @@ static int open_with_write(const char *host, int any) {
             return 1;
     return 0;
 }
-/* A reply: an optional moved handle, then the data, aligned to 16 bytes (word 4 either way). */
+/* A reply, in the request's own buffer as the console does: an optional moved handle, then the
+ * data, aligned to 16 bytes (word 4 either way). */
+static uint32_t *replying;
 static uint32_t *respond(uint32_t rc, int moved_handle) {
-    memset(command, 0, 64);
+    uint32_t *reply = replying;
+    memset(reply, 0, 64);
     const unsigned at = 4;
     if (moved_handle) {
-        command[1] = 1u << 31;
-        command[2] = 1u << 5;
-        command[3] = moved_handle;
+        reply[1] = 1u << 31;
+        reply[2] = 1u << 5;
+        reply[3] = moved_handle;
     }
-    command[at] = 0x4f434653;
-    command[at + 2] = rc;
-    return command + at + 4;
+    reply[at] = 0x4f434653;
+    reply[at + 2] = rc;
+    return reply + at + 4;
 }
 static int new_object(int dir, const char *host, int mode, int fd) {
     for (int i = 2; i < MAXH; i++)
@@ -180,7 +193,17 @@ static uint32_t clock_send(uint32_t *p) {
     p[8] = value;
     return 0;
 }
+/* The card log's writer thread calls in too: one request at a time. */
+static pthread_mutex_t card_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t answer(void *message, uint64_t size, uint32_t handle);
 static uint32_t send(void *message, uint64_t size, uint32_t handle) {
+    pthread_mutex_lock(&card_lock);
+    replying = message;
+    const uint32_t rc = answer(message, size, handle);
+    pthread_mutex_unlock(&card_lock);
+    return rc;
+}
+static uint32_t answer(void *message, uint64_t size, uint32_t handle) {
     (void)size;
     if (handle == CPU_HANDLE)
         return clock_send(message);
@@ -324,7 +347,14 @@ static uint32_t send(void *message, uint64_t size, uint32_t handle) {
     }
     return 1;
 }
+static uint32_t close_locked(uint32_t handle);
 static uint32_t close_handle(uint32_t handle) {
+    pthread_mutex_lock(&card_lock);
+    const uint32_t rc = close_locked(handle);
+    pthread_mutex_unlock(&card_lock);
+    return rc;
+}
+static uint32_t close_locked(uint32_t handle) {
     card_calls++;
     if (handle >= MAXH || !objects[handle].used)
         return 1;
@@ -604,6 +634,16 @@ int main(void) {
           folder.st_size == 1 && card_calls > before);
     CHECK(call(SYS_newfstatat, AT_FDCWD, (long)"/disc/files/Race/Course/none.szs", (long)&folder, 0, 0) == -ENOENT);
 
+    /* With its writer thread the log reaches the card without the writing thread doing it. */
+    hbxl_card_log_start();
+    __wrap_hbxl_vfs_write_console(2, "hbxl: written by the log thread\n", 32);
+    int written = 0;
+    for (int tries = 0; tries < 50 && !written; tries++) {
+        usleep(20000);
+        written = host_read(card_root, "/UserData/Logs/console.log", trace, sizeof(trace) - 1) > 0 &&
+                  strstr(trace, "written by the log thread") != NULL;
+    }
+    CHECK(written);
     __wrap_hbxl_vfs_shutdown(); /* writes out what's left, as at exit */
     char log[256] = {0};
     CHECK(host_read(card_root, "/UserData/Logs/console.log", log, sizeof(log) - 1) > 0);

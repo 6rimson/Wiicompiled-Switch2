@@ -771,12 +771,23 @@ static int log_open(void) {
     return 1;
 }
 
-/* Called with the mutex held. The text is copied out first and log_mutex released before any
- * card call, since a card error prints a line that comes back through log_append. */
+/* Writing the log out. Normally a thread of its own does it (hbxl_card_log_start), with its own
+ * command page and data buffer, so no game thread waits for the card for its log lines: a write
+ * plus flush on the card costs milliseconds, which once made a frame a second miss its refresh.
+ * Before that thread runs, and for sd_trace and the last write at exit, the caller writes. Opening
+ * the file uses the shared buffers under the mutex; lock order is mutex, then log_io. */
+enum { LOG_DATA_BYTES = 0x11000 }; /* LOG_BYTES and the dropped-bytes note, page-rounded */
+void *hbxl_sdk_memalign(size_t align, size_t size);
+static uint32_t *log_command;
+static uint8_t *log_data;
+static pthread_mutex_t log_io = PTHREAD_MUTEX_INITIALIZER;
+static int log_writer; /* 0 not started, 1 running, -1 couldn't start */
 static char log_out[LOG_BYTES + 64];
-static void log_write_out(void) {
-    if (!log_state)
-        log_state = log_open();
+
+/* Called with log_io held, and with the mutex too unless the writer's buffers exist. The text is
+ * copied out first and log_mutex released before any card call, since a card error prints a line
+ * that comes back through log_append. */
+static void log_write_locked(int flush) {
     pthread_mutex_lock(&log_mutex);
     size_t used = log_state < 0 ? 0 : log_used;
     memcpy(log_out, log_buffer, used);
@@ -784,7 +795,7 @@ static void log_write_out(void) {
     log_used = 0;
     log_dropped = 0;
     pthread_mutex_unlock(&log_mutex);
-    if (log_state < 0)
+    if (log_state <= 0)
         return;
     if (dropped) {
         int n = snprintf(log_out + used, 64, "\n[sd] %llu bytes of log dropped here\n",
@@ -793,24 +804,86 @@ static void log_write_out(void) {
             used += n;
     }
     long rc = 0;
-    for (size_t done = 0; done < used && rc >= 0;) {
-        size_t want = used - done < SD_CHUNK ? used - done : SD_CHUNK;
-        memcpy(card()->bounce, log_out + done, want);
-        rc = sd_write(log_file, log_offset, want);
-        if (rc >= 0) {
-            log_offset += want;
-            done += want;
-        }
+    if (used) {
+        uint8_t *data = log_data ? log_data : card()->bounce;
+        memcpy(data, log_out, used); /* used <= LOG_BYTES + 64: one write */
+        rc = log_data ? sd_write_from(log_command, log_data, log_file, log_offset, used)
+                      : sd_write(log_file, log_offset, used);
+        if (rc >= 0)
+            log_offset += used;
     }
-    if (rc < 0 || sd_flush(log_file) < 0) {
+    if (rc >= 0 && flush)
+        rc = log_data ? sd_flush_from(log_command, log_file) : sd_flush(log_file);
+    if (rc < 0) {
         sd_close(log_file);
         log_state = -1; /* the card refused: stop trying */
     }
 }
 
-/* Writes the buffer out if a quarter second has passed or it's getting full. */
+/* Called with the mutex held: everything so far, flushed. */
+static void log_write_out(void) {
+    if (!log_state)
+        log_state = log_open();
+    pthread_mutex_lock(&log_io);
+    log_write_locked(1);
+    pthread_mutex_unlock(&log_io);
+}
+
+static void *log_writer_main(void *unused) {
+    (void)unused;
+    const uint64_t hz = hbxl_ctx && hbxl_ctx->tick_hz ? hbxl_ctx->tick_hz : 19200000;
+    uint64_t last_flush = hbxl_svc_tick();
+    while (log_state >= 0) {
+        const struct timespec pause = {0, 100 * 1000 * 1000};
+        nanosleep(&pause, NULL); /* also where the runtime ends this thread at exit */
+        if (!__atomic_load_n(&log_used, __ATOMIC_RELAXED) && !__atomic_load_n(&log_dropped, __ATOMIC_RELAXED))
+            continue;
+        if (!log_state) {
+            pthread_mutex_lock(&mutex);
+            if (!log_state)
+                log_state = log_open();
+            pthread_mutex_unlock(&mutex);
+        }
+        const uint64_t now = hbxl_svc_tick();
+        const int flush = now - last_flush >= hz; /* a second at most lost if the console stops */
+        pthread_mutex_lock(&log_io);
+        log_write_locked(flush);
+        pthread_mutex_unlock(&log_io);
+        if (flush)
+            last_flush = now;
+    }
+    return NULL;
+}
+
+/* From the game's main(), once libc can start threads. Without it, or if it can't start, the
+ * callers write as before. */
+void hbxl_card_log_start(void) {
+    if (log_writer || log_state < 0 || sd_request() != SD_ALL)
+        return;
+    log_command = hbxl_sdk_memalign(4096, 4096);
+    log_data = hbxl_sdk_memalign(4096, LOG_DATA_BYTES);
+    pthread_t thread;
+    pthread_attr_t attributes;
+    int started = log_command && log_data && !pthread_attr_init(&attributes);
+    if (started) {
+        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&attributes, 64 << 10); /* main() makes the default 8 MiB */
+        started = !pthread_create(&thread, &attributes, log_writer_main, NULL);
+        pthread_attr_destroy(&attributes);
+    }
+    if (!started) {
+        log_command = NULL; /* SDK heap is reused at exit; no free needed */
+        log_data = NULL;
+    }
+    __atomic_store_n(&log_writer, started ? 1 : -1, __ATOMIC_RELEASE);
+}
+
+/* Without the writer thread: writes the buffer out if a quarter second has passed or it's getting
+ * full. At exit (force), the rest, whoever writes. */
 static void log_maybe_write_out(int force) {
     if (!__atomic_load_n(&log_used, __ATOMIC_RELAXED) || log_state < 0)
+        return;
+    if (!force && __atomic_load_n(&log_writer, __ATOMIC_ACQUIRE) == 1)
         return;
     const uint64_t now = hbxl_svc_tick();
     const uint64_t hz = hbxl_ctx && hbxl_ctx->tick_hz ? hbxl_ctx->tick_hz : 19200000;
@@ -818,8 +891,13 @@ static void log_maybe_write_out(int force) {
         return;
     if (pthread_mutex_trylock(&mutex))
         return; /* inside a card operation (maybe this thread's): next time */
-    log_last_flush = now;
-    log_write_out();
+    if (!pthread_mutex_trylock(&log_io)) { /* at exit the writer may have ended holding it */
+        if (!log_state)
+            log_state = log_open();
+        log_last_flush = now;
+        log_write_locked(1);
+        pthread_mutex_unlock(&log_io);
+    }
     pthread_mutex_unlock(&mutex);
 }
 
